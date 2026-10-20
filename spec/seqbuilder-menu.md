@@ -1,0 +1,311 @@
+# SeqBuilder Pro 19 – main menu (from SeqBuilder.xrc)
+
+- **File** <!-- None -->
+  - New DNA `Ctrl-N` <!-- wxID_NEW -->
+  - New Protein `Alt-N` <!-- newProteinDocument -->
+  - New Project <!-- newProject -->
+  - New Cloning Project <!-- newCloningProject -->
+  - New Agarose Gel <!-- newGel -->
+  - New Folder <!-- newFolder -->
+  - Open... `Ctrl-O` <!-- wxID_OPEN -->
+  - Open Entrez Sequence... `Ctrl-R` <!-- openEntrezSequence -->
+  - Open Selections... <!-- openProjectSequence -->
+  - Open Vector Catalog <!-- openVectorCatalog -->
+  - Import Sequence(s) to Project... <!-- import -->
+  - Import VNTI Data into Project... <!-- VNTIimport -->
+  - Collect Open Sequences into new Project <!-- collect -->
+  - Export Sequence(s) From Project... <!-- export -->
+  - Add Sequence to Project <!-- addSequenceToProject -->
+  - Add sequence to Vector Catalog <!-- addToVectorCatalog -->
+  - Import Primers From a Catalog... <!-- importPrimerCatalog -->
+  - Export as GenVision Project... <!-- exportToGenVision -->
+  - Close `Ctrl-W` <!-- wxID_CLOSE -->
+  - Save `Ctrl-S` <!-- wxID_SAVE -->
+  - Save As... <!-- wxID_SAVEAS -->
+  - Save Primer Catalog... <!-- savePrimerList -->
+  - Page Layout... <!-- ID_pageLayout -->
+  - Page Setup... <!-- wxID_PRINT_SETUP -->
+  - Print Preview... <!-- wxID_PrintPreview -->
+  - Print... `Ctrl-P` <!-- wxID_PRINT -->
+  - Print Selection... <!-- printSelection -->
+  - **Recent Documents** <!-- openRecent -->
+  - **Send Sequence To** <!-- ID_netSearchOpenWithProgram -->
+- **Edit** <!-- None -->
+  - Undo `Ctrl-Z` <!-- wxID_UNDO -->
+  - Redo `Shift-Ctrl-Z` <!-- wxID_REDO -->
+  - Redo `Ctrl-Y` <!-- wxID_REDO -->
+  - Cut `Ctrl-X` <!-- wxID_CUT -->
+  - Copy `Ctrl-C` <!-- wxID_COPY -->
+  - Copy as Picture <!-- copyAsPicture -->
+  - **Copy As** <!-- copyAs -->
+    - Unformatted Sequence <!-- copyAsPlain -->
+    - Formatted Sequence <!-- copyAsPretty -->
+    - Translated Sequence <!-- copyAsTranslated -->
+    - Spliced Sequence <!-- copyAsSpliced -->
+  - Paste `Ctrl-V` <!-- wxID_PASTE -->
+  - Delete <!-- wxID_CLEAR -->
+  - Select All `Ctrl-A` <!-- selectAll -->
+  - Rename <!-- rename -->
+  - Reverse Strand <!-- reverseStrand -->
+  - Find... `Ctrl-F` <!-- findDialog -->
+  - Find Again `Ctrl-G` <!-- findAgain -->
+  - Go to Position... `Ctrl-J` <!-- goToPosition -->
+  - Settings... <!-- wxID_PREFERENCES -->
+- **Features** <!-- None -->
+  - Auto-Annotate Sequence... <!-- ID_annotateSequence -->
+  - Send to Feature Library... <!-- ID_sendToDatabase -->
+  - Feature Library Manager <!-- ID_featureLibrary -->
+  - New Feature `Ctrl-K` <!-- newFeature -->
+  - New Feature With Translation <!-- newFeatureWithTranslation -->
+  - Join to Feature... <!-- joinSegment -->
+  - New Note <!-- createNewNote -->
+  - New Translation <!-- createTranslation -->
+  - Update All Translations <!-- updateAllTranslations -->
+  - Delete Qualifier Field <!-- deleteQualifierField -->
+  - Use as Feature Label <!-- makeFeatureTitle -->
+  - Select Sequence <!-- selectFeatureSequence -->
+  - Edit Feature Description <!-- ID_editFeatureDescription -->
+  - Edit Feature Style <!-- ID_editFeatureStyle -->
+  - Export as Text <!-- ID_ExportFeatures -->
+- **Enzymes** <!-- None -->
+  - New Enzyme... <!-- newEnzymeItem -->
+  - Enzyme Manager... <!-- enzymeManager -->
+  - New Selector... <!-- newEnzymeSelector -->
+  - Selector Manager... <!-- enzymeSelectorList -->
+  - Show Enzymes That Cut the Selection <!-- newEnzymeSelectorMustCut -->
+  - Show Enzymes That Don't Cut the Selection <!-- newEnzymeSelectorDontCut -->
+  - Create a selector from the Checked Enzymes <!-- newEnzymeSelectorChecked -->
+  - Lead Lines Above Label <!-- enzymeThreadsUp -->
+  - Lead Lines Below Label <!-- enzymeThreadsDown -->
+  - Show Name/Position... <!-- ID_showNamePosition -->
+  - Show Enzymes Compatible With ... <!-- showEnzymesCompatibleWith -->
+- **Sequence** <!-- None -->
+  - **New Sequence** <!-- ID_newSequenceMenu -->
+    - Translate <!-- translateSelection -->
+    - Forward <!-- forwardSelection -->
+    - Reverse Complement <!-- reverseComplementSelection -->
+    - Reverse <!-- reverseSelection -->
+    - New Origin <!-- newOrigin -->
+  - ORF Detection Options... <!-- orfCriteria -->
+  - Edit ORF Style... <!-- ID_editORFStyle -->
+  - **Translation Display** <!-- readingFrameDisplay -->
+    - Three Letter Code <!-- AAthreeLetter -->
+    - One Letter Code <!-- AAoneLetter -->
+  - **Select Genetic Code** <!-- selectGeneticCode -->
+  - Edit Genetic Code... <!-- editGeneticCode -->
+  - Linear <!-- ID_linearSequence -->
+  - Circular <!-- ID_circularSequence -->
+  - DNA <!-- SeqTypeDNA -->
+  - RNA <!-- SeqTypeRNA -->
+  - Statistics `Ctrl-T` <!-- Statistics -->
+- **Cloning** <!-- None -->
+  - Copy Restriction Insert <!-- copyInsert -->
+  - Paste Restriction Insert... `Ctrl+Shift+V` <!-- cloneFragment -->
+  - Gibson, LIC Cloning... <!-- cloneGibson -->
+  - In-Fusion® Cloning... <!-- cloneInFusion -->
+  - GeneArt® Cloning... <!-- cloneGeneArt -->
+  - Golden Gate Cloning... <!-- cloneGoldenGate -->
+  - MultiSite Gateway® Pro Cloning... <!-- clone24Gateway -->
+  - Gateway® Expression Clone... <!-- cloneLRGateway -->
+  - Gateway® Entry Clone... <!-- cloneBPGateway -->
+  - PCR-Directed Restriction Cloning... <!-- cloneRestriction -->
+  - TA Cloning... <!-- cloneTA -->
+  - Directional TOPO Cloning... <!-- cloneTOPO -->
+  - **Make a TA/TOPO Vector for** <!-- makeVectorAs -->
+    - TA Cloning <!-- MakeTAVector -->
+    - Directional TOPO Cloning <!-- MakeTOPOVector -->
+  - Clone Selected Fragment <!-- cloneThisFragment -->
+  - Clone Selected Fragment From Opposite Strand <!-- cloneBottomFragment -->
+  - Verify Clone <!-- cloneVerify -->
+  - Batch Clone <!-- cloneBatch -->
+  - Change Overhangs... <!-- changeOverhangs -->
+- **Priming** <!-- None -->
+  - Create Primer Pairs... <!-- designPrimers -->
+  - Forward <!-- primerFromTopStrand -->
+  - Reverse <!-- primerFromBottomStrand -->
+  - Pair Selected Primers <!-- createNewPrimerPair -->
+  - Set as Active Primer <!-- workOnPrimerPair -->
+  - Show Forward Primer <!-- showTopStrandPrimer -->
+  - Show Reverse Primer <!-- showBottomStrandPrimer -->
+  - Introduce Restriction Site <!-- introduceRestrictionSite -->
+  - Introduce Codon Change/Mutation <!-- introduceCodonChangeMutation -->
+  - Create Insert by PCR <!-- createInsertByPCR -->
+- **Format** <!-- None -->
+  - **Case** <!-- caseMenu -->
+    - Make Uppercase <!-- makeUppercase -->
+    - Make Lowercase <!-- makeLowercase -->
+    - Reverse Case <!-- reverseCase -->
+  - Special Translation Ruler... <!-- ID_partialTranslationRuler -->
+  - **Residue Grouping** <!-- residueSpacingMenu -->
+    - None <!-- residueSpacingNone -->
+    - Group by 3 <!-- residueSpacing3 -->
+    - Group by 10 <!-- residueSpacing10 -->
+  - Horizontal Labels <!-- enzymeDisplayHorizontal -->
+  - Vertical Labels <!-- enzymeDisplayVertical -->
+- **View** <!-- None -->
+  - Show/Hide Side Panels <!-- showPanels -->
+  - Show/Hide Toolbar <!-- showToolbar -->
+  - Remove Split <!-- splitPage -->
+  - Apply Layout... <!-- applyTemplate -->
+  - Save Layout as Template... <!-- saveAsTemplate -->
+  - Save Layout as Default Template <!-- saveAsDefaultTemplate -->
+  - Restore DNASTAR Default Layout <!-- restoreDefaultTemplate -->
+  - Recalculate Display <!-- autoLayout -->
+  - Fit to View <!-- fitToView -->
+  - Fit to Page <!-- fitToPage -->
+  - Clear History <!-- clearHistory -->
+- **Search** <!-- None -->
+  - Search for Sequences... <!-- blastSelection -->
+  - **Search For Text In** <!-- newTTextSearch -->
+    - NCBI Nucleotide… <!-- textNucleotide -->
+    - NCBI Protein... <!-- textProtein -->
+  - Search for Text Locally <!-- textLocal -->
+  - Manage Local Databases... <!-- localConfig -->
+  - Show Jobs <!-- showJobs -->
+  - Open Search File... <!-- openSearchFile -->
+- **Tools** <!-- None -->
+  - Batch Clone... <!-- ID_batchclone -->
+  - Batch Reverse Complement... <!-- ID_batchReverseComplement -->
+  - Batch Translate... <!-- ID_translate -->
+  - Concatenate... <!-- ID_concatenate -->
+  - Extract Features as Sequences... <!-- ID_extractFeaturesAsSequences -->
+  - Export Sequences into Single File... <!-- ID_combineSequences -->
+  - **Sample by** <!-- ID_toolsSampleByMenu -->
+    - 5' and 3' End Tags... <!-- ID_sampleByEndTags -->
+    - Contains Sequence... <!-- ID_sampleByContainsSequences -->
+    - Probability or Skipping... <!-- ID_sampleByProbability -->
+    - Length... <!-- ID_sampleByLength -->
+    - Name... <!-- ID_sampleByName -->
+  - Suggest a Feature <!-- ID_suggestAFeature -->
+- **Window** <!-- None -->
+- **Debug** <!-- None -->
+- **Help** <!-- None -->
+  - User Guide `F1` <!-- wxID_HELP_CONTENTS -->
+  - User Guide `F1` <!-- wxID_HELP_CONTENTS -->
+  - DNASTAR Website <!-- dnaStarWebSite -->
+  - Tutorials <!-- seqbuilderTutorials -->
+  - Software Updates <!-- softwareUpdates -->
+  - Technical Support Request <!-- techSupport -->
+  - Enter Product Key <!-- authorizeLG -->
+  - Register Software <!-- registerSoftware -->
+  - Legal Information <!-- ID_helpLegal -->
+  - Purchase Lasergene <!-- purchaseLG -->
+  - Molecules in Motion <!-- ID_moleculesInMotion -->
+  - About SeqBuilder Pro <!-- wxID_ABOUT -->
+
+## Dialogs and panels
+
+- wxDialog `enzSelectorManager`
+- wxPanel `enzSelectorDefinition`
+- wxPanel `enzSelectorClassPanel`
+- wxPanel `enzSelectorOverhangPanel`
+- wxPanel `enzSelectorFrequencyPanel`
+- wxPanel `enzSelectorPickPanel`
+- wxPanel `enzSelectorCombinePanel`
+- wxPanel `enzSelectorCombineItem`
+- wxPanel `enzSelectorEmptyPanel`
+- wxPanel `InfoWindowTranslation`
+- wxPanel `tabFormat`
+- wxPanel `pageLayout`
+- wxPanel `featureInfo`
+- wxPanel `styleInfo`
+- wxPanel `titleInfo`
+- wxPanel `enzymeInfo`
+- wxDialog `gcCodeShufflerDialog`
+- wxDialog `gcStartSetterDialog`
+- wxDialog `geneticCodeEditor`
+- wxPanel `gcCodeShuffler`
+- wxPanel `gcCodeStarts`
+- wxDialog `saveGCdialog`
+- wxDialog `geneticCodeEditorMSW`
+- wxPanel `gcCodeShufflerMSW`
+- wxPanel `dummyPageMSW`
+- wxPanel `dummyPage`
+- wxPanel `gcCodeStartsMSW`
+- wxDialog `enzymeManager`
+- wxPanel `recogSeqEditorPanel`
+- wxPanel `enzymeCutPointerPanel`
+- wxDialog `openEntrezDialog`
+- wxPanel `fontChanger`
+- wxDialog `orfOptions`
+- wxPanel `siteFindDialog`
+- wxDialog `seqSelector`
+- wxDialog `viewRulerSettings`
+- wxDialog `gotoPosition`
+- wxDialog `fontDialog`
+- wxPanel `fontSample`
+- wxDialog `seqSelectorSingle`
+- wxDialog `BlastPrefs`
+- wxPanel `BlastPrefsServers`
+- wxDialog `BatchQueryResults_Save`
+- wxPanel `EntrezQuery`
+- wxPanel `EntrezQueryResults`
+- wxPanel `BlastPrefsInternet`
+- wxDialog `BlastQuery`
+- wxPanel `EntrezSearchResults`
+- wxPanel `EntrezQueryItemPanel`
+- wxPanel `EntrezQueryItemsContainer`
+- wxDialog `EntrezNewServer`
+- wxPanel `FindDialogPanel`
+- wxDialog `printWhat`
+- wxPanel `NetSearchResultsTopPanel`
+- wxPanel `FeatureSearchResultsTopPanel`
+- wxPanel `featureJoinSegment`
+- wxDialog `EnzymeOverlapDialog`
+- wxDialog `singleInputDialog`
+- wxPanel `editListBoxContainer`
+- wxPanel `editListBoxItem`
+- wxDialog `readerDlg`
+- wxDialog `demoDlg`
+- wxDialog `testEditListBoxDialog`
+- wxDialog `TACloningDialog`
+- wxDialog `DirTOPOCloningDialog`
+- wxDialog `GatewayCloningDialog`
+- wxDialog `changeOverhangsDialog`
+- wxDialog `searchDialog`
+- wxDialog `cloneFragmentDialog`
+- wxPanel `sequenceEndPanel`
+- wxPanel `endEditLeftSide`
+- wxPanel `endEditRightSide`
+- wxPanel `sequenceEndOverhangEditor`
+- wxDialog `GatewayEntryCloneDialog`
+- wxPanel `MultiGatewayCloningDialog`
+- wxDialog `ProgressDlgSmooth`
+- wxDialog `ProgressDlg`
+- wxDialog `CloneRestrictionEnzymeInsertHelp`
+- wxDialog `GatewayCloningHelp`
+- wxDialog `TACloningHelp`
+- wxDialog `DirectionalTOPOHelp`
+- wxDialog `designPrimers`
+- wxDialog `deletePCRFeature`
+- wxDialog `editPairName`
+- wxPanel `ID_toolsButtonsPanel`
+- wxPanel `ID_toolsTitlePanel`
+- wxPanel `ID_toolsSkeletonPanel`
+- wxPanel `ID_toolsScripts`
+- wxPanel `ID_toolsHistory`
+- wxPanel `ID_toolProgressPanel`
+- wxPanel `ID_toolsTranslatePanel`
+- wxPanel `ID_toolsConcatenatePanel`
+- wxPanel `ID_toolsExtractSequencesAsFeaturesPanel`
+- wxPanel `ID_toolsCombineSequencesPanel`
+- wxPanel `ID_toolsBatchReverseComplement`
+- wxPanel `ID_toolsSampleByProbabilityPanel`
+- wxPanel `ID_toolsSampleByNamePanel`
+- wxPanel `ID_toolsSampleByLengthPanel`
+- wxPanel `ID_toolsSampleByEndTagsPanel`
+- wxPanel `ID_toolsSampleBySubsequencePanel`
+- wxPanel `ID_toolsChangeOriginPanel`
+- wxPanel `ID_toolsConvertAmbiguityCharactersPanel`
+- wxPanel `ID_toolsCreateBedFilePanel`
+- wxPanel `ID_toolsDetectDuplicateFeaturesPanel`
+- wxPanel `ID_toolsBatchClonePanel`
+- wxDialog `ID_toolsDemoDialogBase`
+- wxPanel `ID_toolsAlignPanel`
+- wxPanel `wxID_ANY`
+- wxDialog `testCustomControlDialog`
+- wxDialog `ModalProgressDialog`
+- wxDialog `panelSwitcherDialog`
+- wxDialog `reparentTestDialog`
+- wxDialog `panelTestDialog`
+- wxPanel `panelTest`
