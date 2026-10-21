@@ -11,7 +11,8 @@
 //         Pascal name at 6 (256 bytes), u32 416 at 262, Pascal type at 266, start/end (u32, 1-based,
 //         reversed on the complement strand) at 394/398, u16 complement at 402, u16 1 at 404; the
 //         remaining bytes are the same in every record seen. FXIF id N+1 belongs to UVFT id N.
-//   UVTL  layout as a CommonBlockFmt property tree (8-byte key, u32 LE length, value; some values start
+//   UVTL  top-level SBLinear (1 linear, 0 circular) is what SeqBuilder opens the sequence as.
+//         Layout as a CommonBlockFmt property tree (8-byte key, u32 LE length, value; some values start
 //         with a few bytes of their own before their items). Styles live in VSSTYLE blocks: OBJINFO.STYLE
 //         per object, TYPEINFO.TDATA{TINFO,STYLE} per feature type. There is one VSSTYLE per view state:
 //         ALLDSTAT, the open view (InfSpltF...SeqView) and every default layout in DefLayLs; SeqBuilder
@@ -510,6 +511,7 @@ pub fn new_document(template: &[u8], name: &str, header: &str, seq: Vec<u8>, cir
         }
     }
     s.circular = circular;
+    if let Some(tl) = s.container.chunk_mut(b"UVTL") { edit_all(tl, "SBLinear", |_| vec![!circular as u8]); }
     let latin1 = |t: &str| t.chars().map(|c| u8::try_from(c as u32).unwrap_or(b'?')).collect::<Vec<u8>>();
     // A sequence that never was GenBank stores "^^"
     let text = if header.is_empty() { "^^\n".to_string() } else { header.to_string() };
@@ -540,6 +542,14 @@ pub fn new_document(template: &[u8], name: &str, header: &str, seq: Vec<u8>, cir
     Ok(s)
 }
 
+/// The SBLinear flag of a document (for comparing saves).
+#[cfg(test)]
+pub fn sb_linear(d: &[u8]) -> Option<u8> {
+    let c = Container::parse(d)?;
+    let tl = c.chunks().find(|c| &c.0 == b"UVTL")?.2.to_vec();
+    child(&tl, "SBLinear").and_then(|v| v.first().copied())
+}
+
 /// The UVSI chunk of a document (for comparing saves).
 #[cfg(test)]
 pub fn uvsi(d: &[u8]) -> Vec<u8> {
@@ -558,7 +568,12 @@ pub fn read(d: &[u8]) -> Result<Sbd, String> {
         let at = c.2.windows(15).position(|w| w == b"CommonBlockFmt\0")?;
         child(&c.2[at..], "SeqShape").and_then(|v| u32le(v, 0))
     });
-    let circular = shape.map_or_else(|| header.lines().next().is_some_and(|l| l.starts_with("LOCUS") && l.contains("circular")), |s| s == 2);
+    let linear = get(*b"UVTL").next().and_then(|c| child(c.2, "SBLinear")).and_then(|v| v.first().copied());
+    let circular = match (linear, shape) {
+        (Some(l), _) => l == 0,
+        (None, Some(s)) => s == 2,
+        _ => header.lines().next().is_some_and(|l| l.starts_with("LOCUS") && l.contains("circular")),
+    };
 
     let feats = get(*b"UVFT").filter_map(|&(_, id, r)| {
         let (start, end) = (u32be(r, 394)? as usize, u32be(r, 398)? as usize);

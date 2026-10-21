@@ -10,8 +10,8 @@ use std::f32::consts::{PI, TAU};
 use std::path::{Path, PathBuf};
 
 const DNASTAR_DIR: &str = "/Applications/DNASTAR/Lasergene19";
-// ponytail: new .sbd documents start from a SeqBuilder-saved document; a neutral one (New DNA, a few bases) is better.
-const SBD_TEMPLATE: &[u8] = include_bytes!("../testdata/ALDH2.sbd");
+// New .sbd documents start from this SeqBuilder Pro document (New DNA "acgt" with one feature).
+const SBD_TEMPLATE: &[u8] = include_bytes!("../testdata/template.sbd");
 
 #[derive(Clone)]
 struct Feat {
@@ -1302,7 +1302,7 @@ mod tests {
         assert!(d.deleted.is_empty());
     }
 
-    /// Saving pBR322.gb as .sbd (from the ALDH2 template) must give what SeqBuilder Pro made of it: pBR322.sbd.
+    /// Saving pBR322.gb as .sbd (from the template) must give what SeqBuilder Pro made of it: pBR322.sbd.
     #[test]
     fn genbank_saved_as_sbd_matches_seqbuilder() {
         let mut app = App::default();
@@ -1315,6 +1315,7 @@ mod tests {
         let (got, exp) = (sbd::read(&ours).unwrap(), sbd::read(&want).unwrap());
         assert!(got.seq == exp.seq);
         assert_eq!((got.circular, got.header == exp.header), (true, true));
+        assert_eq!(sbd::sb_linear(&ours), sbd::sb_linear(&want));
         assert!(sbd::uvsi(&ours) == sbd::uvsi(&want));
         assert_eq!(got.feats.len(), exp.feats.len());
         for (g, e) in got.feats.iter().zip(&exp.feats) {
