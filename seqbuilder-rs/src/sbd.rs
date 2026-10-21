@@ -406,6 +406,12 @@ mod tests {
         d.set_feature_style(38, Some(red.obj_styles[&38]));
         assert!(blocks(&d) == blocks(&red));
 
+        // Putting the type's colours back keeps the object style, exactly as SeqBuilder does.
+        let reset = read(&std::fs::read("testdata/pBR322_blaRESET.sbd").unwrap()).unwrap();
+        let mut back = read(&std::fs::read("testdata/pBR322_blaRED.sbd").unwrap()).unwrap();
+        back.set_feature_style(38, Some(reset.type_styles["CDS"]));
+        assert!(blocks(&back) == blocks(&reset));
+
         let again = read(&d.to_bytes()).unwrap();
         assert_eq!(again.obj_styles[&38], red.obj_styles[&38]);
         assert_eq!((again.seq.len(), again.feats.len()), (4361, 50));

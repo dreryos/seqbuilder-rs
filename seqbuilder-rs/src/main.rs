@@ -549,7 +549,6 @@ impl App {
                     ui.label("Line:"); changed |= ui.color_edit_button_srgba(&mut line).changed(); ui.end_row();
                 });
                 if changed { f.style = Some((fill, line)); f.edited = true; }
-                if ui.button("Default style").clicked() { f.style = None; f.edited = true; }
             }
             SideTop::Enzymes => {
                 if self.enz.is_empty() { ui.label("No enzymes loaded (File ▸ Open Enzyme Files…)."); return; }
