@@ -7,8 +7,11 @@
 //   UVTX  GenBank header text (LOCUS..COMMENT), CRLF; "^^" when the sequence was made in SeqBuilder
 //   UVSI  sequence info; its trailing property block holds SeqShape (1 linear, 2 circular)
 //   UVFT  one feature per id: 416-byte record + CR-separated "/key=value" qualifiers
-//   UVTL  layout as a CommonBlockFmt property tree (8-byte key, u32 LE length, value), holding styles:
-//         ALLDSTAT.CMNSTATE.VSSTYLE.OBJINFO.STYLE (per object) and .TYPEINFO.TDATA{TINFO,STYLE} (per feature type)
+//   UVTL  layout as a CommonBlockFmt property tree (8-byte key, u32 LE length, value; some values start
+//         with a few bytes of their own before their items). Styles live in VSSTYLE blocks: OBJINFO.STYLE
+//         per object, TYPEINFO.TDATA{TINFO,STYLE} per feature type. There is one VSSTYLE per view state:
+//         ALLDSTAT, the open view (InfSpltF...SeqView) and every default layout in DefLayLs; SeqBuilder
+//         draws from the view copies, so an edit has to reach all of them.
 // Writing keeps every chunk as read and replaces only the ones that were edited, then lays the file
 // out again: header, chunk data, each object's entries followed by its group header, object table.
 use std::collections::HashMap;
@@ -32,7 +35,6 @@ pub struct Style {
 
 pub struct Sbd {
     container: Container,
-    type_records: HashMap<String, Vec<u8>>, // raw 35-byte type STYLE records, templates for new object styles
     pub seq: Vec<u8>,
     pub header: String,
     pub circular: bool,
@@ -172,15 +174,38 @@ fn block<'a>(like: &[u8], items: impl IntoIterator<Item = (&'a str, Vec<u8>)>) -
     out
 }
 
-/// `b` with the block at `path` replaced by `f(old block)`.
-fn edit(b: &[u8], path: &[&str], f: &mut dyn FnMut(&[u8]) -> Vec<u8>) -> Option<Vec<u8>> {
-    let items = props(b);
-    let at = items.iter().position(|(k, _)| *k == path[0])?;
-    let new = if path.len() == 1 { f(items[at].1) } else { edit(items[at].1, &path[1..], f)? };
-    Some(block(b, items.iter().enumerate().map(|(i, &(k, v))| (k, if i == at { new.clone() } else { v.to_vec() }))))
+fn valid_key(k: &[u8]) -> bool {
+    let n = k.iter().position(|&b| b == 0).unwrap_or(k.len());
+    n >= 3 && k[0].is_ascii_alphabetic() && k[..n].iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_') && k[n..].iter().all(|&b| b == 0)
 }
 
-const OBJINFO: [&str; 4] = ["ALLDSTAT", "CMNSTATE", "VSSTYLE", "OBJINFO"];
+/// Headers (offsets of their 8-byte keys) of the items enclosing position `p`, outermost first.
+/// A value may start with up to 16 bytes of its own before its items.
+fn enclosing(b: &[u8], p: usize) -> Vec<usize> {
+    let (mut s, mut e, mut chain) = (17, b.len(), vec![]);
+    'down: loop {
+        for skip in 0..=16 {
+            let mut i = s + skip;
+            while let (Some(key), Some(len)) = (b.get(i..i + 8), u32le(b, i + 8)) {
+                let end = i + 12 + len as usize;
+                if !valid_key(key) || end > e { break; }
+                if (i + 12..end).contains(&p) {
+                    chain.push(i);
+                    (s, e) = (i + 12, end);
+                    continue 'down;
+                }
+                i = end;
+            }
+        }
+        return chain;
+    }
+}
+
+/// Offsets of every VSSTYLE item header in a UVTL block.
+fn vsstyles(b: &[u8]) -> Vec<usize> {
+    b.windows(8).enumerate().filter(|(_, w)| *w == b"VSSTYLE\0").map(|(i, _)| i)
+        .filter(|&i| enclosing(b, i + 12).last() == Some(&i)).collect()
+}
 
 // STYLE (35 bytes, LE): u32 object index, u32 object type, u8 line on, rgb line, f64 weight,
 // u8 fill on, rgb fill, u8 shadow on, rgb shadow, 7 bytes not decoded yet (shape, linkage, label position).
@@ -194,40 +219,79 @@ fn style(s: &[u8]) -> Option<(u32, u32, Style)> {
     }))
 }
 
+/// One VSSTYLE block with feature `id`'s object style set or removed.
+fn restyle(vs: &[u8], id: u32, kind: &str, st: Option<Style>) -> Vec<u8> {
+    let is_kind = |td: &[u8]| child(td, "TINFO").is_some_and(|ti| {
+        let n = u32le(ti, 0).unwrap_or(0) as usize;
+        ti.get(4..4 + n) == Some(kind.as_bytes())
+    });
+    let type_style = props(vs).into_iter().find(|(k, _)| *k == "TYPEINFO")
+        .and_then(|(_, ti)| props(ti).into_iter().find(|(k, td)| *k == "TDATA" && is_kind(td)))
+        .and_then(|(_, td)| child(td, "STYLE").map(<[u8]>::to_vec));
+    let template = type_style.unwrap_or_else(|| {
+        let mut r = vec![0u8; 35];
+        r[12..20].copy_from_slice(&1f64.to_le_bytes());
+        r
+    });
+    let objinfo = |oi: &[u8]| -> Vec<u8> {
+        let mine = |v: &[u8]| matches!(style(v), Some((i, FEATURE_OBJECT, _)) if i == id);
+        let items = props(oi);
+        let old = items.iter().find(|(k, v)| *k == "STYLE" && mine(v)).map(|(_, v)| v.to_vec());
+        let mut rest: Vec<(&str, Vec<u8>)> = items.iter().filter(|(k, v)| !(*k == "STYLE" && mine(v))).map(|&(k, v)| (k, v.to_vec())).collect();
+        if let Some(st) = st {
+            let mut r = old.unwrap_or_else(|| template.clone());
+            r[0..4].copy_from_slice(&id.to_le_bytes());
+            r[4..8].copy_from_slice(&FEATURE_OBJECT.to_le_bytes());
+            r[8] = st.line.is_some() as u8;
+            if let Some(c) = st.line { r[9..12].copy_from_slice(&c); }
+            r[12..20].copy_from_slice(&st.weight.to_le_bytes());
+            r[20] = st.fill.is_some() as u8;
+            if let Some(c) = st.fill { r[21..24].copy_from_slice(&c); }
+            rest.insert(0, ("STYLE", r)); // SeqBuilder puts the newest object style first
+        }
+        block(oi, rest)
+    };
+    // The type style's first field names the object last styled with it (0xFFFFFFFF = none).
+    // ponytail: resetting it on removal is a guess; SeqBuilder's own removal is not sampled yet.
+    let mark = if st.is_some() { id } else { u32::MAX };
+    let typeinfo = |ti: &[u8]| -> Vec<u8> {
+        block(ti, props(ti).into_iter().map(|(k, td)| {
+            if k != "TDATA" || !is_kind(td) { return (k, td.to_vec()); }
+            (k, block(td, props(td).into_iter().map(|(k2, v)| {
+                let mut v = v.to_vec();
+                if k2 == "STYLE" && (st.is_some() || u32le(&v, 0) == Some(id)) { v[0..4].copy_from_slice(&mark.to_le_bytes()); }
+                (k2, v)
+            })))
+        }))
+    };
+    block(vs, props(vs).into_iter().map(|(k, v)| match k {
+        "OBJINFO" => (k, objinfo(v)),
+        "TYPEINFO" => (k, typeinfo(v)),
+        _ => (k, v.to_vec()),
+    }))
+}
+
 impl Sbd {
     /// The document as SeqBuilder Pro would read it; unchanged chunks are written back byte for byte.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.container.write()
     }
 
-    /// Set (or with `None` remove) the custom style of feature `id`, as Style ▸ Fill/Line does in SeqBuilder.
+    /// Set (or with `None` remove) the custom style of feature `id`, as Style ▸ Fill/Line does in SeqBuilder:
+    /// every VSSTYLE copy gets the object style first in OBJINFO, and its type style records the object id.
     pub fn set_feature_style(&mut self, id: u32, st: Option<Style>) {
         let kind = self.feats.iter().find(|f| f.id == id).map(|f| f.kind.clone()).unwrap_or_default();
-        let template = self.type_records.get(&kind).cloned().unwrap_or_else(|| {
-            let mut r = vec![0u8; 35];
-            r[12..20].copy_from_slice(&1f64.to_le_bytes());
-            r
-        });
-        let mut set = |objinfo: &[u8]| -> Vec<u8> {
-            let items = props(objinfo);
-            let mine = |v: &[u8]| matches!(style(v), Some((i, FEATURE_OBJECT, _)) if i == id);
-            let old = items.iter().find(|(k, v)| *k == "STYLE" && mine(v)).map(|(_, v)| v.to_vec());
-            let mut rest: Vec<(&str, Vec<u8>)> = items.iter().filter(|(k, v)| !(*k == "STYLE" && mine(v))).map(|&(k, v)| (k, v.to_vec())).collect();
-            if let Some(st) = st {
-                let mut r = old.unwrap_or_else(|| template.clone());
-                r[0..4].copy_from_slice(&id.to_le_bytes());
-                r[4..8].copy_from_slice(&FEATURE_OBJECT.to_le_bytes());
-                r[8] = st.line.is_some() as u8;
-                if let Some(c) = st.line { r[9..12].copy_from_slice(&c); }
-                r[12..20].copy_from_slice(&st.weight.to_le_bytes());
-                r[20] = st.fill.is_some() as u8;
-                if let Some(c) = st.fill { r[21..24].copy_from_slice(&c); }
-                rest.insert(0, ("STYLE", r)); // SeqBuilder puts the newest object style first
+        let Some(tl) = self.container.chunk_mut(b"UVTL") else { return };
+        for at in vsstyles(tl).into_iter().rev() {
+            let chain = enclosing(tl, at + 12);
+            let len = u32le(tl, at + 8).unwrap_or(0) as usize;
+            let new = restyle(&tl[at + 12..at + 12 + len], id, &kind, st);
+            let delta = new.len() as i64 - len as i64;
+            tl.splice(at + 12..at + 12 + len, new);
+            for h in chain {
+                let l = u32le(tl, h + 8).unwrap_or(0) as i64 + delta;
+                tl[h + 8..h + 12].copy_from_slice(&(l as u32).to_le_bytes());
             }
-            block(objinfo, rest)
-        };
-        if let Some(tl) = self.container.chunk_mut(b"UVTL") {
-            if let Some(new) = edit(tl, &OBJINFO, &mut set) { *tl = new; }
         }
         match st {
             Some(st) => { self.obj_styles.insert(id, st); }
@@ -271,7 +335,7 @@ pub fn read(d: &[u8]) -> Result<Sbd, String> {
         })
     }).collect();
 
-    let (mut type_styles, mut obj_styles, mut type_records) = (HashMap::new(), HashMap::new(), HashMap::new());
+    let (mut type_styles, mut obj_styles) = (HashMap::new(), HashMap::new());
     let vs = get(*b"UVTL").next()
         .and_then(|c| child(c.2, "ALLDSTAT")).and_then(|b| child(b, "CMNSTATE")).and_then(|b| child(b, "VSSTYLE"));
     if let Some(vs) = vs {
@@ -283,17 +347,14 @@ pub fn read(d: &[u8]) -> Result<Sbd, String> {
                 "TYPEINFO" => for (_, td) in props(v).into_iter().filter(|(k, _)| *k == "TDATA") {
                     let (Some(ti), Some(raw)) = (child(td, "TINFO"), child(td, "STYLE")) else { continue };
                     let (Some(st), n) = (style(raw), u32le(ti, 0).unwrap_or(0) as usize) else { continue };
-                    if let Some(name) = ti.get(4..4 + n) {
-                        type_styles.insert(text(name), st.2);
-                        type_records.insert(text(name), raw.to_vec());
-                    }
+                    if let Some(name) = ti.get(4..4 + n) { type_styles.insert(text(name), st.2); }
                 },
                 _ => {}
             }
         }
     }
     drop(chunks);
-    Ok(Sbd { container, type_records, seq, header, circular, feats, type_styles, obj_styles })
+    Ok(Sbd { container, seq, header, circular, feats, type_styles, obj_styles })
 }
 
 #[cfg(test)]
@@ -332,15 +393,18 @@ mod tests {
         }
     }
 
-    /// Recolouring bla red must give the same style block as SeqBuilder Pro saved in pBR322_blaRED.sbd.
+    /// Recolouring bla red must give the same style blocks as SeqBuilder Pro saved in pBR322_blaRED.sbd.
     #[test]
     fn custom_style_matches_seqbuilder() {
-        let objinfo = |s: &Sbd| s.container.chunks().find(|c| &c.0 == b"UVTL")
-            .and_then(|c| OBJINFO.iter().try_fold(c.2, |b, k| child(b, k)).map(<[u8]>::to_vec)).unwrap();
+        let blocks = |s: &Sbd| {
+            let tl = s.container.chunks().find(|c| &c.0 == b"UVTL").unwrap().2.to_vec();
+            vsstyles(&tl).into_iter().map(|at| tl[at + 12..at + 12 + u32le(&tl, at + 8).unwrap() as usize].to_vec()).collect::<Vec<_>>()
+        };
         let mut d = read(&std::fs::read("testdata/pBR322.sbd").unwrap()).unwrap();
         let red = read(&std::fs::read("testdata/pBR322_blaRED.sbd").unwrap()).unwrap();
+        assert_eq!(blocks(&d).len(), 8);
         d.set_feature_style(38, Some(red.obj_styles[&38]));
-        assert_eq!(objinfo(&d), objinfo(&red));
+        assert!(blocks(&d) == blocks(&red));
 
         let again = read(&d.to_bytes()).unwrap();
         assert_eq!(again.obj_styles[&38], red.obj_styles[&38]);
