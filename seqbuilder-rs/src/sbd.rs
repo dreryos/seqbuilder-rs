@@ -76,6 +76,7 @@ pub struct Sbd {
     pub feats: Vec<SbdFeat>,
     pub type_styles: HashMap<String, Style>,
     pub obj_styles: HashMap<u32, Style>, // by UVFT id
+    pub shown: HashMap<u32, bool>,       // Show checkbox by UVFT id (VSFEAT.STATE)
 }
 
 const FEATURE_OBJECT: u32 = 9; // object type of features in STYLE records
@@ -96,6 +97,17 @@ fn pascal(d: &[u8], o: usize) -> String {
 struct Entry {
     meta: [u8; 32], // as read; length and offset are rewritten on save
     data: Vec<u8>,
+    rank: u64,      // place of the data in the file: 2 × original offset, odd for chunks added after one
+}
+
+impl Entry {
+    fn is(&self, typ: &[u8; 4]) -> bool {
+        &self.meta[..4] == typ
+    }
+
+    fn id(&self) -> u32 {
+        u32::from_be_bytes(self.meta[4..8].try_into().unwrap())
+    }
 }
 
 struct Object {
@@ -107,13 +119,11 @@ struct Object {
 struct Container {
     head: [u8; 0x30],
     objects: Vec<Object>,
-    order: Vec<(usize, usize)>, // (object, entry) in file order of their data
 }
 
 impl Container {
     fn parse(d: &[u8]) -> Option<Container> {
         let mut objects = vec![];
-        let mut located = vec![];
         let mut o = u32be(d, 0x2c)? as usize;
         while o + 0x40 <= d.len() {
             let grp = u32be(d, o + 20)? as usize;
@@ -123,21 +133,22 @@ impl Container {
                 let e = first + 32 * k;
                 let meta: [u8; 32] = d.get(e..e + 32)?.try_into().ok()?;
                 let (len, off) = (u32be(&meta, 12)? as usize, u32be(&meta, 28)? as usize);
-                located.push((off, objects.len(), k));
-                entries.push(Entry { meta, data: d.get(off..off + len)?.to_vec() });
+                entries.push(Entry { meta, data: d.get(off..off + len)?.to_vec(), rank: 2 * off as u64 });
             }
             objects.push(Object { record: d[o..o + 0x40].try_into().ok()?, group: d.get(grp..grp + 20)?.try_into().ok()?, entries });
             o += 0x40;
         }
-        located.sort();
-        Some(Container { head: d.get(..0x30)?.try_into().ok()?, objects, order: located.into_iter().map(|(_, o, e)| (o, e)).collect() })
+        Some(Container { head: d.get(..0x30)?.try_into().ok()?, objects })
     }
 
     fn write(&self) -> Vec<u8> {
         let put = |b: &mut [u8], at: usize, v: usize| b[at..at + 4].copy_from_slice(&(v as u32).to_be_bytes());
         let mut out = self.head.to_vec();
         let mut offsets: Vec<Vec<usize>> = self.objects.iter().map(|o| vec![0; o.entries.len()]).collect();
-        for &(o, e) in &self.order {
+        let mut order: Vec<(u64, usize, usize)> = self.objects.iter().enumerate()
+            .flat_map(|(o, obj)| obj.entries.iter().enumerate().map(move |(e, en)| (en.rank, o, e))).collect();
+        order.sort();
+        for (_, o, e) in order {
             offsets[o][e] = out.len();
             out.extend(&self.objects[o].entries[e].data);
         }
@@ -180,8 +191,27 @@ impl Container {
 
     fn chunk_id_mut(&mut self, typ: &[u8; 4], id: Option<u32>) -> Option<&mut Vec<u8>> {
         self.objects.iter_mut().flat_map(|o| &mut o.entries)
-            .find(|e| &e.meta[..4] == typ && id.is_none_or(|id| e.meta[4..8] == id.to_be_bytes()))
+            .find(|e| e.is(typ) && id.is_none_or(|id| e.id() == id))
             .map(|e| &mut e.data)
+    }
+
+    /// Add a chunk right after the last one of its type, in the directory and in the data (as SeqBuilder does).
+    fn add_after_last(&mut self, typ: &[u8; 4], id: u32, data: Vec<u8>) -> Option<()> {
+        let obj = self.objects.iter_mut().find(|o| o.entries.iter().any(|e| e.is(typ)))?;
+        let at = obj.entries.iter().rposition(|e| e.is(typ))?;
+        let mut meta = obj.entries[at].meta;
+        meta[4..8].copy_from_slice(&id.to_be_bytes());
+        let rank = obj.entries[at].rank + 1;
+        obj.entries.insert(at + 1, Entry { meta, data, rank });
+        Some(())
+    }
+
+    fn remove(&mut self, typ: &[u8; 4], id: u32) {
+        for o in &mut self.objects { o.entries.retain(|e| !(e.is(typ) && e.id() == id)); }
+    }
+
+    fn ids(&self, typ: &[u8; 4]) -> Vec<u32> {
+        self.objects.iter().flat_map(|o| &o.entries).filter(|e| e.is(typ)).map(Entry::id).collect()
     }
 }
 
@@ -242,10 +272,54 @@ fn enclosing(b: &[u8], p: usize) -> Vec<usize> {
     }
 }
 
-/// Offsets of every VSSTYLE item header in a UVTL block.
-fn vsstyles(b: &[u8]) -> Vec<usize> {
-    b.windows(8).enumerate().filter(|(_, w)| *w == b"VSSTYLE\0").map(|(i, _)| i)
+/// Offsets of every item header named `key` in a UVTL block.
+fn find_items(b: &[u8], key: &str) -> Vec<usize> {
+    let mut k = [0u8; 8];
+    k[..key.len()].copy_from_slice(key.as_bytes());
+    b.windows(8).enumerate().filter(|(_, w)| *w == k).map(|(i, _)| i)
         .filter(|&i| enclosing(b, i + 12).last() == Some(&i)).collect()
+}
+
+/// Replace the value of every `key` item in a UVTL block, fixing the lengths of all enclosing items.
+fn edit_all(tl: &mut Vec<u8>, key: &str, mut f: impl FnMut(&[u8]) -> Vec<u8>) {
+    for at in find_items(tl, key).into_iter().rev() {
+        let chain = enclosing(tl, at + 12);
+        let len = u32le(tl, at + 8).unwrap_or(0) as usize;
+        let new = f(&tl[at + 12..at + 12 + len]);
+        let delta = new.len() as i64 - len as i64;
+        tl.splice(at + 12..at + 12 + len, new);
+        for h in chain {
+            let l = u32le(tl, h + 8).unwrap_or(0) as i64 + delta;
+            tl[h + 8..h + 12].copy_from_slice(&(l as u32).to_le_bytes());
+        }
+    }
+}
+
+// VSFEAT.STATE: u32 count, then per feature id ever made (u32 id, u8 shown). Deleting a feature leaves its entry.
+fn feature_state(st: &[u8]) -> Vec<(u32, bool)> {
+    let n = u32le(st, 0).unwrap_or(0) as usize;
+    (0..n).filter_map(|k| Some((u32le(st, 4 + 5 * k)?, *st.get(8 + 5 * k)? != 0))).collect()
+}
+
+fn encode_state(rows: &[(u32, bool)]) -> Vec<u8> {
+    let mut v = (rows.len() as u32).to_le_bytes().to_vec();
+    for &(id, shown) in rows {
+        v.extend(id.to_le_bytes());
+        v.push(shown as u8);
+    }
+    v
+}
+
+/// Apply `f` to the feature state of every VSFEAT copy.
+fn edit_feature_state(tl: &mut Vec<u8>, mut f: impl FnMut(&mut Vec<(u32, bool)>)) {
+    edit_all(tl, "VSFEAT", |vf| {
+        block(vf, props(vf).into_iter().map(|(k, v)| {
+            if k != "STATE" { return (k, v.to_vec()); }
+            let mut rows = feature_state(v);
+            f(&mut rows);
+            (k, encode_state(&rows))
+        }))
+    });
 }
 
 // STYLE (35 bytes, LE): u32 object index, u32 object type, u8 line on, rgb line, f64 weight,
@@ -313,6 +387,37 @@ fn restyle(vs: &[u8], id: u32, kind: &str, st: Option<Style>) -> Vec<u8> {
 }
 
 impl Sbd {
+    /// Add a feature as Features ▸ New Feature does: next unused id, a UVFT after the last one, one more
+    /// FXIF, and a shown entry in every feature state. Returns the id.
+    pub fn add_feature(&mut self, mut f: SbdFeat) -> u32 {
+        let used = self.shown.keys().copied().chain(self.container.ids(b"UVFT"));
+        f.id = used.max().map_or(0, |m| m + 1);
+        self.container.add_after_last(b"UVFT", f.id, f.encode());
+        let fx = self.container.ids(b"FXIF");
+        let template = fx.last().and_then(|&i| self.container.chunk_id_mut(b"FXIF", Some(i)).map(|d| d.clone()));
+        if let (Some(&last), Some(data)) = (fx.last(), template) { self.container.add_after_last(b"FXIF", last + 1, data); }
+        if let Some(tl) = self.container.chunk_mut(b"UVTL") { edit_feature_state(tl, |rows| rows.push((f.id, true))); }
+        self.shown.insert(f.id, true);
+        let id = f.id;
+        self.feats.push(f);
+        id
+    }
+
+    /// Delete a feature as SeqBuilder does: its UVFT and the last FXIF go, ids are not renumbered.
+    pub fn remove_feature(&mut self, id: u32) {
+        self.container.remove(b"UVFT", id);
+        if let Some(&last) = self.container.ids(b"FXIF").last() { self.container.remove(b"FXIF", last); }
+        self.feats.retain(|f| f.id != id);
+    }
+
+    /// The Show checkbox of the feature table.
+    pub fn set_feature_shown(&mut self, id: u32, shown: bool) {
+        if let Some(tl) = self.container.chunk_mut(b"UVTL") {
+            edit_feature_state(tl, |rows| rows.iter_mut().filter(|r| r.0 == id).for_each(|r| r.1 = shown));
+        }
+        self.shown.insert(id, shown);
+    }
+
     /// Replace an existing feature (matched by id) with edited name, type, range or qualifiers.
     pub fn update_feature(&mut self, f: SbdFeat) -> Result<(), String> {
         let data = self.container.chunk_id_mut(b"UVFT", Some(f.id)).ok_or(format!("no feature {}", f.id))?;
@@ -331,17 +436,7 @@ impl Sbd {
     pub fn set_feature_style(&mut self, id: u32, st: Option<Style>) {
         let kind = self.feats.iter().find(|f| f.id == id).map(|f| f.kind.clone()).unwrap_or_default();
         let Some(tl) = self.container.chunk_mut(b"UVTL") else { return };
-        for at in vsstyles(tl).into_iter().rev() {
-            let chain = enclosing(tl, at + 12);
-            let len = u32le(tl, at + 8).unwrap_or(0) as usize;
-            let new = restyle(&tl[at + 12..at + 12 + len], id, &kind, st);
-            let delta = new.len() as i64 - len as i64;
-            tl.splice(at + 12..at + 12 + len, new);
-            for h in chain {
-                let l = u32le(tl, h + 8).unwrap_or(0) as i64 + delta;
-                tl[h + 8..h + 12].copy_from_slice(&(l as u32).to_le_bytes());
-            }
-        }
+        edit_all(tl, "VSSTYLE", |vs| restyle(vs, id, &kind, st));
         match st {
             Some(st) => { self.obj_styles.insert(id, st); }
             None => { self.obj_styles.remove(&id); }
@@ -399,8 +494,11 @@ pub fn read(d: &[u8]) -> Result<Sbd, String> {
             }
         }
     }
+    let shown = get(*b"UVTL").next()
+        .and_then(|c| ["ALLDSTAT", "CMNSTATE", "VSFEAT", "STATE"].iter().try_fold(c.2, |b, k| child(b, k)))
+        .map(|st| feature_state(st).into_iter().collect()).unwrap_or_default();
     drop(chunks);
-    Ok(Sbd { container, seq, header, circular, feats, type_styles, obj_styles })
+    Ok(Sbd { container, shown, seq, header, circular, feats, type_styles, obj_styles })
 }
 
 #[cfg(test)]
@@ -443,6 +541,48 @@ mod tests {
         }
     }
 
+    fn items_of(s: &Sbd, key: &str) -> Vec<Vec<u8>> {
+        let tl = s.container.chunks().find(|c| &c.0 == b"UVTL").unwrap().2.to_vec();
+        find_items(&tl, key).into_iter().map(|at| tl[at + 12..at + 12 + u32le(&tl, at + 8).unwrap() as usize].to_vec()).collect()
+    }
+
+    /// Adding TEST 100..200 must give the chunks and feature states SeqBuilder Pro wrote in pBR322_add.sbd.
+    #[test]
+    fn add_feature_matches_seqbuilder() {
+        let mut d = read(&std::fs::read("testdata/pBR322.sbd").unwrap()).unwrap();
+        let mut want = read(&std::fs::read("testdata/pBR322_add.sbd").unwrap()).unwrap();
+        assert_eq!(d.shown.get(&0), Some(&false)); // source is listed but hidden
+        let id = d.add_feature(SbdFeat {
+            id: 0, name: "TEST".into(), kind: "misc_feature".into(), start: 100, end: 200, complement: false,
+            quals: vec!["dnas_title=\"TEST\"".into(), "note=\"TEST_note\"".into()],
+        });
+        assert_eq!(id, 50);
+        let dir = |s: &Sbd| s.container.chunks().map(|c| (c.0, c.1)).collect::<Vec<_>>();
+        assert_eq!(dir(&d), dir(&want));
+        for typ in [b"UVFT", b"FXIF"] {
+            for i in d.container.ids(typ) {
+                assert!(d.container.chunk_id_mut(typ, Some(i)).cloned() == want.container.chunk_id_mut(typ, Some(i)).cloned());
+            }
+        }
+        // SeqBuilder also re-saves VSFEAT.TSTYLE with its type entries in another order; only STATE carries the edit.
+        let states = |s: &Sbd| items_of(s, "VSFEAT").iter().map(|v| child(v, "STATE").unwrap().to_vec()).collect::<Vec<_>>();
+        assert_eq!(states(&d).len(), 9);
+        assert!(states(&d) == states(&want));
+        let again = read(&d.to_bytes()).unwrap();
+        assert_eq!((again.feats.len(), again.feats[50].name.as_str(), again.shown[&50]), (51, "TEST", true));
+    }
+
+    /// Deleting echinomycin 24..27 (UVFT 2) must leave the chunks SeqBuilder Pro left in pBR322_del.sbd.
+    #[test]
+    fn remove_feature_matches_seqbuilder() {
+        let mut d = read(&std::fs::read("testdata/pBR322.sbd").unwrap()).unwrap();
+        let want = read(&std::fs::read("testdata/pBR322_del.sbd").unwrap()).unwrap();
+        d.remove_feature(2);
+        let dir = |s: &Sbd| s.container.chunks().map(|c| (c.0, c.1, c.2.to_vec())).filter(|c| &c.0 != b"UVTL" && &c.0 != b"UVCB").collect::<Vec<_>>();
+        assert!(dir(&d) == dir(&want));
+        assert_eq!(read(&d.to_bytes()).unwrap().feats.len(), 49);
+    }
+
     #[test]
     fn writes_back_unchanged_files_byte_for_byte() {
         for f in ["pBR322.sbd", "pBR322_blaRED.sbd", "ALDH2.sbd"] {
@@ -456,7 +596,7 @@ mod tests {
     fn custom_style_matches_seqbuilder() {
         let blocks = |s: &Sbd| {
             let tl = s.container.chunks().find(|c| &c.0 == b"UVTL").unwrap().2.to_vec();
-            vsstyles(&tl).into_iter().map(|at| tl[at + 12..at + 12 + u32le(&tl, at + 8).unwrap() as usize].to_vec()).collect::<Vec<_>>()
+            find_items(&tl, "VSSTYLE").into_iter().map(|at| tl[at + 12..at + 12 + u32le(&tl, at + 8).unwrap() as usize].to_vec()).collect::<Vec<_>>()
         };
         let mut d = read(&std::fs::read("testdata/pBR322.sbd").unwrap()).unwrap();
         let red = read(&std::fs::read("testdata/pBR322_blaRED.sbd").unwrap()).unwrap();

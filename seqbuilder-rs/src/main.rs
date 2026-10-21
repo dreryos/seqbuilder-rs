@@ -53,6 +53,7 @@ struct Doc {
     hits: Vec<Vec<usize>>, // per enzyme: 0-based site positions
     path: PathBuf,
     sbd: Option<sbd::Sbd>, // kept to write the document back
+    deleted: Vec<u32>,     // .sbd feature ids deleted since the last save
 }
 
 struct Site {
@@ -143,7 +144,7 @@ fn load(path: &Path) -> Result<Doc, String> {
     let mut doc = if text.first() == Some(&b'>') {
         let seq: Vec<u8> = text.split(|&b| b == b'\n').filter(|l| !l.starts_with(b">"))
             .flatten().copied().filter(u8::is_ascii_alphabetic).collect();
-        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None }
+        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![] }
     } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sbd")) {
         let s = sbd::read(&text)?;
         let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
@@ -158,7 +159,7 @@ fn load(path: &Path) -> Result<Doc, String> {
                 kind: f.kind.clone(), name: f.name.clone(), label: short(&f.name), desc: q("note").or_else(|| q("product")).unwrap_or_default(),
                 range: if f.complement { format!("complement({lo}..{hi})") } else { format!("{lo}..{hi}") },
                 start: lo.saturating_sub(1), end: hi, strand: if f.complement { -1 } else { 1 }, lane: 0,
-                show: f.kind != "source", style: s.obj_styles.get(&f.id).map(colors),
+                show: s.shown.get(&f.id).copied().unwrap_or(f.kind != "source"), style: s.obj_styles.get(&f.id).map(colors),
                 base: s.type_styles.get(&f.kind).map(colors), sbd_id: Some(f.id), edited: false,
                 quals: f.quals.clone(), dirty: false,
             }
@@ -168,7 +169,7 @@ fn load(path: &Path) -> Result<Doc, String> {
             name: locus.split_whitespace().next().map_or(name, str::to_owned),
             definition: s.header_field("DEFINITION", " "), accession: s.header_field("ACCESSION", " "),
             comment: s.header_field("COMMENT", "\n"),
-            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: Some(s),
+            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: Some(s), deleted: vec![],
         }
     } else {
         let rec = gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())?
@@ -198,7 +199,7 @@ fn load(path: &Path) -> Result<Doc, String> {
         Doc {
             name: rec.name.clone().unwrap_or(name), definition: rec.definition.clone().unwrap_or_default(),
             accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
-            seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None,
+            seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![],
         }
     };
     doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
@@ -317,6 +318,7 @@ impl App {
             f.strand = if comp { -1 } else { 1 };
             f.range = if comp { format!("complement({lo}..{hi})") } else { format!("{lo}..{hi}") };
             f.label = short(&f.name);
+            if f.quals.iter().any(|q| q.starts_with("dnas_title=")) { set_qual(&mut f.quals, "dnas_title", &f.name.clone()); }
             set_qual(&mut f.quals, "note", &note);
             f.desc = if note.is_empty() { f.desc.clone() } else { note };
             f.dirty = true;
@@ -324,28 +326,59 @@ impl App {
         }
     }
 
-    /// Write the open .sbd back (to `to`, or where it came from), with this session's style edits.
+    /// Features ▸ New Feature (⌘K): a misc_feature over the selection, picked for editing in Details.
+    fn new_feature(&mut self) {
+        let (Some(d), Some((a, b))) = (&mut self.doc, self.sel) else { return };
+        let name = "New Feature".to_string();
+        d.feats.push(Feat {
+            kind: "misc_feature".into(), label: name.clone(), desc: String::new(), range: format!("{}..{b}", a + 1),
+            start: a, end: b, strand: 1, lane: 0, show: true, style: None, base: None, sbd_id: None, edited: false,
+            quals: vec![format!("dnas_title=\"{name}\"")], dirty: true, name,
+        });
+        d.lanes = assign_lanes(&mut d.feats, d.seq.len());
+        self.sel_feat = Some(d.feats.len() - 1);
+        self.side_bottom = SideBottom::Details;
+    }
+
+    fn delete_feature(&mut self) {
+        let (Some(d), Some(i)) = (&mut self.doc, self.sel_feat) else { return };
+        if i >= d.feats.len() { return; }
+        let f = d.feats.remove(i);
+        d.deleted.extend(f.sbd_id);
+        d.lanes = assign_lanes(&mut d.feats, d.seq.len());
+        self.sel_feat = None;
+    }
+
+    /// Write the open .sbd back (to `to`, or where it came from) with this session's edits:
+    /// deleted, new and changed features, then styles and Show flags.
     fn save(&mut self, to: Option<PathBuf>) {
         let Some(d) = &mut self.doc else { return };
         let Some(s) = &mut d.sbd else {
             self.error = Some("Saving is only supported for documents opened from .sbd so far".into());
             return;
         };
+        for id in d.deleted.drain(..) { s.remove_feature(id); }
+        for f in d.feats.iter_mut().filter(|f| f.dirty) {
+            let (lo, hi) = (f.start + 1, f.end);
+            let comp = f.strand < 0;
+            let (start, end) = if comp { (hi, lo) } else { (lo, hi) };
+            let feat = sbd::SbdFeat { id: f.sbd_id.unwrap_or(0), name: f.name.clone(), kind: f.kind.clone(), start, end, complement: comp, quals: f.quals.clone() };
+            match f.sbd_id {
+                Some(_) => if let Err(e) = s.update_feature(feat) { self.error = Some(e); return; },
+                None => f.sbd_id = Some(s.add_feature(feat)),
+            }
+            f.dirty = false;
+        }
+        for f in &d.feats {
+            let Some(id) = f.sbd_id else { continue };
+            if s.shown.get(&id) != Some(&f.show) { s.set_feature_shown(id, f.show); }
+        }
         let rgb = |c: Color32| [c.r(), c.g(), c.b()];
         for f in d.feats.iter_mut().filter(|f| f.edited) {
             let Some(id) = f.sbd_id else { continue };
             let weight = s.obj_styles.get(&id).or(s.type_styles.get(&f.kind)).map_or(1.0, |st| st.weight);
             s.set_feature_style(id, f.style.map(|(fill, line)| sbd::Style { fill: (fill.a() > 0).then(|| rgb(fill)), line: Some(rgb(line)), weight }));
             f.edited = false;
-        }
-        for f in d.feats.iter_mut().filter(|f| f.dirty) {
-            let Some(id) = f.sbd_id else { continue };
-            let (lo, hi) = (f.start + 1, f.end);
-            let comp = f.strand < 0;
-            let (start, end) = if comp { (hi, lo) } else { (lo, hi) };
-            let feat = sbd::SbdFeat { id, name: f.name.clone(), kind: f.kind.clone(), start, end, complement: comp, quals: f.quals.clone() };
-            if let Err(e) = s.update_feature(feat) { self.error = Some(e); return; }
-            f.dirty = false;
         }
         let path = to.unwrap_or_else(|| d.path.clone());
         match std::fs::write(&path, s.to_bytes()) {
@@ -433,6 +466,10 @@ impl App {
                 }
                 if ui.button("Go to Position…  ⌘J").clicked() { self.goto_open = true; }
             });
+            ui.menu_button("Features", |ui| {
+                if ui.add_enabled(self.sel.is_some(), egui::Button::new("New Feature  ⌘K")).clicked() { self.new_feature(); }
+                if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Delete Feature  ⌫")).clicked() { self.delete_feature(); }
+            });
             ui.menu_button("Enzymes", |ui| {
                 if ui.button("Selector Manager…").clicked() { self.selmgr = self.sels.first().map(|s| s.id); }
                 ui.menu_button("Apply Selector", |ui| {
@@ -452,6 +489,10 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) { self.save(None); }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) { self.new_feature(); }
+        if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete)) {
+            self.delete_feature();
+        }
         let (open, all, goto) = ctx.input_mut(|i| (
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::O),
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
@@ -1085,6 +1126,28 @@ mod tests {
         for (a, b) in back.feats.iter().zip(&orig.feats).filter(|(a, _)| a.id != 26) {
             assert_eq!((&a.name, a.start, a.end, &a.quals), (&b.name, b.start, b.end, &b.quals));
         }
+    }
+
+    #[test]
+    fn adds_deletes_and_hides_features_in_sbd() {
+        let mut app = App::default();
+        app.open(Path::new("testdata/pBR322.sbd"));
+        assert!(!app.doc.as_ref().unwrap().feats[0].show, "source starts hidden, as stored in the file");
+        app.sel_feat = Some(2); // echinomycin 24..27
+        app.delete_feature();
+        app.sel = Some((99, 200));
+        app.new_feature();
+        app.doc.as_mut().unwrap().feats[5].show = false;
+        let out = std::env::temp_dir().join("seqbuilder-rs-add-del-test.sbd");
+        app.save(Some(out.clone()));
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let back = sbd::read(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(back.feats.len(), 50);
+        assert!(back.feats.iter().all(|f| f.id != 2));
+        let new = back.feats.iter().find(|f| f.name == "New Feature").unwrap();
+        assert_eq!((new.id, new.kind.as_str(), new.start, new.end), (50, "misc_feature", 100, 200));
+        let hidden = app.doc.as_ref().unwrap().feats[5].sbd_id.unwrap();
+        assert_eq!((back.shown[&hidden], back.shown[&50]), (false, true));
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
