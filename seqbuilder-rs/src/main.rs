@@ -21,7 +21,10 @@ struct Feat {
     strand: i8,    // 1 forward, -1 reverse
     lane: usize,
     show: bool,
-    style: Option<(Color32, Color32)>, // (fill, line) override from the Style tab
+    style: Option<(Color32, Color32)>, // (fill, line) of this feature, from the document or the Style tab
+    base: Option<(Color32, Color32)>,  // the document's style for this feature type
+    sbd_id: Option<u32>,               // UVFT id when read from a .sbd
+    edited: bool,                      // style changed since the last save
 }
 
 struct Doc {
@@ -34,6 +37,8 @@ struct Doc {
     feats: Vec<Feat>,
     lanes: usize,
     hits: Vec<Vec<usize>>, // per enzyme: 0-based site positions
+    path: PathBuf,
+    sbd: Option<sbd::Sbd>, // kept to write the document back
 }
 
 struct Site {
@@ -124,22 +129,23 @@ fn load(path: &Path) -> Result<Doc, String> {
     let mut doc = if text.first() == Some(&b'>') {
         let seq: Vec<u8> = text.split(|&b| b == b'\n').filter(|l| !l.starts_with(b">"))
             .flatten().copied().filter(u8::is_ascii_alphabetic).collect();
-        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![] }
+        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None }
     } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sbd")) {
         let s = sbd::read(&text)?;
         let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
         let feats = s.feats.iter().map(|f| {
             let (lo, hi) = (f.start.min(f.end), f.start.max(f.end));
             let q = |k: &str| f.quals.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
-            let style = s.obj_styles.get(&f.id).or(s.type_styles.get(&f.kind)).map(|st| {
+            let colors = |st: &sbd::Style| {
                 let fill = st.fill.map_or(Color32::TRANSPARENT, rgb);
                 (fill, st.line.map_or(fill, rgb))
-            });
+            };
             Feat {
                 kind: f.kind.clone(), label: short(&f.name), desc: q("note").or_else(|| q("product")).unwrap_or_default(),
                 range: if f.complement { format!("complement({lo}..{hi})") } else { format!("{lo}..{hi}") },
                 start: lo.saturating_sub(1), end: hi, strand: if f.complement { -1 } else { 1 }, lane: 0,
-                show: f.kind != "source", style,
+                show: f.kind != "source", style: s.obj_styles.get(&f.id).map(colors),
+                base: s.type_styles.get(&f.kind).map(colors), sbd_id: Some(f.id), edited: false,
             }
         }).collect();
         let locus = s.header_field("LOCUS", " ");
@@ -147,7 +153,7 @@ fn load(path: &Path) -> Result<Doc, String> {
             name: locus.split_whitespace().next().map_or(name, str::to_owned),
             definition: s.header_field("DEFINITION", " "), accession: s.header_field("ACCESSION", " "),
             comment: s.header_field("COMMENT", "\n"),
-            seq: s.seq, circular: s.circular, feats, lanes: 0, hits: vec![],
+            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: Some(s),
         }
     } else {
         let rec = gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())?
@@ -164,14 +170,14 @@ fn load(path: &Path) -> Result<Doc, String> {
                 kind: f.kind.to_string(), label, desc: q("note").or_else(|| q("product")).unwrap_or_default(),
                 range: f.location.to_gb_format(), start, end, strand: location_strand(&f.location), lane: 0,
                 show: f.kind != "source", // SeqBuilder lists source but leaves it hidden
-                style: None,
+                style: None, base: None, sbd_id: None, edited: false,
             })
         }).collect();
         let circular = rec.is_circular();
         Doc {
             name: rec.name.clone().unwrap_or(name), definition: rec.definition.clone().unwrap_or_default(),
             accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
-            seq: rec.seq, circular, feats, lanes: 0, hits: vec![],
+            seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None,
         }
     };
     doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
@@ -193,7 +199,7 @@ fn kind_color(kind: &str) -> (Color32, Color32) {
 }
 
 fn colors(f: &Feat) -> (Color32, Color32) {
-    f.style.unwrap_or_else(|| kind_color(&f.kind))
+    f.style.or(f.base).unwrap_or_else(|| kind_color(&f.kind))
 }
 
 /// SeqBuilder shows short sequences in bp and long ones in kb ("4361 bp", "114.842 kb").
@@ -266,6 +272,34 @@ impl App {
         }
     }
 
+    /// Write the open .sbd back (to `to`, or where it came from), with this session's style edits.
+    fn save(&mut self, to: Option<PathBuf>) {
+        let Some(d) = &mut self.doc else { return };
+        let Some(s) = &mut d.sbd else {
+            self.error = Some("Saving is only supported for documents opened from .sbd so far".into());
+            return;
+        };
+        let rgb = |c: Color32| [c.r(), c.g(), c.b()];
+        for f in d.feats.iter_mut().filter(|f| f.edited) {
+            let Some(id) = f.sbd_id else { continue };
+            let weight = s.obj_styles.get(&id).or(s.type_styles.get(&f.kind)).map_or(1.0, |st| st.weight);
+            s.set_feature_style(id, f.style.map(|(fill, line)| sbd::Style { fill: (fill.a() > 0).then(|| rgb(fill)), line: Some(rgb(line)), weight }));
+            f.edited = false;
+        }
+        let path = to.unwrap_or_else(|| d.path.clone());
+        match std::fs::write(&path, s.to_bytes()) {
+            Ok(()) => { d.path = path; self.error = None; }
+            Err(e) => self.error = Some(format!("{}: {e}", path.display())),
+        }
+    }
+
+    fn save_as(&mut self) {
+        let name = self.doc.as_ref().and_then(|d| d.path.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if let Some(p) = rfd::FileDialog::new().add_filter("SeqBuilder document", &["sbd"]).set_file_name(name).save_file() {
+            self.save(Some(p));
+        }
+    }
+
     fn load_enzymes(&mut self, ezd: &Path, sel: &Path) {
         match std::fs::read(ezd) {
             Ok(b) => self.enz = enzymes::parse_ezd(&b),
@@ -321,6 +355,8 @@ impl App {
                         self.open(&p);
                     }
                 }
+                if ui.button("Save  ⌘S").clicked() { self.save(None); }
+                if ui.button("Save As…").clicked() { self.save_as(); }
                 if ui.button("Open Enzyme Files…").clicked() {
                     let ezd = rfd::FileDialog::new().add_filter("Enzyme file", &["ezd"]).pick_file();
                     let sel = ezd.as_ref().and_then(|_| rfd::FileDialog::new().add_filter("Selector file", &["sel"]).pick_file());
@@ -354,6 +390,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) { self.save(None); }
         let (open, all, goto) = ctx.input_mut(|i| (
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::O),
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
@@ -511,8 +548,8 @@ impl App {
                     ui.label("Fill:"); changed |= ui.color_edit_button_srgba(&mut fill).changed(); ui.end_row();
                     ui.label("Line:"); changed |= ui.color_edit_button_srgba(&mut line).changed(); ui.end_row();
                 });
-                if changed { f.style = Some((fill, line)); }
-                if ui.button("Default style").clicked() { f.style = None; }
+                if changed { f.style = Some((fill, line)); f.edited = true; }
+                if ui.button("Default style").clicked() { f.style = None; f.edited = true; }
             }
             SideTop::Enzymes => {
                 if self.enz.is_empty() { ui.label("No enzymes loaded (File ▸ Open Enzyme Files…)."); return; }
@@ -946,6 +983,22 @@ mod tests {
         }
         let red = load(Path::new("testdata/pBR322_blaRED.sbd")).unwrap();
         assert_eq!(red.feats[38].style.unwrap().0, Color32::from_rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn saves_style_edits_to_sbd() {
+        let mut app = App::default();
+        app.open(Path::new("testdata/pBR322.sbd"));
+        let f = &mut app.doc.as_mut().unwrap().feats[38];
+        f.style = Some((Color32::from_rgb(0, 200, 0), Color32::from_rgb(0, 0, 255)));
+        f.edited = true;
+        let out = std::env::temp_dir().join("seqbuilder-rs-test.sbd");
+        app.save(Some(out.clone()));
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let back = sbd::read(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(back.obj_styles[&38].fill, Some([0, 200, 0]));
+        assert_eq!(back.obj_styles[&38].weight, 1.0);
+        assert_eq!(back.feats.len(), 50);
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.

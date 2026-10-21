@@ -1,3 +1,4 @@
 .DS_Store
 /seqbuilder-rs/target/
 __pycache__/
+/verify/

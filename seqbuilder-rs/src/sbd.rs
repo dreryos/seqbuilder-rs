@@ -1,4 +1,4 @@
-// SeqBuilder Pro document (.sbd) reader.
+// SeqBuilder Pro document (.sbd) reader and writer.
 //
 // Container (big-endian): u32 at 0x2C -> object table (0x40-byte records: idx, 1, type4, subtype4, 0,
 // group offset, Pascal name). Group: u32 0xCC, count, count, 0, first entry offset. Entries are 32 bytes:
@@ -9,6 +9,8 @@
 //   UVFT  one feature per id: 416-byte record + CR-separated "/key=value" qualifiers
 //   UVTL  layout as a CommonBlockFmt property tree (8-byte key, u32 LE length, value), holding styles:
 //         ALLDSTAT.CMNSTATE.VSSTYLE.OBJINFO.STYLE (per object) and .TYPEINFO.TDATA{TINFO,STYLE} (per feature type)
+// Writing keeps every chunk as read and replaces only the ones that were edited, then lays the file
+// out again: header, chunk data, each object's entries followed by its group header, object table.
 use std::collections::HashMap;
 
 pub struct SbdFeat {
@@ -29,6 +31,8 @@ pub struct Style {
 }
 
 pub struct Sbd {
+    container: Container,
+    type_records: HashMap<String, Vec<u8>>, // raw 35-byte type STYLE records, templates for new object styles
     pub seq: Vec<u8>,
     pub header: String,
     pub circular: bool,
@@ -52,22 +56,90 @@ fn pascal(d: &[u8], o: usize) -> String {
     d.get(o + 1..o + 1 + n).map(|s| s.iter().map(|&b| b as char).collect()).unwrap_or_default()
 }
 
-/// All chunks as (type, id, bytes).
-fn chunks(d: &[u8]) -> Option<Vec<([u8; 4], u32, &[u8])>> {
-    let mut out = vec![];
-    let mut o = u32be(d, 0x2c)? as usize;
-    while o + 0x40 <= d.len() {
-        let grp = u32be(d, o + 20)? as usize;
-        let (n, first) = (u32be(d, grp + 4)? as usize, u32be(d, grp + 16)? as usize);
-        for k in 0..n {
-            let e = first + 32 * k;
-            let typ: [u8; 4] = d.get(e..e + 4)?.try_into().ok()?;
-            let (id, len, off) = (u32be(d, e + 4)?, u32be(d, e + 12)? as usize, u32be(d, e + 28)? as usize);
-            out.push((typ, id, d.get(off..off + len)?));
+struct Entry {
+    meta: [u8; 32], // as read; length and offset are rewritten on save
+    data: Vec<u8>,
+}
+
+struct Object {
+    record: [u8; 0x40],
+    group: [u8; 20],
+    entries: Vec<Entry>,
+}
+
+struct Container {
+    head: [u8; 0x30],
+    objects: Vec<Object>,
+    order: Vec<(usize, usize)>, // (object, entry) in file order of their data
+}
+
+impl Container {
+    fn parse(d: &[u8]) -> Option<Container> {
+        let mut objects = vec![];
+        let mut located = vec![];
+        let mut o = u32be(d, 0x2c)? as usize;
+        while o + 0x40 <= d.len() {
+            let grp = u32be(d, o + 20)? as usize;
+            let (n, first) = (u32be(d, grp + 4)? as usize, u32be(d, grp + 16)? as usize);
+            let mut entries = vec![];
+            for k in 0..n {
+                let e = first + 32 * k;
+                let meta: [u8; 32] = d.get(e..e + 32)?.try_into().ok()?;
+                let (len, off) = (u32be(&meta, 12)? as usize, u32be(&meta, 28)? as usize);
+                located.push((off, objects.len(), k));
+                entries.push(Entry { meta, data: d.get(off..off + len)?.to_vec() });
+            }
+            objects.push(Object { record: d[o..o + 0x40].try_into().ok()?, group: d.get(grp..grp + 20)?.try_into().ok()?, entries });
+            o += 0x40;
         }
-        o += 0x40;
+        located.sort();
+        Some(Container { head: d.get(..0x30)?.try_into().ok()?, objects, order: located.into_iter().map(|(_, o, e)| (o, e)).collect() })
     }
-    Some(out)
+
+    fn write(&self) -> Vec<u8> {
+        let put = |b: &mut [u8], at: usize, v: usize| b[at..at + 4].copy_from_slice(&(v as u32).to_be_bytes());
+        let mut out = self.head.to_vec();
+        let mut offsets: Vec<Vec<usize>> = self.objects.iter().map(|o| vec![0; o.entries.len()]).collect();
+        for &(o, e) in &self.order {
+            offsets[o][e] = out.len();
+            out.extend(&self.objects[o].entries[e].data);
+        }
+        let mut groups = vec![];
+        for (o, obj) in self.objects.iter().enumerate() {
+            let first = out.len();
+            for (e, entry) in obj.entries.iter().enumerate() {
+                let mut meta = entry.meta;
+                put(&mut meta, 12, entry.data.len());
+                put(&mut meta, 16, entry.data.len());
+                put(&mut meta, 28, offsets[o][e]);
+                out.extend(meta);
+            }
+            let mut group = obj.group;
+            put(&mut group, 4, obj.entries.len());
+            put(&mut group, 8, obj.entries.len());
+            put(&mut group, 16, first);
+            groups.push(out.len());
+            out.extend(group);
+        }
+        let table = out.len();
+        for (obj, grp) in self.objects.iter().zip(groups) {
+            let mut record = obj.record;
+            put(&mut record, 20, grp);
+            out.extend(record);
+        }
+        put(&mut out, 0x2c, table);
+        out
+    }
+
+    fn chunks(&self) -> impl Iterator<Item = ([u8; 4], u32, &[u8])> {
+        self.objects.iter().flat_map(|o| &o.entries).map(|e| {
+            (e.meta[..4].try_into().unwrap(), u32::from_be_bytes(e.meta[4..8].try_into().unwrap()), e.data.as_slice())
+        })
+    }
+
+    fn chunk_mut(&mut self, typ: &[u8; 4]) -> Option<&mut Vec<u8>> {
+        self.objects.iter_mut().flat_map(|o| &mut o.entries).find(|e| &e.meta[..4] == typ).map(|e| &mut e.data)
+    }
 }
 
 /// Children of a CommonBlockFmt property block.
@@ -87,6 +159,29 @@ fn child<'a>(b: &'a [u8], key: &str) -> Option<&'a [u8]> {
     props(b).into_iter().find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
+/// A property block rebuilt from (key, value) items, keeping the CommonBlockFmt prefix if `like` has one.
+fn block<'a>(like: &[u8], items: impl IntoIterator<Item = (&'a str, Vec<u8>)>) -> Vec<u8> {
+    let mut out = if like.starts_with(b"CommonBlockFmt\0") { like[..17].to_vec() } else { vec![] };
+    for (k, v) in items {
+        let mut key = [0u8; 8];
+        key[..k.len()].copy_from_slice(k.as_bytes());
+        out.extend(key);
+        out.extend((v.len() as u32).to_le_bytes());
+        out.extend(v);
+    }
+    out
+}
+
+/// `b` with the block at `path` replaced by `f(old block)`.
+fn edit(b: &[u8], path: &[&str], f: &mut dyn FnMut(&[u8]) -> Vec<u8>) -> Option<Vec<u8>> {
+    let items = props(b);
+    let at = items.iter().position(|(k, _)| *k == path[0])?;
+    let new = if path.len() == 1 { f(items[at].1) } else { edit(items[at].1, &path[1..], f)? };
+    Some(block(b, items.iter().enumerate().map(|(i, &(k, v))| (k, if i == at { new.clone() } else { v.to_vec() }))))
+}
+
+const OBJINFO: [&str; 4] = ["ALLDSTAT", "CMNSTATE", "VSSTYLE", "OBJINFO"];
+
 // STYLE (35 bytes, LE): u32 object index, u32 object type, u8 line on, rgb line, f64 weight,
 // u8 fill on, rgb fill, u8 shadow on, rgb shadow, 7 bytes not decoded yet (shape, linkage, label position).
 fn style(s: &[u8]) -> Option<(u32, u32, Style)> {
@@ -100,6 +195,46 @@ fn style(s: &[u8]) -> Option<(u32, u32, Style)> {
 }
 
 impl Sbd {
+    /// The document as SeqBuilder Pro would read it; unchanged chunks are written back byte for byte.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.container.write()
+    }
+
+    /// Set (or with `None` remove) the custom style of feature `id`, as Style ▸ Fill/Line does in SeqBuilder.
+    pub fn set_feature_style(&mut self, id: u32, st: Option<Style>) {
+        let kind = self.feats.iter().find(|f| f.id == id).map(|f| f.kind.clone()).unwrap_or_default();
+        let template = self.type_records.get(&kind).cloned().unwrap_or_else(|| {
+            let mut r = vec![0u8; 35];
+            r[12..20].copy_from_slice(&1f64.to_le_bytes());
+            r
+        });
+        let mut set = |objinfo: &[u8]| -> Vec<u8> {
+            let items = props(objinfo);
+            let mine = |v: &[u8]| matches!(style(v), Some((i, FEATURE_OBJECT, _)) if i == id);
+            let old = items.iter().find(|(k, v)| *k == "STYLE" && mine(v)).map(|(_, v)| v.to_vec());
+            let mut rest: Vec<(&str, Vec<u8>)> = items.iter().filter(|(k, v)| !(*k == "STYLE" && mine(v))).map(|&(k, v)| (k, v.to_vec())).collect();
+            if let Some(st) = st {
+                let mut r = old.unwrap_or_else(|| template.clone());
+                r[0..4].copy_from_slice(&id.to_le_bytes());
+                r[4..8].copy_from_slice(&FEATURE_OBJECT.to_le_bytes());
+                r[8] = st.line.is_some() as u8;
+                if let Some(c) = st.line { r[9..12].copy_from_slice(&c); }
+                r[12..20].copy_from_slice(&st.weight.to_le_bytes());
+                r[20] = st.fill.is_some() as u8;
+                if let Some(c) = st.fill { r[21..24].copy_from_slice(&c); }
+                rest.insert(0, ("STYLE", r)); // SeqBuilder puts the newest object style first
+            }
+            block(objinfo, rest)
+        };
+        if let Some(tl) = self.container.chunk_mut(b"UVTL") {
+            if let Some(new) = edit(tl, &OBJINFO, &mut set) { *tl = new; }
+        }
+        match st {
+            Some(st) => { self.obj_styles.insert(id, st); }
+            None => { self.obj_styles.remove(&id); }
+        }
+    }
+
     /// A GenBank header field (DEFINITION, ACCESSION, COMMENT...) from UVTX, continuation lines included.
     pub fn header_field(&self, key: &str, sep: &str) -> String {
         let mut lines = self.header.lines().skip_while(|l| l.split_whitespace().next() != Some(key));
@@ -111,7 +246,8 @@ impl Sbd {
 }
 
 pub fn read(d: &[u8]) -> Result<Sbd, String> {
-    let chunks = chunks(d).ok_or("not a SeqBuilder document (bad chunk directory)")?;
+    let container = Container::parse(d).ok_or("not a SeqBuilder document (bad chunk directory)")?;
+    let chunks: Vec<_> = container.chunks().collect();
     let get = |t: [u8; 4]| chunks.iter().filter(move |c| c.0 == t);
     let text = |b: &[u8]| -> String { b.iter().map(|&c| c as char).collect() }; // Latin-1
     let seq = get(*b"UVSQ").next().ok_or("no sequence")?.2.to_vec();
@@ -135,7 +271,7 @@ pub fn read(d: &[u8]) -> Result<Sbd, String> {
         })
     }).collect();
 
-    let (mut type_styles, mut obj_styles) = (HashMap::new(), HashMap::new());
+    let (mut type_styles, mut obj_styles, mut type_records) = (HashMap::new(), HashMap::new(), HashMap::new());
     let vs = get(*b"UVTL").next()
         .and_then(|c| child(c.2, "ALLDSTAT")).and_then(|b| child(b, "CMNSTATE")).and_then(|b| child(b, "VSSTYLE"));
     if let Some(vs) = vs {
@@ -145,15 +281,19 @@ pub fn read(d: &[u8]) -> Result<Sbd, String> {
                     if let Some((idx, FEATURE_OBJECT, st)) = style(s) { obj_styles.insert(idx, st); }
                 },
                 "TYPEINFO" => for (_, td) in props(v).into_iter().filter(|(k, _)| *k == "TDATA") {
-                    let (Some(ti), Some(st)) = (child(td, "TINFO"), child(td, "STYLE").and_then(style)) else { continue };
-                    let n = u32le(ti, 0).unwrap_or(0) as usize;
-                    if let Some(name) = ti.get(4..4 + n) { type_styles.insert(text(name), st.2); }
+                    let (Some(ti), Some(raw)) = (child(td, "TINFO"), child(td, "STYLE")) else { continue };
+                    let (Some(st), n) = (style(raw), u32le(ti, 0).unwrap_or(0) as usize) else { continue };
+                    if let Some(name) = ti.get(4..4 + n) {
+                        type_styles.insert(text(name), st.2);
+                        type_records.insert(text(name), raw.to_vec());
+                    }
                 },
                 _ => {}
             }
         }
     }
-    Ok(Sbd { seq, header, circular, feats, type_styles, obj_styles })
+    drop(chunks);
+    Ok(Sbd { container, type_records, seq, header, circular, feats, type_styles, obj_styles })
 }
 
 #[cfg(test)]
@@ -182,5 +322,30 @@ mod tests {
         let red = read(&std::fs::read("testdata/pBR322_blaRED.sbd").unwrap()).unwrap();
         assert_eq!((red.feats[38].name.as_str(), red.feats[38].kind.as_str()), ("bla", "CDS"));
         assert_eq!(red.obj_styles[&38].fill, Some([0xff, 0, 0]));
+    }
+
+    #[test]
+    fn writes_back_unchanged_files_byte_for_byte() {
+        for f in ["pBR322.sbd", "pBR322_blaRED.sbd", "ALDH2.sbd"] {
+            let d = std::fs::read(format!("testdata/{f}")).unwrap();
+            assert!(read(&d).unwrap().to_bytes() == d, "{f}");
+        }
+    }
+
+    /// Recolouring bla red must give the same style block as SeqBuilder Pro saved in pBR322_blaRED.sbd.
+    #[test]
+    fn custom_style_matches_seqbuilder() {
+        let objinfo = |s: &Sbd| s.container.chunks().find(|c| &c.0 == b"UVTL")
+            .and_then(|c| OBJINFO.iter().try_fold(c.2, |b, k| child(b, k)).map(<[u8]>::to_vec)).unwrap();
+        let mut d = read(&std::fs::read("testdata/pBR322.sbd").unwrap()).unwrap();
+        let red = read(&std::fs::read("testdata/pBR322_blaRED.sbd").unwrap()).unwrap();
+        d.set_feature_style(38, Some(red.obj_styles[&38]));
+        assert_eq!(objinfo(&d), objinfo(&red));
+
+        let again = read(&d.to_bytes()).unwrap();
+        assert_eq!(again.obj_styles[&38], red.obj_styles[&38]);
+        assert_eq!((again.seq.len(), again.feats.len()), (4361, 50));
+        d.set_feature_style(38, None);
+        assert!(read(&d.to_bytes()).unwrap().to_bytes() == std::fs::read("testdata/pBR322.sbd").unwrap());
     }
 }
