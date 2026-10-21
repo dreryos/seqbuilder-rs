@@ -468,7 +468,7 @@ impl App {
             });
             ui.menu_button("Features", |ui| {
                 if ui.add_enabled(self.sel.is_some(), egui::Button::new("New Feature  ⌘K")).clicked() { self.new_feature(); }
-                if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Delete Feature  ⌫")).clicked() { self.delete_feature(); }
+                if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Delete Feature")).clicked() { self.delete_feature(); }
             });
             ui.menu_button("Enzymes", |ui| {
                 if ui.button("Selector Manager…").clicked() { self.selmgr = self.sels.first().map(|s| s.id); }
@@ -490,9 +490,6 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) { self.save(None); }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) { self.new_feature(); }
-        if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete)) {
-            self.delete_feature();
-        }
         let (open, all, goto) = ctx.input_mut(|i| (
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::O),
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
