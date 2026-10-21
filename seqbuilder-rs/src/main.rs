@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 const DNASTAR_DIR: &str = "/Applications/DNASTAR/Lasergene19";
 
+#[derive(Clone)]
 struct Feat {
     kind: String,
     name: String,
@@ -28,6 +29,12 @@ struct Feat {
     edited: bool,                      // style changed since the last save
     quals: Vec<String>,                // "key=value" qualifier lines, quoting included
     dirty: bool,                       // name, type, range or qualifiers changed since the last save
+}
+
+/// The Range column for a feature that does not wrap the origin.
+fn range_text(f: &Feat) -> String {
+    let (lo, hi) = (f.start + 1, f.end);
+    if f.strand < 0 { format!("complement({lo}..{hi})") } else { format!("{lo}..{hi}") }
 }
 
 /// Set (or with an empty value remove) a qualifier line.
@@ -54,6 +61,7 @@ struct Doc {
     path: PathBuf,
     sbd: Option<sbd::Sbd>, // kept to write the document back
     deleted: Vec<u32>,     // .sbd feature ids deleted since the last save
+    seq_dirty: bool,       // sequence edited since the last save
 }
 
 struct Site {
@@ -144,7 +152,7 @@ fn load(path: &Path) -> Result<Doc, String> {
     let mut doc = if text.first() == Some(&b'>') {
         let seq: Vec<u8> = text.split(|&b| b == b'\n').filter(|l| !l.starts_with(b">"))
             .flatten().copied().filter(u8::is_ascii_alphabetic).collect();
-        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![] }
+        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false }
     } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sbd")) {
         let s = sbd::read(&text)?;
         let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
@@ -169,7 +177,7 @@ fn load(path: &Path) -> Result<Doc, String> {
             name: locus.split_whitespace().next().map_or(name, str::to_owned),
             definition: s.header_field("DEFINITION", " "), accession: s.header_field("ACCESSION", " "),
             comment: s.header_field("COMMENT", "\n"),
-            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: Some(s), deleted: vec![],
+            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: Some(s), deleted: vec![], seq_dirty: false,
         }
     } else {
         let rec = gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())?
@@ -199,7 +207,7 @@ fn load(path: &Path) -> Result<Doc, String> {
         Doc {
             name: rec.name.clone().unwrap_or(name), definition: rec.definition.clone().unwrap_or_default(),
             accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
-            seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![],
+            seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false,
         }
     };
     doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
@@ -274,6 +282,9 @@ struct App {
     goto_open: bool,
     goto_text: String,
     scroll_to: Option<usize>,
+    caret: Option<usize>,                // insertion point in the Sequence view (before this base)
+    undo: Vec<(Vec<u8>, Vec<Feat>)>,
+    redo: Vec<(Vec<u8>, Vec<Feat>)>,
     frames: u32,
 }
 
@@ -316,13 +327,81 @@ impl App {
         if changed {
             if !wraps { (f.start, f.end) = (lo - 1, hi); }
             f.strand = if comp { -1 } else { 1 };
-            f.range = if comp { format!("complement({lo}..{hi})") } else { format!("{lo}..{hi}") };
+            f.range = range_text(f);
             f.label = short(&f.name);
             if f.quals.iter().any(|q| q.starts_with("dnas_title=")) { set_qual(&mut f.quals, "dnas_title", &f.name.clone()); }
             set_qual(&mut f.quals, "note", &note);
             f.desc = if note.is_empty() { f.desc.clone() } else { note };
             f.dirty = true;
             d.lanes = assign_lanes(&mut d.feats, len);
+        }
+    }
+
+    /// Replace bases [a, b) with `ins` and move features the way SeqBuilder does: coordinates past the edit
+    /// shift, coordinates inside a deleted stretch clamp to its start, features left empty are deleted.
+    fn edit_seq(&mut self, a: usize, b: usize, ins: &[u8]) {
+        let Some(d) = &mut self.doc else { return };
+        self.undo.push((d.seq.clone(), d.feats.clone()));
+        self.redo.clear();
+        let (cut, add) = (b - a, ins.len());
+        d.seq.splice(a..b, ins.iter().copied());
+        let start = |s: usize| if s >= b { s - cut + add } else if s >= a { a } else { s };
+        let end = |e: usize| if e > b { e - cut + add } else if e > a { a } else { e };
+        let mut gone = vec![];
+        for (i, f) in d.feats.iter_mut().enumerate() {
+            let (s, e) = (start(f.start), end(f.end));
+            if (s, e) == (f.start, f.end) { continue; }
+            if f.start < f.end && s >= e { gone.push(i); continue; }
+            (f.start, f.end, f.dirty) = (s, e, true);
+            if s < e { f.range = range_text(f); }
+        }
+        for i in gone.into_iter().rev() { d.deleted.extend(d.feats.remove(i).sbd_id); }
+        d.seq_dirty = true;
+        d.lanes = assign_lanes(&mut d.feats, d.seq.len());
+        (self.sel, self.caret, self.sel_feat) = (None, Some(a + add), None);
+        self.compute_hits();
+    }
+
+    fn undo_redo(&mut self, redo: bool) {
+        let Some(d) = &mut self.doc else { return };
+        let (from, to) = if redo { (&mut self.redo, &mut self.undo) } else { (&mut self.undo, &mut self.redo) };
+        let Some((seq, feats)) = from.pop() else { return };
+        to.push((std::mem::replace(&mut d.seq, seq), std::mem::replace(&mut d.feats, feats)));
+        // Rewrite everything on the next save; ids of features that came back must not be deleted.
+        d.feats.iter_mut().for_each(|f| f.dirty = true);
+        d.deleted.retain(|id| !d.feats.iter().any(|f| f.sbd_id == Some(*id)));
+        d.seq_dirty = true;
+        d.lanes = assign_lanes(&mut d.feats, d.seq.len());
+        (self.sel, self.caret, self.sel_feat) = (None, None, None);
+        self.compute_hits();
+    }
+
+    /// Typing, deleting, cut and paste in the Sequence view.
+    fn sequence_keys(&mut self, ctx: &egui::Context) {
+        if self.view != View::Sequence || self.doc.is_none() || ctx.egui_wants_keyboard_input() { return; }
+        let bases = |t: &str| t.bytes().filter(|b| b"ACGTUNRYKMSWBDHVacgtunrykmswbdhv".contains(b)).collect::<Vec<u8>>();
+        let len = self.doc.as_ref().map_or(0, |d| d.seq.len());
+        let span = |app: &App| app.sel.or(app.caret.map(|c| (c, c)));
+        for ev in ctx.input(|i| i.events.clone()) {
+            match ev {
+                egui::Event::Text(t) | egui::Event::Paste(t) => {
+                    let ins = bases(&t);
+                    if let (false, Some((a, b))) = (ins.is_empty(), span(self)) { self.edit_seq(a, b, &ins); }
+                }
+                egui::Event::Cut => if let Some((a, b)) = self.sel {
+                    if let Some(s) = self.selected() { ctx.copy_text(String::from_utf8_lossy(s).into_owned()); }
+                    self.edit_seq(a, b, b"");
+                },
+                egui::Event::Key { key, pressed: true, modifiers, .. } if modifiers.is_none() => match (key, self.sel, self.caret) {
+                    (egui::Key::Backspace | egui::Key::Delete, Some((a, b)), _) => self.edit_seq(a, b, b""),
+                    (egui::Key::Backspace, None, Some(c)) if c > 0 => self.edit_seq(c - 1, c, b""),
+                    (egui::Key::Delete, None, Some(c)) if c < len => self.edit_seq(c, c + 1, b""),
+                    (egui::Key::ArrowLeft, _, Some(c)) => self.caret = Some(c.saturating_sub(1)),
+                    (egui::Key::ArrowRight, _, Some(c)) => self.caret = Some((c + 1).min(len)),
+                    _ => {}
+                },
+                _ => {}
+            }
         }
     }
 
@@ -358,6 +437,10 @@ impl App {
             return;
         };
         for id in d.deleted.drain(..) { s.remove_feature(id); }
+        if d.seq_dirty {
+            s.set_sequence(d.seq.clone());
+            d.seq_dirty = false;
+        }
         for f in d.feats.iter_mut().filter(|f| f.dirty) {
             let (lo, hi) = (f.start + 1, f.end);
             let comp = f.strand < 0;
@@ -458,6 +541,9 @@ impl App {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo  ⌘Z")).clicked() { self.undo_redo(false); }
+                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo  ⇧⌘Z")).clicked() { self.undo_redo(true); }
+                ui.separator();
                 if ui.button("Copy  ⌘C").clicked() {
                     if let Some(s) = self.selected() { ui.ctx().copy_text(String::from_utf8_lossy(s).into_owned()); }
                 }
@@ -490,6 +576,11 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) { self.save(None); }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) { self.new_feature(); }
+        if !ctx.egui_wants_keyboard_input() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)) { self.undo_redo(true); }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) { self.undo_redo(false); }
+        }
+        self.sequence_keys(ctx);
         let (open, all, goto) = ctx.input_mut(|i| (
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::O),
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
@@ -879,7 +970,7 @@ impl App {
 
         let mut area = egui::ScrollArea::vertical().auto_shrink(false);
         if let Some(pos) = self.scroll_to.take() { area = area.vertical_scroll_offset((pos / bpr) as f32 * row_h); }
-        let (mut sel, mut anchor, show_comp) = (self.sel, self.anchor, self.complement);
+        let (mut sel, mut anchor, show_comp, caret) = (self.sel, self.anchor, self.complement, self.caret);
         area.show_rows(ui, row_h, rows, |ui, range| {
             let origin = ui.cursor().min - Vec2::new(0.0, range.start as f32 * row_h);
             let base_at = |p: Pos2| -> usize {
@@ -915,6 +1006,10 @@ impl App {
                     p.line_segment([Pos2::new(x(s.pos), r.bottom()), Pos2::new(x(s.pos), ys)], Stroke::new(0.6, fg));
                     next_free = r.right() + 6.0;
                 }
+                if let Some(c) = caret.filter(|&c| (a..b).contains(&c) || (c == b && b == doc.seq.len())) {
+                    let cx = if c < b { x(c) } else { x(b - 1) + cw } - 1.0;
+                    p.line_segment([Pos2::new(cx, ys - 1.0), Pos2::new(cx, ys + lh)], Stroke::new(2.0, fg));
+                }
                 for i in a..b {
                     p.text(Pos2::new(x(i), ys), Align2::LEFT_TOP, (doc.seq[i] as char).to_string(), font.clone(), fg);
                     if show_comp { p.text(Pos2::new(x(i), ys + lh), Align2::LEFT_TOP, (complement(doc.seq[i]) as char).to_string(), font.clone(), dim); }
@@ -946,7 +1041,10 @@ impl App {
                 }
             }
         });
-        if sel.is_some_and(|(a, b)| a == b) { sel = None; }
+        if let Some((a, b)) = sel {
+            // a click without dragging places the caret
+            if a == b { (sel, self.caret) = (None, Some(a)); } else { self.caret = None; }
+        }
         self.sel = sel;
         self.anchor = anchor;
     }
@@ -973,6 +1071,7 @@ impl eframe::App for App {
             }
             // Debug aid: SEQBUILDER_FEATURE=n opens with that table row picked.
             if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { self.sel_feat = Some(i); }
+            if let Some(c) = std::env::var("SEQBUILDER_CARET").ok().and_then(|v| v.parse().ok()) { self.caret = Some(c); }
         }
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
@@ -1145,6 +1244,42 @@ mod tests {
         assert_eq!((new.id, new.kind.as_str(), new.start, new.end), (50, "misc_feature", 100, 200));
         let hidden = app.doc.as_ref().unwrap().feats[5].sbd_id.unwrap();
         assert_eq!((back.shown[&hidden], back.shown[&50]), (false, true));
+    }
+
+    /// Inserting GGGGG before base 10 and deleting 2000..2009 must give the sequence and features
+    /// SeqBuilder Pro saved in pBR322_ins.sbd and pBR322_cut.sbd.
+    #[test]
+    fn sequence_edits_match_seqbuilder() {
+        for (sample, edit) in [("pBR322_ins", (9, 9, &b"GGGGG"[..])), ("pBR322_cut", (1999, 2009, &b""[..]))] {
+            let mut app = App::default();
+            app.open(Path::new("testdata/pBR322.sbd"));
+            app.edit_seq(edit.0, edit.1, edit.2);
+            let out = std::env::temp_dir().join(format!("seqbuilder-rs-{sample}.sbd"));
+            app.save(Some(out.clone()));
+            assert!(app.error.is_none(), "{:?}", app.error);
+            let ours = std::fs::read(&out).unwrap();
+            let want = std::fs::read(format!("testdata/{sample}.sbd")).unwrap();
+            let (got, exp) = (sbd::read(&ours).unwrap(), sbd::read(&want).unwrap());
+            assert!(got.seq == exp.seq, "{sample}: sequence");
+            assert_eq!(got.feats.len(), exp.feats.len());
+            for (g, e) in got.feats.iter().zip(&exp.feats) {
+                assert_eq!((g.id, g.start, g.end, &g.quals), (e.id, e.start, e.end, &e.quals), "{sample}: {}", e.name);
+            }
+            assert!(sbd::uvsi(&ours) == sbd::uvsi(&want), "{sample}: UVSI");
+        }
+    }
+
+    #[test]
+    fn undo_restores_sequence_and_features() {
+        let mut app = App::default();
+        app.open(Path::new("testdata/pBR322.sbd"));
+        let before = (app.doc.as_ref().unwrap().seq.clone(), app.doc.as_ref().unwrap().feats[2].start);
+        app.edit_seq(10, 30, b""); // swallows echinomycin 24..27
+        assert_eq!(app.doc.as_ref().unwrap().feats.len(), 49);
+        app.undo_redo(false);
+        let d = app.doc.as_ref().unwrap();
+        assert_eq!((d.seq.clone(), d.feats[2].start, d.feats.len()), (before.0, before.1, 50));
+        assert!(d.deleted.is_empty());
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.

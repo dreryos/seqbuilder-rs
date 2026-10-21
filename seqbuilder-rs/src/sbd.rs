@@ -5,7 +5,8 @@
 // type4, id, flags, len, len, timestamp, 0, offset. Chunks used here:
 //   UVSQ  sequence, ASCII
 //   UVTX  GenBank header text (LOCUS..COMMENT), CRLF; "^^" when the sequence was made in SeqBuilder
-//   UVSI  sequence info; its trailing property block holds SeqShape (1 linear, 2 circular)
+//   UVSI  sequence info: u32 BE sequence length at 16; its trailing property block holds SeqShape
+//         (1 linear, 2 circular)
 //   UVFT  one feature per id: 416-byte record + CR-separated "/key=value" qualifiers. Record: u16 0x65,
 //         Pascal name at 6 (256 bytes), u32 416 at 262, Pascal type at 266, start/end (u32, 1-based,
 //         reversed on the complement strand) at 394/398, u16 complement at 402, u16 1 at 404; the
@@ -418,6 +419,13 @@ impl Sbd {
         self.shown.insert(id, shown);
     }
 
+    /// Replace the sequence (features are moved by the caller and saved with `update_feature`).
+    pub fn set_sequence(&mut self, seq: Vec<u8>) {
+        if let Some(sq) = self.container.chunk_mut(b"UVSQ") { *sq = seq.clone(); }
+        if let Some(si) = self.container.chunk_mut(b"UVSI") { si[16..20].copy_from_slice(&(seq.len() as u32).to_be_bytes()); }
+        self.seq = seq;
+    }
+
     /// Replace an existing feature (matched by id) with edited name, type, range or qualifiers.
     pub fn update_feature(&mut self, f: SbdFeat) -> Result<(), String> {
         let data = self.container.chunk_id_mut(b"UVFT", Some(f.id)).ok_or(format!("no feature {}", f.id))?;
@@ -451,6 +459,12 @@ impl Sbd {
             .chain(lines.take_while(|l| l.starts_with("            ")).map(str::trim))
             .collect::<Vec<_>>().join(sep)
     }
+}
+
+/// The UVSI chunk of a document (for comparing saves).
+#[cfg(test)]
+pub fn uvsi(d: &[u8]) -> Vec<u8> {
+    Container::parse(d).and_then(|c| c.chunks().find(|c| &c.0 == b"UVSI").map(|c| c.2.to_vec())).unwrap_or_default()
 }
 
 pub fn read(d: &[u8]) -> Result<Sbd, String> {
