@@ -10,6 +10,8 @@ use std::f32::consts::{PI, TAU};
 use std::path::{Path, PathBuf};
 
 const DNASTAR_DIR: &str = "/Applications/DNASTAR/Lasergene19";
+// ponytail: new .sbd documents start from a SeqBuilder-saved document; a neutral one (New DNA, a few bases) is better.
+const SBD_TEMPLATE: &[u8] = include_bytes!("../testdata/ALDH2.sbd");
 
 #[derive(Clone)]
 struct Feat {
@@ -29,6 +31,13 @@ struct Feat {
     edited: bool,                      // style changed since the last save
     quals: Vec<String>,                // "key=value" qualifier lines, quoting included
     dirty: bool,                       // name, type, range or qualifiers changed since the last save
+}
+
+/// A feature as stored in .sbd (1-based, start > end on the complement strand).
+fn sbd_feat(f: &Feat, id: u32) -> sbd::SbdFeat {
+    let (lo, hi, comp) = (f.start + 1, f.end, f.strand < 0);
+    let (start, end) = if comp { (hi, lo) } else { (lo, hi) };
+    sbd::SbdFeat { id, name: f.name.clone(), kind: f.kind.clone(), start, end, complement: comp, quals: f.quals.clone() }
 }
 
 /// The Range column for a feature that does not wrap the origin.
@@ -62,6 +71,7 @@ struct Doc {
     sbd: Option<sbd::Sbd>, // kept to write the document back
     deleted: Vec<u32>,     // .sbd feature ids deleted since the last save
     seq_dirty: bool,       // sequence edited since the last save
+    header: String,        // GenBank header (LOCUS..COMMENT) for a new .sbd; empty for FASTA
 }
 
 struct Site {
@@ -152,7 +162,7 @@ fn load(path: &Path) -> Result<Doc, String> {
     let mut doc = if text.first() == Some(&b'>') {
         let seq: Vec<u8> = text.split(|&b| b == b'\n').filter(|l| !l.starts_with(b">"))
             .flatten().copied().filter(u8::is_ascii_alphabetic).collect();
-        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false }
+        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false, header: String::new() }
     } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sbd")) {
         let s = sbd::read(&text)?;
         let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
@@ -177,7 +187,7 @@ fn load(path: &Path) -> Result<Doc, String> {
             name: locus.split_whitespace().next().map_or(name, str::to_owned),
             definition: s.header_field("DEFINITION", " "), accession: s.header_field("ACCESSION", " "),
             comment: s.header_field("COMMENT", "\n"),
-            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: Some(s), deleted: vec![], seq_dirty: false,
+            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), header: s.header.clone(), sbd: Some(s), deleted: vec![], seq_dirty: false,
         }
     } else {
         let rec = gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())?
@@ -186,13 +196,16 @@ fn load(path: &Path) -> Result<Doc, String> {
         let feats = rec.features.iter().filter_map(|f| {
             let (s, e) = f.location.find_bounds().ok()?;
             let q = |k: &str| f.qualifier_values(k).next().map(str::to_owned);
-            let name = ["label", "gene", "product", "note"].iter().find_map(|k| q(k)).unwrap_or_else(|| f.kind.to_string());
-            let quals = f.qualifiers.iter().map(|(k, v)| match v {
-                // GenBank leaves numbers and [citations] unquoted
-                Some(v) if v.parse::<i64>().is_ok() || v.starts_with('[') => format!("{k}={v}"),
-                Some(v) => format!("{k}=\"{v}\""),
+            // INSDC qualifiers whose values are written without quotes
+            const BARE: [&str; 13] = ["anticodon", "citation", "codon_start", "compare", "direction", "estimated_length",
+                "mod_base", "number", "rpt_type", "rpt_unit_range", "tag_peptide", "transl_except", "transl_table"];
+            let quals: Vec<String> = f.qualifiers.iter().map(|(k, v)| match v {
+                Some(v) if BARE.contains(&k.as_ref()) => format!("{k}={v}"),
+                // continuation lines join with a space, except inside a protein translation
+                Some(v) => format!("{k}=\"{}\"", v.replace('\n', if k == "translation" { "" } else { " " })),
                 None => k.to_string(),
             }).collect();
+            let name = sbd::feature_name(&quals);
             // find_bounds unwraps origin-spanning joins past len; fold them back.
             let (start, end) = (s.rem_euclid(len as i64) as usize, e as usize);
             let end = if end > len { end - len } else { end };
@@ -208,6 +221,7 @@ fn load(path: &Path) -> Result<Doc, String> {
             name: rec.name.clone().unwrap_or(name), definition: rec.definition.clone().unwrap_or_default(),
             accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
             seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false,
+            header: text.iter().map(|&b| b as char).collect::<String>().split("\nFEATURES").next().unwrap_or_default().to_string() + "\n",
         }
     };
     doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
@@ -432,20 +446,26 @@ impl App {
     /// deleted, new and changed features, then styles and Show flags.
     fn save(&mut self, to: Option<PathBuf>) {
         let Some(d) = &mut self.doc else { return };
-        let Some(s) = &mut d.sbd else {
-            self.error = Some("Saving is only supported for documents opened from .sbd so far".into());
-            return;
-        };
+        if d.sbd.is_none() {
+            // A GenBank or FASTA document becomes an .sbd built from the template.
+            let Some(path) = &to else { return self.save_as() };
+            let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let feats = d.feats.iter().map(|f| sbd_feat(f, 0)).collect();
+            match sbd::new_document(SBD_TEMPLATE, &name, &d.header, d.seq.clone(), d.circular, feats) {
+                Ok(s) => d.sbd = Some(s),
+                Err(e) => { self.error = Some(e); return; }
+            }
+            for (i, f) in d.feats.iter_mut().enumerate() { (f.sbd_id, f.dirty) = (Some(i as u32), false); }
+            (d.seq_dirty, d.deleted) = (false, vec![]);
+        }
+        let Some(s) = &mut d.sbd else { return };
         for id in d.deleted.drain(..) { s.remove_feature(id); }
         if d.seq_dirty {
             s.set_sequence(d.seq.clone());
             d.seq_dirty = false;
         }
         for f in d.feats.iter_mut().filter(|f| f.dirty) {
-            let (lo, hi) = (f.start + 1, f.end);
-            let comp = f.strand < 0;
-            let (start, end) = if comp { (hi, lo) } else { (lo, hi) };
-            let feat = sbd::SbdFeat { id: f.sbd_id.unwrap_or(0), name: f.name.clone(), kind: f.kind.clone(), start, end, complement: comp, quals: f.quals.clone() };
+            let feat = sbd_feat(f, f.sbd_id.unwrap_or(0));
             match f.sbd_id {
                 Some(_) => if let Err(e) = s.update_feature(feat) { self.error = Some(e); return; },
                 None => f.sbd_id = Some(s.add_feature(feat)),
@@ -471,7 +491,7 @@ impl App {
     }
 
     fn save_as(&mut self) {
-        let name = self.doc.as_ref().and_then(|d| d.path.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = self.doc.as_ref().and_then(|d| d.path.file_stem()).map(|n| n.to_string_lossy().into_owned() + ".sbd").unwrap_or_default();
         if let Some(p) = rfd::FileDialog::new().add_filter("SeqBuilder document", &["sbd"]).set_file_name(name).save_file() {
             self.save(Some(p));
         }
@@ -1280,6 +1300,29 @@ mod tests {
         let d = app.doc.as_ref().unwrap();
         assert_eq!((d.seq.clone(), d.feats[2].start, d.feats.len()), (before.0, before.1, 50));
         assert!(d.deleted.is_empty());
+    }
+
+    /// Saving pBR322.gb as .sbd (from the ALDH2 template) must give what SeqBuilder Pro made of it: pBR322.sbd.
+    #[test]
+    fn genbank_saved_as_sbd_matches_seqbuilder() {
+        let mut app = App::default();
+        app.open(Path::new("testdata/pBR322.gb"));
+        let out = std::env::temp_dir().join("pBR322.sbd");
+        app.save(Some(out.clone()));
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let ours = std::fs::read(&out).unwrap();
+        let want = std::fs::read("testdata/pBR322.sbd").unwrap();
+        let (got, exp) = (sbd::read(&ours).unwrap(), sbd::read(&want).unwrap());
+        assert!(got.seq == exp.seq);
+        assert_eq!((got.circular, got.header == exp.header), (true, true));
+        assert!(sbd::uvsi(&ours) == sbd::uvsi(&want));
+        assert_eq!(got.feats.len(), exp.feats.len());
+        for (g, e) in got.feats.iter().zip(&exp.feats) {
+            assert_eq!((g.id, &g.name, &g.kind, g.start, g.end, g.complement), (e.id, &e.name, &e.kind, e.start, e.end, e.complement));
+            assert_eq!(g.quals, e.quals, "{}", e.name);
+        }
+        assert_eq!(got.shown, exp.shown);
+        assert!(got.obj_styles.is_empty());
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.

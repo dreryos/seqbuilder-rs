@@ -98,7 +98,7 @@ fn pascal(d: &[u8], o: usize) -> String {
 struct Entry {
     meta: [u8; 32], // as read; length and offset are rewritten on save
     data: Vec<u8>,
-    rank: u64,      // place of the data in the file: 2 × original offset, odd for chunks added after one
+    rank: (u64, u32), // place of the data in the file: (original offset, n-th chunk added after it)
 }
 
 impl Entry {
@@ -134,7 +134,7 @@ impl Container {
                 let e = first + 32 * k;
                 let meta: [u8; 32] = d.get(e..e + 32)?.try_into().ok()?;
                 let (len, off) = (u32be(&meta, 12)? as usize, u32be(&meta, 28)? as usize);
-                entries.push(Entry { meta, data: d.get(off..off + len)?.to_vec(), rank: 2 * off as u64 });
+                entries.push(Entry { meta, data: d.get(off..off + len)?.to_vec(), rank: (off as u64, 0) });
             }
             objects.push(Object { record: d[o..o + 0x40].try_into().ok()?, group: d.get(grp..grp + 20)?.try_into().ok()?, entries });
             o += 0x40;
@@ -146,7 +146,7 @@ impl Container {
         let put = |b: &mut [u8], at: usize, v: usize| b[at..at + 4].copy_from_slice(&(v as u32).to_be_bytes());
         let mut out = self.head.to_vec();
         let mut offsets: Vec<Vec<usize>> = self.objects.iter().map(|o| vec![0; o.entries.len()]).collect();
-        let mut order: Vec<(u64, usize, usize)> = self.objects.iter().enumerate()
+        let mut order: Vec<((u64, u32), usize, usize)> = self.objects.iter().enumerate()
             .flat_map(|(o, obj)| obj.entries.iter().enumerate().map(move |(e, en)| (en.rank, o, e))).collect();
         order.sort();
         for (_, o, e) in order {
@@ -202,8 +202,23 @@ impl Container {
         let at = obj.entries.iter().rposition(|e| e.is(typ))?;
         let mut meta = obj.entries[at].meta;
         meta[4..8].copy_from_slice(&id.to_be_bytes());
-        let rank = obj.entries[at].rank + 1;
+        let rank = (obj.entries[at].rank.0, obj.entries[at].rank.1 + 1);
         obj.entries.insert(at + 1, Entry { meta, data, rank });
+        Some(())
+    }
+
+    /// Replace every chunk of a type with `chunks`, where the first old one was.
+    fn replace_all(&mut self, typ: &[u8; 4], chunks: Vec<(u32, Vec<u8>)>) -> Option<()> {
+        let obj = self.objects.iter_mut().find(|o| o.entries.iter().any(|e| e.is(typ)))?;
+        let at = obj.entries.iter().position(|e| e.is(typ))?;
+        let (meta, rank) = (obj.entries[at].meta, obj.entries[at].rank);
+        obj.entries.retain(|e| !e.is(typ));
+        let new = chunks.into_iter().enumerate().map(|(k, (id, data))| {
+            let mut meta = meta;
+            meta[4..8].copy_from_slice(&id.to_be_bytes());
+            Entry { meta, data, rank: (rank.0, rank.1 + k as u32) }
+        });
+        obj.entries.splice(at..at, new);
         Some(())
     }
 
@@ -459,6 +474,70 @@ impl Sbd {
             .chain(lines.take_while(|l| l.starts_with("            ")).map(str::trim))
             .collect::<Vec<_>>().join(sep)
     }
+}
+
+/// The name SeqBuilder shows for a feature: /gene, else /product, else the first qualifier's value,
+/// without parenthesised parts, cut at a word to at most 40 characters.
+pub fn feature_name(quals: &[String]) -> String {
+    let value = |l: &String| l.split_once('=').map_or(String::new(), |(_, v)| v.trim_matches('"').to_string());
+    let find = |k: &str| quals.iter().find(|l| l.split_once('=').is_some_and(|(key, _)| key == k)).map(value);
+    let raw = find("gene").or_else(|| find("product")).or_else(|| quals.first().map(value)).unwrap_or_default();
+    let mut name = String::new();
+    let mut depth = 0;
+    for c in raw.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => name.push(c),
+            _ => {}
+        }
+    }
+    let mut name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    while name.chars().count() > 40 {
+        name.truncate(name.rfind(' ').unwrap_or(40.min(name.len())));
+    }
+    name
+}
+
+/// A new document made from `template` (any SeqBuilder document): its layouts and settings are kept,
+/// everything about the sequence and its features is replaced.
+pub fn new_document(template: &[u8], name: &str, header: &str, seq: Vec<u8>, circular: bool, feats: Vec<SbdFeat>) -> Result<Sbd, String> {
+    let mut s = read(template)?;
+    s.set_sequence(seq);
+    if let Some(si) = s.container.chunk_mut(b"UVSI") {
+        if let Some(at) = si.windows(8).position(|w| w == b"SeqShape") {
+            si[at + 12..at + 16].copy_from_slice(&(1 + circular as u32).to_le_bytes());
+        }
+    }
+    s.circular = circular;
+    let latin1 = |t: &str| t.chars().map(|c| u8::try_from(c as u32).unwrap_or(b'?')).collect::<Vec<u8>>();
+    // A sequence that never was GenBank stores "^^"
+    let text = if header.is_empty() { "^^\n".to_string() } else { header.to_string() };
+    if let Some(tx) = s.container.chunk_mut(b"UVTX") { *tx = latin1(&text.replace('\n', "\r\n")); }
+    s.header = header.to_string();
+    if let Some(cb) = s.container.chunk_mut(b"UVCB") {
+        let mut v = (name.len() as u32).to_le_bytes().to_vec();
+        v.extend(latin1(name));
+        edit_all(cb, "SeqName", |_| v.clone());
+    }
+    let feats: Vec<SbdFeat> = feats.into_iter().enumerate().map(|(i, f)| SbdFeat { id: i as u32, ..f }).collect();
+    let fxif = s.container.chunks().find(|c| &c.0 == b"FXIF").map(|c| c.2.to_vec()).ok_or("template has no FXIF")?;
+    s.container.replace_all(b"UVFT", feats.iter().map(|f| (f.id, f.encode())).collect()).ok_or("template has no features")?;
+    s.container.replace_all(b"FXIF", (1..=feats.len() as u32).map(|i| (i, fxif.clone())).collect());
+    // SeqBuilder lists source features hidden
+    s.shown = feats.iter().map(|f| (f.id, f.kind != "source")).collect();
+    let rows: Vec<(u32, bool)> = feats.iter().map(|f| (f.id, s.shown[&f.id])).collect();
+    if let Some(tl) = s.container.chunk_mut(b"UVTL") {
+        edit_feature_state(tl, |r| *r = rows.clone());
+        // the template's per-feature styles belong to features that are gone
+        edit_all(tl, "VSSTYLE", |vs| block(vs, props(vs).into_iter().map(|(k, v)| {
+            if k != "OBJINFO" { return (k, v.to_vec()); }
+            (k, block(v, props(v).into_iter().filter(|(k, st)| !(*k == "STYLE" && matches!(style(st), Some((_, FEATURE_OBJECT, _))))).map(|(k, st)| (k, st.to_vec()))))
+        })));
+    }
+    s.obj_styles.clear();
+    s.feats = feats;
+    Ok(s)
 }
 
 /// The UVSI chunk of a document (for comparing saves).
