@@ -6,7 +6,10 @@
 //   UVSQ  sequence, ASCII
 //   UVTX  GenBank header text (LOCUS..COMMENT), CRLF; "^^" when the sequence was made in SeqBuilder
 //   UVSI  sequence info; its trailing property block holds SeqShape (1 linear, 2 circular)
-//   UVFT  one feature per id: 416-byte record + CR-separated "/key=value" qualifiers
+//   UVFT  one feature per id: 416-byte record + CR-separated "/key=value" qualifiers. Record: u16 0x65,
+//         Pascal name at 6 (256 bytes), u32 416 at 262, Pascal type at 266, start/end (u32, 1-based,
+//         reversed on the complement strand) at 394/398, u16 complement at 402, u16 1 at 404; the
+//         remaining bytes are the same in every record seen. FXIF id N+1 belongs to UVFT id N.
 //   UVTL  layout as a CommonBlockFmt property tree (8-byte key, u32 LE length, value; some values start
 //         with a few bytes of their own before their items). Styles live in VSSTYLE blocks: OBJINFO.STYLE
 //         per object, TYPEINFO.TDATA{TINFO,STYLE} per feature type. There is one VSSTYLE per view state:
@@ -23,7 +26,39 @@ pub struct SbdFeat {
     pub start: usize, // 1-based, as stored; start > end on the complement strand
     pub end: usize,
     pub complement: bool,
-    pub quals: Vec<(String, String)>,
+    pub quals: Vec<String>, // "key=value" lines as stored, value quoting included
+}
+
+impl SbdFeat {
+    /// A qualifier's value without its quotes.
+    pub fn qual(&self, key: &str) -> Option<String> {
+        self.quals.iter().find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(|v| v.trim_matches('"').to_string()))
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let latin1 = |s: &str, max: usize| -> Vec<u8> {
+            let b: Vec<u8> = s.chars().map(|c| u8::try_from(c as u32).unwrap_or(b'?')).take(max).collect();
+            std::iter::once(b.len() as u8).chain(b).collect()
+        };
+        let mut r = vec![0u8; 416];
+        r[1] = 0x65;
+        let name = latin1(&self.name, 255);
+        r[6..6 + name.len()].copy_from_slice(&name);
+        r[262..266].copy_from_slice(&416u32.to_be_bytes());
+        let kind = latin1(&self.kind, 60);
+        r[266..266 + kind.len()].copy_from_slice(&kind);
+        (r[327], r[331], r[353]) = (1, 1, 1);
+        r[394..398].copy_from_slice(&(self.start as u32).to_be_bytes());
+        r[398..402].copy_from_slice(&(self.end as u32).to_be_bytes());
+        r[402..404].copy_from_slice(&(self.complement as u16).to_be_bytes());
+        r[404..406].copy_from_slice(&1u16.to_be_bytes());
+        for q in &self.quals {
+            r.push(b'/');
+            r.extend(latin1(q, usize::MAX).into_iter().skip(1));
+            r.push(b'\r');
+        }
+        r
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -140,7 +175,13 @@ impl Container {
     }
 
     fn chunk_mut(&mut self, typ: &[u8; 4]) -> Option<&mut Vec<u8>> {
-        self.objects.iter_mut().flat_map(|o| &mut o.entries).find(|e| &e.meta[..4] == typ).map(|e| &mut e.data)
+        self.chunk_id_mut(typ, None)
+    }
+
+    fn chunk_id_mut(&mut self, typ: &[u8; 4], id: Option<u32>) -> Option<&mut Vec<u8>> {
+        self.objects.iter_mut().flat_map(|o| &mut o.entries)
+            .find(|e| &e.meta[..4] == typ && id.is_none_or(|id| e.meta[4..8] == id.to_be_bytes()))
+            .map(|e| &mut e.data)
     }
 }
 
@@ -272,6 +313,14 @@ fn restyle(vs: &[u8], id: u32, kind: &str, st: Option<Style>) -> Vec<u8> {
 }
 
 impl Sbd {
+    /// Replace an existing feature (matched by id) with edited name, type, range or qualifiers.
+    pub fn update_feature(&mut self, f: SbdFeat) -> Result<(), String> {
+        let data = self.container.chunk_id_mut(b"UVFT", Some(f.id)).ok_or(format!("no feature {}", f.id))?;
+        *data = f.encode();
+        if let Some(old) = self.feats.iter_mut().find(|o| o.id == f.id) { *old = f; }
+        Ok(())
+    }
+
     /// The document as SeqBuilder Pro would read it; unchanged chunks are written back byte for byte.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.container.write()
@@ -325,10 +374,7 @@ pub fn read(d: &[u8]) -> Result<Sbd, String> {
 
     let feats = get(*b"UVFT").filter_map(|&(_, id, r)| {
         let (start, end) = (u32be(r, 394)? as usize, u32be(r, 398)? as usize);
-        let quals = text(r.get(416..)?).split('\r').filter_map(|l| {
-            let (k, v) = l.strip_prefix('/')?.split_once('=').unwrap_or((l.trim_start_matches('/'), ""));
-            Some((k.to_string(), v.trim_matches('"').to_string()))
-        }).collect();
+        let quals = text(r.get(416..)?).split('\r').filter_map(|l| l.strip_prefix('/').map(str::to_owned)).collect();
         Some(SbdFeat {
             id, name: pascal(r, 6), kind: pascal(r, 266), start, end,
             complement: u16::from_be_bytes([r[402], r[403]]) != 0, quals,
@@ -369,7 +415,7 @@ mod tests {
         assert_eq!(d.feats.len(), 50);
         let p1 = &d.feats[3];
         assert_eq!((p1.kind.as_str(), p1.start, p1.end, p1.complement), ("regulatory", 33, 27, true));
-        assert!(p1.quals.contains(&("note".into(), "promoter P1 (6)".into())));
+        assert_eq!(p1.qual("note").as_deref(), Some("promoter P1 (6)"));
         assert_eq!(d.type_styles["CDS"].fill, Some([0xe8, 0xfa, 0xfd]));
         assert!(!d.obj_styles.contains_key(&38));
 
@@ -383,6 +429,18 @@ mod tests {
         let red = read(&std::fs::read("testdata/pBR322_blaRED.sbd").unwrap()).unwrap();
         assert_eq!((red.feats[38].name.as_str(), red.feats[38].kind.as_str()), ("bla", "CDS"));
         assert_eq!(red.obj_styles[&38].fill, Some([0xff, 0, 0]));
+    }
+
+    #[test]
+    fn feature_records_encode_back_exactly() {
+        for f in ["pBR322.sbd", "ALDH2.sbd"] {
+            let d = std::fs::read(format!("testdata/{f}")).unwrap();
+            let c = Container::parse(&d).unwrap();
+            let s = read(&d).unwrap();
+            for ((_, id, raw), feat) in c.chunks().filter(|c| &c.0 == b"UVFT").zip(&s.feats) {
+                assert!(feat.encode() == raw, "{f} feature {id}");
+            }
+        }
     }
 
     #[test]

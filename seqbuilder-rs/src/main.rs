@@ -13,7 +13,8 @@ const DNASTAR_DIR: &str = "/Applications/DNASTAR/Lasergene19";
 
 struct Feat {
     kind: String,
-    label: String,
+    name: String,
+    label: String, // name shortened for drawing
     desc: String,
     range: String, // GenBank location text, shown in the table
     start: usize,  // 0-based, inclusive
@@ -25,6 +26,19 @@ struct Feat {
     base: Option<(Color32, Color32)>,  // the document's style for this feature type
     sbd_id: Option<u32>,               // UVFT id when read from a .sbd
     edited: bool,                      // style changed since the last save
+    quals: Vec<String>,                // "key=value" qualifier lines, quoting included
+    dirty: bool,                       // name, type, range or qualifiers changed since the last save
+}
+
+/// Set (or with an empty value remove) a qualifier line.
+fn set_qual(quals: &mut Vec<String>, key: &str, value: &str) {
+    let line = format!("{key}=\"{value}\"");
+    match quals.iter().position(|l| l.strip_prefix(key).is_some_and(|r| r.starts_with('='))) {
+        Some(i) if value.is_empty() => { quals.remove(i); }
+        Some(i) => quals[i] = line,
+        None if !value.is_empty() => quals.push(line),
+        None => {}
+    }
 }
 
 struct Doc {
@@ -135,17 +149,18 @@ fn load(path: &Path) -> Result<Doc, String> {
         let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
         let feats = s.feats.iter().map(|f| {
             let (lo, hi) = (f.start.min(f.end), f.start.max(f.end));
-            let q = |k: &str| f.quals.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+            let q = |k: &str| f.qual(k);
             let colors = |st: &sbd::Style| {
                 let fill = st.fill.map_or(Color32::TRANSPARENT, rgb);
                 (fill, st.line.map_or(fill, rgb))
             };
             Feat {
-                kind: f.kind.clone(), label: short(&f.name), desc: q("note").or_else(|| q("product")).unwrap_or_default(),
+                kind: f.kind.clone(), name: f.name.clone(), label: short(&f.name), desc: q("note").or_else(|| q("product")).unwrap_or_default(),
                 range: if f.complement { format!("complement({lo}..{hi})") } else { format!("{lo}..{hi}") },
                 start: lo.saturating_sub(1), end: hi, strand: if f.complement { -1 } else { 1 }, lane: 0,
                 show: f.kind != "source", style: s.obj_styles.get(&f.id).map(colors),
                 base: s.type_styles.get(&f.kind).map(colors), sbd_id: Some(f.id), edited: false,
+                quals: f.quals.clone(), dirty: false,
             }
         }).collect();
         let locus = s.header_field("LOCUS", " ");
@@ -162,15 +177,21 @@ fn load(path: &Path) -> Result<Doc, String> {
         let feats = rec.features.iter().filter_map(|f| {
             let (s, e) = f.location.find_bounds().ok()?;
             let q = |k: &str| f.qualifier_values(k).next().map(str::to_owned);
-            let label = short(&["label", "gene", "product", "note"].iter().find_map(|k| q(k)).unwrap_or_else(|| f.kind.to_string()));
+            let name = ["label", "gene", "product", "note"].iter().find_map(|k| q(k)).unwrap_or_else(|| f.kind.to_string());
+            let quals = f.qualifiers.iter().map(|(k, v)| match v {
+                // GenBank leaves numbers and [citations] unquoted
+                Some(v) if v.parse::<i64>().is_ok() || v.starts_with('[') => format!("{k}={v}"),
+                Some(v) => format!("{k}=\"{v}\""),
+                None => k.to_string(),
+            }).collect();
             // find_bounds unwraps origin-spanning joins past len; fold them back.
             let (start, end) = (s.rem_euclid(len as i64) as usize, e as usize);
             let end = if end > len { end - len } else { end };
             Some(Feat {
-                kind: f.kind.to_string(), label, desc: q("note").or_else(|| q("product")).unwrap_or_default(),
+                kind: f.kind.to_string(), label: short(&name), name, desc: q("note").or_else(|| q("product")).unwrap_or_default(),
                 range: f.location.to_gb_format(), start, end, strand: location_strand(&f.location), lane: 0,
                 show: f.kind != "source", // SeqBuilder lists source but leaves it hidden
-                style: None, base: None, sbd_id: None, edited: false,
+                style: None, base: None, sbd_id: None, edited: false, quals, dirty: false,
             })
         }).collect();
         let circular = rec.is_circular();
@@ -272,6 +293,37 @@ impl App {
         }
     }
 
+    /// Details for the feature picked in the table, editable (name, type, range, strand, note).
+    fn feature_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(d) = &mut self.doc else { return };
+        let len = d.seq.len();
+        let Some(f) = self.sel_feat.and_then(|i| d.feats.get_mut(i)) else { return };
+        ui.heading("Feature");
+        ui.separator();
+        let (mut lo, mut hi, mut comp) = (f.start + 1, f.end, f.strand < 0);
+        let mut note = f.quals.iter().find_map(|l| l.strip_prefix("note=")).map(|v| v.trim_matches('"').to_string()).unwrap_or_default();
+        let wraps = f.start >= f.end; // ponytail: origin-spanning ranges are shown, not edited
+        let mut changed = false;
+        egui::Grid::new("feature_editor").num_columns(2).show(ui, |ui| {
+            ui.label("Name"); changed |= ui.text_edit_singleline(&mut f.name).changed(); ui.end_row();
+            ui.label("Type"); changed |= ui.text_edit_singleline(&mut f.kind).changed(); ui.end_row();
+            ui.label("Start"); changed |= ui.add_enabled(!wraps, egui::DragValue::new(&mut lo).range(1..=hi)).changed(); ui.end_row();
+            ui.label("End"); changed |= ui.add_enabled(!wraps, egui::DragValue::new(&mut hi).range(lo..=len)).changed(); ui.end_row();
+            ui.label("Strand"); changed |= ui.checkbox(&mut comp, "Complement").changed(); ui.end_row();
+            ui.label("Note"); changed |= ui.text_edit_multiline(&mut note).changed(); ui.end_row();
+        });
+        if changed {
+            if !wraps { (f.start, f.end) = (lo - 1, hi); }
+            f.strand = if comp { -1 } else { 1 };
+            f.range = if comp { format!("complement({lo}..{hi})") } else { format!("{lo}..{hi}") };
+            f.label = short(&f.name);
+            set_qual(&mut f.quals, "note", &note);
+            f.desc = if note.is_empty() { f.desc.clone() } else { note };
+            f.dirty = true;
+            d.lanes = assign_lanes(&mut d.feats, len);
+        }
+    }
+
     /// Write the open .sbd back (to `to`, or where it came from), with this session's style edits.
     fn save(&mut self, to: Option<PathBuf>) {
         let Some(d) = &mut self.doc else { return };
@@ -285,6 +337,15 @@ impl App {
             let weight = s.obj_styles.get(&id).or(s.type_styles.get(&f.kind)).map_or(1.0, |st| st.weight);
             s.set_feature_style(id, f.style.map(|(fill, line)| sbd::Style { fill: (fill.a() > 0).then(|| rgb(fill)), line: Some(rgb(line)), weight }));
             f.edited = false;
+        }
+        for f in d.feats.iter_mut().filter(|f| f.dirty) {
+            let Some(id) = f.sbd_id else { continue };
+            let (lo, hi) = (f.start + 1, f.end);
+            let comp = f.strand < 0;
+            let (start, end) = if comp { (hi, lo) } else { (lo, hi) };
+            let feat = sbd::SbdFeat { id, name: f.name.clone(), kind: f.kind.clone(), start, end, complement: comp, quals: f.quals.clone() };
+            if let Err(e) = s.update_feature(feat) { self.error = Some(e); return; }
+            f.dirty = false;
         }
         let path = to.unwrap_or_else(|| d.path.clone());
         match std::fs::write(&path, s.to_bytes()) {
@@ -508,6 +569,7 @@ impl App {
                     ui.radio_value(&mut self.grouping, 3, "Group by 3");
                     ui.radio_value(&mut self.grouping, 10, "Group by 10");
                 }
+                SideBottom::Details if self.sel_feat.is_some() && self.doc.is_some() => self.feature_editor(ui),
                 SideBottom::Details => match &self.doc {
                     None => { ui.label("No document open."); }
                     Some(_) if self.sel.is_some() => {
@@ -871,6 +933,8 @@ impl eframe::App for App {
             if let Ok(v) = std::env::var("SEQBUILDER_VIEW") {
                 self.view = match v.as_str() { "linear" => View::Linear, "sequence" => View::Sequence, _ => self.view };
             }
+            // Debug aid: SEQBUILDER_FEATURE=n opens with that table row picked.
+            if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { self.sel_feat = Some(i); }
         }
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
@@ -998,6 +1062,29 @@ mod tests {
         assert_eq!(back.obj_styles[&38].fill, Some([0, 200, 0]));
         assert_eq!(back.obj_styles[&38].weight, 1.0);
         assert_eq!(back.feats.len(), 50);
+    }
+
+    #[test]
+    fn saves_feature_edits_to_sbd() {
+        let mut app = App::default();
+        app.open(Path::new("testdata/pBR322.sbd"));
+        let f = &mut app.doc.as_mut().unwrap().feats[26]; // ROP protein CDS 1915..2106
+        assert_eq!(f.name, "ROP protein");
+        (f.name, f.start, f.end, f.strand) = ("ROP".into(), 1914, 2100, -1);
+        set_qual(&mut f.quals, "note", "edited in SeqBuilder RS");
+        f.dirty = true;
+        let out = std::env::temp_dir().join("seqbuilder-rs-feature-test.sbd");
+        app.save(Some(out.clone()));
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let back = sbd::read(&std::fs::read(&out).unwrap()).unwrap();
+        let rop = &back.feats[26];
+        assert_eq!((rop.name.as_str(), rop.start, rop.end, rop.complement), ("ROP", 2100, 1915, true));
+        assert_eq!(rop.qual("note").as_deref(), Some("edited in SeqBuilder RS"));
+        assert_eq!(rop.qual("product").as_deref(), Some("ROP protein"));
+        let orig = sbd::read(&std::fs::read("testdata/pBR322.sbd").unwrap()).unwrap();
+        for (a, b) in back.feats.iter().zip(&orig.feats).filter(|(a, _)| a.id != 26) {
+            assert_eq!((&a.name, a.start, a.end, &a.quals), (&b.name, b.start, b.end, &b.quals));
+        }
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
