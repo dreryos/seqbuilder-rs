@@ -1477,22 +1477,24 @@ impl App {
             p.line_segment([Pos2::new(x(pos), ay - 3.0), Pos2::new(x(pos), ay + 3.0)], Stroke::new(1.0, fg));
             p.text(Pos2::new(x(pos), ay + 4.0), Align2::CENTER_TOP, pos.to_string(), FontId::proportional(9.0), fg);
         }
-        // each working primer's sites on the top strand above the axis, on the bottom strand below
-        for ps in [&pf, &pr].into_iter().flatten() {
+        // each working primer's sites (forward green, reverse red): top strand above the axis, bottom below
+        for (ps, colour) in [(&pf, green), (&pr, red)] {
+            let Some(ps) = ps else { continue };
             for (reverse, y0, y1) in [(false, ay - 22.0, ay - 6.0), (true, ay + 18.0, ay + 34.0)] {
                 for pos in primers::binding_sites(&d.seq, ps, reverse) {
-                    p.line_segment([Pos2::new(x(pos), y0), Pos2::new(x(pos), y1)], Stroke::new(1.0, red));
+                    p.rect_filled(Rect::from_x_y_ranges(x(pos) - 2.0..=x(pos) + 2.0, y0..=y1), 0.0, colour);
                 }
             }
         }
         ui.separator();
 
         // Most stable dimer, pair dimer and hairpin, side by side.
-        // A dimer as SeqBuilder draws it: the overlap in full, each strand's overhang cut to "CC . " / " . CC".
+        // A dimer as SeqBuilder draws it: the overlap in full, each strand's overhang cut to "CC . TT".
         let dimer_text = |a: &[u8], b: &[u8], dm: &primers::Dimer| -> String {
             let text = |s: &[u8]| String::from_utf8_lossy(s).into_owned();
-            let left = |s: &[u8]| if s.len() > 4 { format!("{} . ", text(&s[..2])) } else { text(s) };
-            let right = |s: &[u8]| if s.len() > 4 { format!(" . {}", text(&s[s.len() - 2..])) } else { text(s) };
+            // an overhang keeps its 2 bases next to the overlap and its 2 end bases
+            let left = |s: &[u8]| if s.len() > 6 { format!("{} . {}", text(&s[..2]), text(&s[s.len() - 2..])) } else { text(s) };
+            let right = |s: &[u8]| if s.len() > 6 { format!("{} . {}", text(&s[..2]), text(&s[s.len() - 2..])) } else { text(s) };
             let brev: Vec<u8> = b.iter().rev().copied().collect(); // b 3'→5'; brev[k] sits under a[offset + k]
             let (na, nb) = (a.len() as isize, b.len() as isize);
             let (o0, o1) = (dm.offset.max(0), (dm.offset + nb - 1).min(na - 1));
@@ -1506,29 +1508,37 @@ impl App {
         };
         let mono = |ui: &mut egui::Ui, t: String| { ui.add(egui::Label::new(egui::RichText::new(t).monospace()).wrap_mode(egui::TextWrapMode::Extend)); };
         ui.columns(3, |c| {
-            let active = pr.as_ref().or(pf.as_ref());
-            match active.and_then(|a| primers::dimer(a, a).map(|dm| (a, dm))) {
+            // the working primer whose self dimer is most stable
+            let selfdimer = [pf.as_ref(), pr.as_ref()].into_iter().flatten()
+                .filter_map(|a| primers::dimer(a, a).filter(|dm| dm.len > 2).map(|dm| (a, dm)))
+                .min_by(|x, y| x.1.dg.total_cmp(&y.1.dg));
+            match selfdimer {
                 Some((a, dm)) => {
-                    let bad = if dm.dg <= -3.0 { " (BAD!)" } else { "" };
+                    let bad = if primers::is_bad(dm.dg) { " (BAD!)" } else { "" };
                     c[0].label(format!("Most stable dimer {} bp, {:.1} kc/m{bad}", dm.len, dm.dg));
                     mono(&mut c[0], dimer_text(a, a, &dm));
                 }
-                None => { c[0].label("No dimers"); }
+                None => { c[0].label("No dimers > 2 bp"); }
             }
             match (&pf, &pr) {
                 (Some(a), Some(b)) => match primers::dimer(a, b).filter(|dm| dm.len > 2) {
-                    Some(dm) => { c[1].label(format!("Most stable pair dimer {} bp, {:.1} kc/m", dm.len, dm.dg)); mono(&mut c[1], dimer_text(a, b, &dm)); }
+                    // ponytail: SeqBuilder scored this pair "3 bp, -0.0"; the stretch length agrees, its energy does not yet
+                    Some(dm) => { c[1].label(format!("Most stable pair dimer {} bp, {:.1} kc/m (estimate)", dm.len, dm.dg)); mono(&mut c[1], dimer_text(a, b, &dm)); }
                     None => { c[1].label("No pair dimers > 2 bp"); }
                 },
                 _ => { c[1].label("No pair dimers > 2 bp"); }
             }
-            match active.and_then(|a| primers::hairpin(a).map(|h| (a, h))) {
+            let hairpin = [pf.as_ref(), pr.as_ref()].into_iter().flatten()
+                .filter_map(|a| primers::hairpin(a).map(|h| (a, h)))
+                .min_by(|x, y| x.1.dg.total_cmp(&y.1.dg));
+            match hairpin {
                 Some((a, h)) => {
-                    c[2].label(format!("Hairpin {} bp, {:.1} kc/m (estimate)", h.stem, h.dg));
+                    let bad = if primers::is_bad(h.dg) { " (BAD!)" } else { "" };
+                    c[2].label(format!("Hairpin {} bp, {:.1} kc/m{bad}", h.stem, h.dg));
                     let stem: String = (0..a.len()).map(|i| if (h.start..h.start + h.stem).contains(&i) || (h.end + 1 - h.stem..=h.end).contains(&i) { '|' } else { ' ' }).collect();
                     mono(&mut c[2], format!("5' {} 3'\n   {stem}", String::from_utf8_lossy(a)));
                 }
-                None => { c[2].label("No hairpins"); }
+                None => { c[2].label("No hairpins > 1 bp"); }
             }
         });
         ui.separator();
@@ -1543,28 +1553,22 @@ impl App {
         for (i, colour) in [(fwd, green), (rev, red)] {
             if let Some(i) = i { p.rect_filled(Rect::from_center_size(Pos2::new(x(d.feats[i].start), my), Vec2::new(6.0, 12.0)), 3.0, colour); }
         }
-        // ponytail: Prod Tm (Davis, Botstein & Roth) and Ta OPT (Rychlik) follow SeqBuilder's labels but are not
-        // checked against SeqBuilder numbers yet; Score and Prod dTm are left empty.
+        // Score is SeqBuilder's own primer rating, not reproduced; the rest matches its pair table.
         egui::Grid::new("pair").striped(true).num_columns(7).show(ui, |ui| {
             for h in ["Pair Name", "Score", "Prod Tm", "Pri dTm", "Ta OPT", "Prod dTm", "Length"] { ui.strong(h); }
             ui.end_row();
-            ui.label("");
-            ui.label("");
             match (fwd, rev, &pf, &pr) {
                 (Some(f), Some(r), Some(a), Some(b)) if d.feats[f].start < d.feats[r].end => {
                     let product = &d.seq[d.feats[f].start..d.feats[r].end];
-                    let n = product.len() as f64;
-                    let gc = product.iter().filter(|b| matches!(b.to_ascii_uppercase(), b'G' | b'C')).count() as f64 / n;
-                    let prod_tm = 81.5 + 16.6 * 0.05f64.log10() + 41.0 * gc - 675.0 / n;
-                    let (ta, tb) = (primers::tm(a), primers::tm(b));
-                    let ta_opt = 0.3 * ta.min(tb) + 0.7 * prod_tm - 14.9;
-                    ui.label(format!("{prod_tm:.1}"));
-                    ui.label(format!("{:.1}", (ta - tb).abs()));
-                    ui.label(format!("{ta_opt:.1}"));
+                    let (prod_tm, pri_dtm, ta_opt, prod_dtm) = primers::pair_values(a, b, product);
+                    ui.label("Pair 1");
                     ui.label("");
+                    for v in [prod_tm, pri_dtm, ta_opt, prod_dtm] { ui.label(format!("{v:.1}")); }
                     ui.label(product.len().to_string());
                 }
                 _ => {
+                    ui.label("");
+                    ui.label("");
                     for _ in 0..4 { ui.label("0.0"); }
                     ui.label(pr.as_ref().or(pf.as_ref()).map_or(0, |p| p.len()).to_string());
                 }

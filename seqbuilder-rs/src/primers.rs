@@ -77,7 +77,9 @@ pub fn dimer(a: &[u8], b: &[u8]) -> Option<Dimer> {
             while i < pairs.len() && pairs[i] { i += 1; }
             if i - start < 2 { continue; }
             let g = duplex_dg(&a[start..i]);
-            if best.as_ref().is_none_or(|d| g < d.dg) {
+            // ties go to the later alignment, the stretch nearer the 3' end (SeqBuilder picks CCGG over CCCG
+            // for pBR322's reverse 1483..1506)
+            if best.as_ref().is_none_or(|d| g <= d.dg) {
                 best = Some(Dimer { offset, pairs: pairs.clone(), len: i - start, dg: g });
             }
         }
@@ -93,36 +95,58 @@ pub struct Hairpin {
     pub dg: f64,
 }
 
-// ponytail: loop penalties are SantaLucia (2004) hairpin values; SeqBuilder's "Hairpin 3 bp, -0.2 kc/m"
-// for ALDH2's reverse primer is not reproduced yet, so this ranking may differ from SeqBuilder's.
-/// The most stable hairpin (stem of at least 2 pairs, loop of at least 3 bases).
+// ponytail: one loop penalty for every loop size, fitted to SeqBuilder (ALDH2 "3 bp, -0.2", pBR322 reverse
+// 1483..1506 "4 bp, -2.3"); the two allow 4.31-4.37.
+const HAIRPIN_LOOP: f64 = 4.34;
+
+/// The most stable hairpin (stem of at least 2 pairs, loop of at least 3 bases) with ΔG below zero;
+/// SeqBuilder says "No hairpins > 1 bp" otherwise.
 pub fn hairpin(p: &[u8]) -> Option<Hairpin> {
     let p = upper(p);
-    let loop_penalty = |l: usize| match l { 3 | 4 => 3.5, 5 => 3.3, 6 => 4.0, 7 => 4.2, 8 => 4.3, 9 => 4.5, _ => 4.6 + 0.1 * (l as f64 - 10.0).max(0.0) };
     let mut best: Option<Hairpin> = None;
     for start in 0..p.len() {
         for end in (start + 1..p.len()).rev() {
             let mut stem = 0;
             while start + stem < end - stem && complement(p[start + stem]) == p[end - stem] { stem += 1; }
-            if stem < 2 { continue; }
-            let lp = (end - stem) as isize - (start + stem) as isize + 1;
-            if lp < 3 { continue; }
-            let g = duplex_dg(&p[start..start + stem]) + loop_penalty(lp as usize);
-            if best.as_ref().is_none_or(|h| g < h.dg) { best = Some(Hairpin { start, end, stem, dg: g }); }
+            if stem < 2 || (end - stem) < (start + stem) + 2 { continue; } // loop of 3 or more
+            let g = duplex_dg(&p[start..start + stem]) + HAIRPIN_LOOP;
+            if g < 0.0 && best.as_ref().is_none_or(|h| g < h.dg) { best = Some(Hairpin { start, end, stem, dg: g }); }
         }
     }
     best
 }
 
-// ponytail: SeqBuilder's rule for "Primer Binding Sites" is not known; this marks every place where the
-// primer's 3'-terminal 8 bases match, which is what a polymerase would extend from.
-/// 0-based positions on the sequence where the primer's 3' end could prime (forward: on the top strand).
+// ponytail: "BAD!" splits SeqBuilder's -2.3 and -3.3 (bad) from -0.2 and -0.0 (fine); -2 is a guess between.
+pub fn is_bad(dg: f64) -> bool {
+    dg <= -2.0
+}
+
+/// Where the primer's 3'-terminal 12 bases (SeqBuilder's "Unique at 3' for 12 bp") match the sequence, on
+/// the top strand or with `reverse` on the bottom strand: the 0-based position of the primer's 3' end.
 pub fn binding_sites(seq: &[u8], primer: &[u8], reverse: bool) -> Vec<usize> {
-    let k = 8.min(primer.len());
+    let k = 12.min(primer.len());
     let tail = upper(&primer[primer.len() - k..]);
     let target: Vec<u8> = if reverse { tail.iter().rev().map(|&b| complement(b)).collect() } else { tail };
     let seq = upper(seq);
-    seq.windows(k).enumerate().filter(|(_, w)| *w == target.as_slice()).map(|(i, _)| i).collect()
+    let three_prime = if reverse { 0 } else { k - 1 };
+    seq.windows(k).enumerate().filter(|(_, w)| *w == target.as_slice()).map(|(i, _)| i + three_prime).collect()
+}
+
+/// Product Tm: 81.5 + 16.6·log([Na+]/(1 + 0.7[Na+])) + 0.41·%GC − 500/N at 50 mM. Of the usual product
+/// formulas this one alone gives all of SeqBuilder's Prod Tm and Prod dTm values (84.2/26.4, 84.3/27.0).
+pub fn product_tm(product: &[u8]) -> f64 {
+    let n = product.len() as f64;
+    let gc = product.iter().filter(|b| matches!(b.to_ascii_uppercase(), b'G' | b'C')).count() as f64 * 100.0 / n;
+    let na = 0.05f64;
+    81.5 + 16.6 * (na / (1.0 + 0.7 * na)).log10() + 0.41 * gc - 500.0 / n
+}
+
+/// The pair table of the Primer Design view: (Prod Tm, Pri dTm, Ta OPT, Prod dTm).
+/// Ta OPT is Rychlik's 0.3·Tm(lower primer) + 0.7·Tm(product) − 14.9.
+pub fn pair_values(forward: &[u8], reverse: &[u8], product: &[u8]) -> (f64, f64, f64, f64) {
+    let (tf, tr, tp) = (tm(forward), tm(reverse), product_tm(product));
+    let low = tf.min(tr);
+    (tp, (tf - tr).abs(), 0.3 * low + 0.7 * tp - 14.9, tp - low)
 }
 
 #[cfg(test)]
@@ -138,10 +162,32 @@ mod tests {
         assert_eq!(format!("{:.1}", tm(rev)), "77.7");
     }
 
+    /// Values SeqBuilder's Primer Design view showed for pBR322 pairs and ALDH2.
     #[test]
-    fn binding_sites_find_the_primer_itself() {
-        let seq = b"AAAAGGATCCAAAAAAAAAAGGATCCTTTT";
-        assert!(binding_sites(seq, b"CCCAAAAGGATCC", false).contains(&2));
-        assert!(!binding_sites(seq, b"GGATCCTTTT", true).is_empty());
+    fn matches_seqbuilder_primer_design() {
+        let f704 = b"CGGGGCATGACTATCG";
+        let r1483 = b"GCAACCCCGCCAGCCTAGCCGGGT";
+        let d = dimer(r1483, r1483).unwrap();
+        assert_eq!((d.len, format!("{:.1}", d.dg)), (4, "-6.6".to_string())); // "Most stable dimer 4 bp, -6.6 kc/m (BAD!)"
+        assert_eq!(d.offset, 16); // the 3'-end CCGG, as SeqBuilder draws it
+        let h = hairpin(r1483).unwrap();
+        assert_eq!((h.stem, format!("{:.1}", h.dg)), (4, "-2.3".to_string())); // "Hairpin 4 bp, -2.3 kc/m (BAD!)"
+        assert!(is_bad(d.dg) && is_bad(h.dg));
+        assert!(hairpin(f704).is_none()); // "No hairpins > 1 bp"
+        let h = hairpin(b"CCGCCTCCCGGGTTCATGCCATTCTCCTGCCTCAGCCT").unwrap();
+        assert_eq!((h.stem, format!("{:.1}", h.dg)), (3, "-0.2".to_string())); // ALDH2 "Hairpin 3 bp, -0.2 kc/m"
+        assert!(!is_bad(h.dg));
+
+        let seq = std::fs::read("testdata/pBR322.gb").unwrap();
+        let seq = gb_io::reader::parse_slice(&seq).unwrap().remove(0).seq;
+        let fmt = |v: (f64, f64, f64, f64)| [v.0, v.1, v.2, v.3].map(|x| format!("{x:.1}"));
+        // Set 2: Forward 704..719 + Reverse 1483..1506, 803 bp: Prod Tm 84.3, Pri dTm 17.8, Ta OPT 61.3, Prod dTm 27.0
+        assert_eq!(fmt(pair_values(f704, r1483, &seq[703..1506])), ["84.3", "17.8", "61.3", "27.0"]);
+        // Set 1: Forward 635..659 + Reverse 1267..1284, 650 bp: Tm 84.2, Ta OPT 61.3, dTm 26.4
+        let v = fmt(pair_values(b"TCGCATAAGGGAGAGCGTCGACCGA", b"GCTTCCATTCAGGTCGAG", &seq[634..1284]));
+        assert_eq!((v[0].as_str(), v[2].as_str(), v[3].as_str()), ("84.2", "61.3", "26.4"));
+        // only each primer's own site, as SeqBuilder marks them on pBR322
+        assert_eq!(binding_sites(&seq, f704, false), vec![718]); // 3' end of 704..719
+        assert_eq!(binding_sites(&seq, r1483, true), vec![1482]); // 3' end of 1483..1506 on the bottom strand
     }
 }
