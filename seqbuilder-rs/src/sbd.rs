@@ -435,6 +435,17 @@ impl Sbd {
         self.shown.insert(id, shown);
     }
 
+    /// Sequence ▸ Linear / Circular: SeqBuilder records the topology in UVSI SeqShape and UVTL SBLinear.
+    pub fn set_circular(&mut self, circular: bool) {
+        if let Some(si) = self.container.chunk_mut(b"UVSI") {
+            if let Some(at) = si.windows(8).position(|w| w == b"SeqShape") {
+                si[at + 12..at + 16].copy_from_slice(&(1 + circular as u32).to_le_bytes());
+            }
+        }
+        if let Some(tl) = self.container.chunk_mut(b"UVTL") { edit_all(tl, "SBLinear", |_| vec![!circular as u8]); }
+        self.circular = circular;
+    }
+
     /// Replace the sequence (features are moved by the caller and saved with `update_feature`).
     pub fn set_sequence(&mut self, seq: Vec<u8>) {
         if let Some(sq) = self.container.chunk_mut(b"UVSQ") { *sq = seq.clone(); }
@@ -505,13 +516,7 @@ pub fn feature_name(quals: &[String]) -> String {
 pub fn new_document(template: &[u8], name: &str, header: &str, seq: Vec<u8>, circular: bool, feats: Vec<SbdFeat>) -> Result<Sbd, String> {
     let mut s = read(template)?;
     s.set_sequence(seq);
-    if let Some(si) = s.container.chunk_mut(b"UVSI") {
-        if let Some(at) = si.windows(8).position(|w| w == b"SeqShape") {
-            si[at + 12..at + 16].copy_from_slice(&(1 + circular as u32).to_le_bytes());
-        }
-    }
-    s.circular = circular;
-    if let Some(tl) = s.container.chunk_mut(b"UVTL") { edit_all(tl, "SBLinear", |_| vec![!circular as u8]); }
+    s.set_circular(circular);
     let latin1 = |t: &str| t.chars().map(|c| u8::try_from(c as u32).unwrap_or(b'?')).collect::<Vec<u8>>();
     // A sequence that never was GenBank stores "^^"
     let text = if header.is_empty() { "^^\n".to_string() } else { header.to_string() };
@@ -689,6 +694,21 @@ mod tests {
         let dir = |s: &Sbd| s.container.chunks().map(|c| (c.0, c.1, c.2.to_vec())).filter(|c| &c.0 != b"UVTL" && &c.0 != b"UVCB").collect::<Vec<_>>();
         assert!(dir(&d) == dir(&want));
         assert_eq!(read(&d.to_bytes()).unwrap().feats.len(), 49);
+    }
+
+    /// Switching topology must change exactly what SeqBuilder Pro changed in pBR322_linear / ALDH2_circular.
+    #[test]
+    fn topology_switch_matches_seqbuilder() {
+        for (from, to, circular) in [("pBR322", "pBR322_linear", false), ("ALDH2", "ALDH2_circular", true)] {
+            let mut d = read(&std::fs::read(format!("testdata/{from}.sbd")).unwrap()).unwrap();
+            let want = std::fs::read(format!("testdata/{to}.sbd")).unwrap();
+            assert_eq!(d.circular, !circular);
+            d.set_circular(circular);
+            let ours = d.to_bytes();
+            assert!(uvsi(&ours) == uvsi(&want), "{to}: UVSI");
+            assert_eq!(sb_linear(&ours), sb_linear(&want), "{to}: SBLinear");
+            assert_eq!(read(&ours).unwrap().circular, circular);
+        }
     }
 
     #[test]

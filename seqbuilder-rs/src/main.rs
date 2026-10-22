@@ -72,6 +72,7 @@ struct Doc {
     deleted: Vec<u32>,     // .sbd feature ids deleted since the last save
     seq_dirty: bool,       // sequence edited since the last save
     header: String,        // GenBank header (LOCUS..COMMENT) for a new .sbd; empty for FASTA
+    topology_dirty: bool,  // switched linear/circular since the last save
 }
 
 struct Site {
@@ -162,7 +163,7 @@ fn load(path: &Path) -> Result<Doc, String> {
     let mut doc = if text.first() == Some(&b'>') {
         let seq: Vec<u8> = text.split(|&b| b == b'\n').filter(|l| !l.starts_with(b">"))
             .flatten().copied().filter(u8::is_ascii_alphabetic).collect();
-        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false, header: String::new() }
+        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false }
     } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sbd")) {
         let s = sbd::read(&text)?;
         let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
@@ -187,7 +188,7 @@ fn load(path: &Path) -> Result<Doc, String> {
             name: locus.split_whitespace().next().map_or(name, str::to_owned),
             definition: s.header_field("DEFINITION", " "), accession: s.header_field("ACCESSION", " "),
             comment: s.header_field("COMMENT", "\n"),
-            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), header: s.header.clone(), sbd: Some(s), deleted: vec![], seq_dirty: false,
+            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), header: s.header.clone(), sbd: Some(s), deleted: vec![], seq_dirty: false, topology_dirty: false,
         }
     } else {
         let rec = gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())?
@@ -222,6 +223,7 @@ fn load(path: &Path) -> Result<Doc, String> {
             accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
             seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false,
             header: text.iter().map(|&b| b as char).collect::<String>().split("\nFEATURES").next().unwrap_or_default().to_string() + "\n",
+            topology_dirty: false,
         }
     };
     doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
@@ -419,6 +421,15 @@ impl App {
         }
     }
 
+    /// Sequence ▸ Linear / Circular.
+    fn set_circular(&mut self, circular: bool) {
+        let Some(d) = &mut self.doc else { return };
+        if d.circular == circular { return; }
+        (d.circular, d.topology_dirty) = (circular, true);
+        if !circular && self.view == View::Circular { self.view = View::Linear; }
+        self.compute_hits(); // sites across the origin come and go
+    }
+
     /// Features ▸ New Feature (⌘K): a misc_feature over the selection, picked for editing in Details.
     fn new_feature(&mut self) {
         let (Some(d), Some((a, b))) = (&mut self.doc, self.sel) else { return };
@@ -463,6 +474,10 @@ impl App {
         if d.seq_dirty {
             s.set_sequence(d.seq.clone());
             d.seq_dirty = false;
+        }
+        if d.topology_dirty {
+            s.set_circular(d.circular);
+            d.topology_dirty = false;
         }
         for f in d.feats.iter_mut().filter(|f| f.dirty) {
             let feat = sbd_feat(f, f.sbd_id.unwrap_or(0));
@@ -575,6 +590,11 @@ impl App {
             ui.menu_button("Features", |ui| {
                 if ui.add_enabled(self.sel.is_some(), egui::Button::new("New Feature  ⌘K")).clicked() { self.new_feature(); }
                 if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Delete Feature")).clicked() { self.delete_feature(); }
+            });
+            ui.menu_button("Sequence", |ui| {
+                let circular = self.doc.as_ref().map(|d| d.circular);
+                if ui.add_enabled(circular.is_some(), egui::Button::selectable(circular == Some(false), "Linear")).clicked() { self.set_circular(false); }
+                if ui.add_enabled(circular.is_some(), egui::Button::selectable(circular == Some(true), "Circular")).clicked() { self.set_circular(true); }
             });
             ui.menu_button("Enzymes", |ui| {
                 if ui.button("Selector Manager…").clicked() { self.selmgr = self.sels.first().map(|s| s.id); }
