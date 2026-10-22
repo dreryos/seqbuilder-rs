@@ -1,6 +1,7 @@
 // SeqBuilder-like DNA viewer laid out like SeqBuilder Pro: tool strip, map page with view tabs,
 // feature table with tabs, Style/Enzymes and Settings/Details side panels.
 mod enzymes;
+mod genbank;
 mod sbd;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
@@ -38,6 +39,24 @@ fn sbd_feat(f: &Feat, id: u32) -> sbd::SbdFeat {
     let (lo, hi, comp) = (f.start + 1, f.end, f.strand < 0);
     let (start, end) = if comp { (hi, lo) } else { (lo, hi) };
     sbd::SbdFeat { id, name: f.name.clone(), kind: f.kind.clone(), start, end, complement: comp, quals: f.quals.clone() }
+}
+
+/// GenBank location: as read when it holds what the coordinates cannot (join, order, partial ends)
+/// and the feature was not edited, otherwise from the coordinates.
+fn gb_location(f: &Feat) -> String {
+    let complex = ["join(", "order(", "<", ">"].iter().any(|m| f.range.contains(m));
+    if f.start >= f.end || (complex && !f.dirty) { return f.range.clone(); }
+    let (lo, hi) = (f.start + 1, f.end);
+    let span = if lo == hi { lo.to_string() } else { format!("{lo}..{hi}") };
+    if f.strand < 0 { format!("complement({span})") } else { span }
+}
+
+/// The document as a GenBank flat file.
+fn export_genbank(d: &Doc) -> String {
+    let header = if d.header.starts_with("^^") { "" } else { &d.header };
+    let feats: Vec<genbank::Feature> = d.feats.iter()
+        .map(|f| genbank::Feature { kind: &f.kind, location: gb_location(f), quals: &f.quals }).collect();
+    genbank::write(header, &d.name, &d.seq, d.circular, &feats)
 }
 
 /// The Range column for a feature that does not wrap the origin.
@@ -505,6 +524,15 @@ impl App {
         }
     }
 
+    /// File ▸ Export GenBank…
+    fn export(&mut self) {
+        let Some(d) = &self.doc else { return };
+        let name = d.path.file_stem().map(|n| n.to_string_lossy().into_owned() + ".gb").unwrap_or_default();
+        if let Some(p) = rfd::FileDialog::new().add_filter("GenBank", &["gb", "gbk"]).set_file_name(name).save_file() {
+            if let Err(e) = std::fs::write(&p, export_genbank(d)) { self.error = Some(format!("{}: {e}", p.display())); }
+        }
+    }
+
     fn save_as(&mut self) {
         let name = self.doc.as_ref().and_then(|d| d.path.file_stem()).map(|n| n.to_string_lossy().into_owned() + ".sbd").unwrap_or_default();
         if let Some(p) = rfd::FileDialog::new().add_filter("SeqBuilder document", &["sbd"]).set_file_name(name).save_file() {
@@ -569,6 +597,7 @@ impl App {
                 }
                 if ui.button("Save  ⌘S").clicked() { self.save(None); }
                 if ui.button("Save As…").clicked() { self.save_as(); }
+                if ui.add_enabled(self.doc.is_some(), egui::Button::new("Export GenBank…")).clicked() { self.export(); }
                 if ui.button("Open Enzyme Files…").clicked() {
                     let ezd = rfd::FileDialog::new().add_filter("Enzyme file", &["ezd"]).pick_file();
                     let sel = ezd.as_ref().and_then(|_| rfd::FileDialog::new().add_filter("Selector file", &["sel"]).pick_file());
@@ -1162,6 +1191,15 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
+    // seqbuilder-rs --export-genbank in.sbd out.gb  (batch conversion, no window)
+    let args: Vec<String> = std::env::args().collect();
+    if let [_, flag, input, output] = &args[..] {
+        if flag == "--export-genbank" {
+            let written = load(Path::new(input)).and_then(|d| std::fs::write(output, export_genbank(&d)).map_err(|e| e.to_string()));
+            if let Err(e) = written { eprintln!("{input}: {e}"); std::process::exit(1); }
+            return Ok(());
+        }
+    }
     let mut app = App { zoom: 1.0, ..Default::default() };
     let dir = std::env::var("SEQBUILDER_ENZYMES").map(PathBuf::from).unwrap_or_else(|_| DNASTAR_DIR.into());
     // User-edited selectors live where DataManager's DMConfig.cfg points; fall back to the shipped file.
@@ -1344,6 +1382,25 @@ mod tests {
         }
         assert_eq!(got.shown, exp.shown);
         assert!(got.obj_styles.is_empty());
+    }
+
+    /// Exporting pBR322 (read from GenBank or from SeqBuilder's .sbd) must reproduce NCBI's file byte for byte.
+    #[test]
+    fn genbank_export_reproduces_ncbi_file() {
+        // efetch ends the record with an extra blank line, a GenBank file ends at "//"
+        let ncbi = std::fs::read_to_string("testdata/pBR322.gb").unwrap().trim_end().to_string() + "\n";
+        for f in ["testdata/pBR322.gb", "testdata/pBR322.sbd"] {
+            let out = export_genbank(&load(Path::new(f)).unwrap());
+            if out != ncbi {
+                let line = out.lines().zip(ncbi.lines()).position(|(a, b)| a != b);
+                panic!("{f}: differs at line {line:?}: {:?}", line.map(|i| (out.lines().nth(i), ncbi.lines().nth(i))));
+            }
+        }
+        // a sequence made in SeqBuilder (no GenBank header) still exports as valid GenBank
+        let out = export_genbank(&load(Path::new("testdata/ALDH2.sbd")).unwrap());
+        let back = gb_io::reader::parse_slice(out.as_bytes()).unwrap().remove(0);
+        assert_eq!((back.seq.len(), back.features.len(), back.is_circular()), (114842, 2, false));
+        assert_eq!(back.features[1].location.to_gb_format(), "complement(5087..5124)");
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
