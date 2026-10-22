@@ -1,6 +1,6 @@
-// GenBank flat-file writer laid out like NCBI's: the header is kept as written (only LOCUS is
-// regenerated for the current length and topology), features come from qualifier lines that already
-// carry their quoting, the sequence is written 60 bases a line in groups of 10.
+// GenBank flat-file writer laid out like SeqBuilder Pro's File > Export: the header is kept as written
+// (only LOCUS is regenerated for the current length and topology), features come from qualifier lines
+// that already carry their quoting, CRLF line ends and a blank line after "//".
 
 pub struct Feature<'a> {
     pub kind: &'a str,
@@ -8,7 +8,9 @@ pub struct Feature<'a> {
     pub quals: &'a [String], // "key=value" lines, quoting included
 }
 
-const QUAL_WIDTH: usize = 58; // columns 22..79
+const QUAL_WIDTH: usize = 58; // columns 22..79, used by translations
+// ponytail: SeqBuilder wrapped a 58-character note line and kept a 56-character one; 57 is a guess.
+const TEXT_WIDTH: usize = 57;
 
 /// `header` is the GenBank text before FEATURES (may be empty); `name` is used when it has no LOCUS.
 pub fn write(header: &str, name: &str, seq: &[u8], circular: bool, features: &[Feature]) -> String {
@@ -33,8 +35,8 @@ pub fn write(header: &str, name: &str, seq: &[u8], circular: bool, features: &[F
         let groups: Vec<String> = bases.chunks(10).map(|g| String::from_utf8_lossy(g).to_lowercase()).collect();
         out += &format!("{:>9} {}\n", row * 60 + 1, groups.join(" "));
     }
-    out += "//\n";
-    out
+    out += "//\n\n";
+    out.replace('\n', "\r\n")
 }
 
 /// LOCUS with the current length and topology; name, molecule, division and date are kept when known.
@@ -59,16 +61,17 @@ fn locus(old: Option<&str>, name: &str, len: usize, circular: bool) -> String {
 fn wrap(text: &str, hard: bool) -> Vec<String> {
     let mut lines = vec![];
     let mut rest: Vec<char> = text.chars().collect();
-    while rest.len() > QUAL_WIDTH {
-        let cut = if hard { None } else { rest[..=QUAL_WIDTH].iter().rposition(|&c| c == ' ') };
+    let width = if hard { QUAL_WIDTH } else { TEXT_WIDTH };
+    while rest.len() > width {
+        let cut = if hard { None } else { rest[..=width].iter().rposition(|&c| c == ' ') };
         match cut {
             Some(at) if at > 0 => {
                 lines.push(rest[..at].iter().collect());
                 rest.drain(..=at);
             }
             _ => {
-                lines.push(rest[..QUAL_WIDTH].iter().collect());
-                rest.drain(..QUAL_WIDTH);
+                lines.push(rest[..width].iter().collect());
+                rest.drain(..width);
             }
         }
     }
@@ -100,7 +103,7 @@ mod tests {
     #[test]
     fn wraps_like_ncbi() {
         let long = "note=\"corresponds to one of the 38bp repeats found in Tn3 (bp 1-38 of Tn3)\"";
-        assert_eq!(wrap(&format!("/{long}"), false), ["/note=\"corresponds to one of the 38bp repeats found in Tn3", "(bp 1-38 of Tn3)\""]);
+        assert_eq!(wrap(&format!("/{long}"), false), ["/note=\"corresponds to one of the 38bp repeats found in", "Tn3 (bp 1-38 of Tn3)\""]);
         assert!(locus(None, "ALDH2", 114842, false).starts_with(&format!("LOCUS       ALDH2{}114842 bp    DNA     linear   UNK ", " ".repeat(17))));
     }
 }

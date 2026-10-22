@@ -46,16 +46,25 @@ fn sbd_feat(f: &Feat, id: u32) -> sbd::SbdFeat {
 fn gb_location(f: &Feat) -> String {
     let complex = ["join(", "order(", "<", ">"].iter().any(|m| f.range.contains(m));
     if f.start >= f.end || (complex && !f.dirty) { return f.range.clone(); }
-    let (lo, hi) = (f.start + 1, f.end);
-    let span = if lo == hi { lo.to_string() } else { format!("{lo}..{hi}") };
+    let span = format!("{}..{}", f.start + 1, f.end); // SeqBuilder writes a single base as 426..426
     if f.strand < 0 { format!("complement({span})") } else { span }
 }
 
-/// The document as a GenBank flat file.
+/// The document as a GenBank flat file, as SeqBuilder exports it: features by start position and the
+/// document name as /dnas_title on the first source feature.
 fn export_genbank(d: &Doc) -> String {
     let header = if d.header.starts_with("^^") { "" } else { &d.header };
-    let feats: Vec<genbank::Feature> = d.feats.iter()
-        .map(|f| genbank::Feature { kind: &f.kind, location: gb_location(f), quals: &f.quals }).collect();
+    let title = d.path.file_stem().map_or(d.name.clone(), |s| s.to_string_lossy().into_owned());
+    let first_source = d.feats.iter().position(|f| f.kind == "source");
+    let quals: Vec<Vec<String>> = d.feats.iter().enumerate().map(|(i, f)| {
+        let mut q = f.quals.clone();
+        if Some(i) == first_source && !q.iter().any(|l| l.starts_with("dnas_title=")) { q.insert(0, format!("dnas_title=\"{title}\"")); }
+        q
+    }).collect();
+    let mut order: Vec<usize> = (0..d.feats.len()).collect();
+    order.sort_by_key(|&i| d.feats[i].start); // stable: equal starts keep document order
+    let feats: Vec<genbank::Feature> = order.iter()
+        .map(|&i| genbank::Feature { kind: &d.feats[i].kind, location: gb_location(&d.feats[i]), quals: &quals[i] }).collect();
     genbank::write(header, &d.name, &d.seq, d.circular, &feats)
 }
 
@@ -1384,19 +1393,30 @@ mod tests {
         assert!(got.obj_styles.is_empty());
     }
 
-    /// Exporting pBR322 (read from GenBank or from SeqBuilder's .sbd) must reproduce NCBI's file byte for byte.
+    /// Exporting pBR322_add.sbd must give what SeqBuilder Pro's File > Export wrote: pBR322_add.gbk.
     #[test]
-    fn genbank_export_reproduces_ncbi_file() {
-        // efetch ends the record with an extra blank line, a GenBank file ends at "//"
-        let ncbi = std::fs::read_to_string("testdata/pBR322.gb").unwrap().trim_end().to_string() + "\n";
-        for f in ["testdata/pBR322.gb", "testdata/pBR322.sbd"] {
-            let out = export_genbank(&load(Path::new(f)).unwrap());
-            if out != ncbi {
-                let line = out.lines().zip(ncbi.lines()).position(|(a, b)| a != b);
-                panic!("{f}: differs at line {line:?}: {:?}", line.map(|i| (out.lines().nth(i), ncbi.lines().nth(i))));
-            }
+    fn genbank_export_matches_seqbuilder() {
+        let want = std::fs::read_to_string("testdata/pBR322_add.gbk").unwrap();
+        let out = export_genbank(&load(Path::new("testdata/pBR322_add.sbd")).unwrap());
+        if out != want {
+            let line = out.lines().zip(want.lines()).position(|(a, b)| a != b);
+            panic!("differs at line {line:?}: {:?}", line.map(|i| (out.lines().nth(i), want.lines().nth(i))));
         }
-        // a sequence made in SeqBuilder (no GenBank header) still exports as valid GenBank
+    }
+
+    /// The same data as NCBI's pBR322.gb whether exported from GenBank or from SeqBuilder's .sbd.
+    #[test]
+    fn genbank_export_keeps_ncbi_content() {
+        let ncbi = gb_io::reader::parse_file("testdata/pBR322.gb").unwrap().remove(0);
+        for f in ["testdata/pBR322.gb", "testdata/pBR322.sbd"] {
+            let back = gb_io::reader::parse_slice(export_genbank(&load(Path::new(f)).unwrap()).as_bytes()).unwrap().remove(0);
+            assert!(back.seq == ncbi.seq && back.is_circular() && back.definition == ncbi.definition, "{f}");
+            assert_eq!(back.features.len(), ncbi.features.len());
+            let key = |f: &gb_io::seq::Feature| (f.location.find_bounds().unwrap(), f.kind.to_string());
+            let (mut a, mut b): (Vec<_>, Vec<_>) = (back.features.iter().map(key).collect(), ncbi.features.iter().map(key).collect());
+            (a.sort(), b.sort());
+            assert_eq!(a, b, "{f}");
+        }
         let out = export_genbank(&load(Path::new("testdata/ALDH2.sbd")).unwrap());
         let back = gb_io::reader::parse_slice(out.as_bytes()).unwrap().remove(0);
         assert_eq!((back.seq.len(), back.features.len(), back.is_circular()), (114842, 2, false));
