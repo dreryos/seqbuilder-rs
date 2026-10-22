@@ -30,6 +30,9 @@ struct Feat {
     base: Option<sbd::Style>,          // the document's style for this feature type
     sbd_id: Option<u32>,               // UVFT id when read from a .sbd
     edited: bool,                      // style changed since the last save
+    shape: Option<sbd::Shape>,         // this feature's own shape, linkage and label
+    base_shape: Option<sbd::Shape>,    // the document's shape for this feature type
+    shape_edited: bool,
     quals: Vec<String>,                // "key=value" qualifier lines, quoting included
     dirty: bool,                       // name, type, range or qualifiers changed since the last save
 }
@@ -202,6 +205,7 @@ fn load(path: &Path) -> Result<Doc, String> {
                 range: if f.complement { format!("complement({lo}..{hi})") } else { format!("{lo}..{hi}") },
                 start: lo.saturating_sub(1), end: hi, strand: if f.complement { -1 } else { 1 }, lane: 0,
                 show: s.shown.get(&f.id).copied().unwrap_or(f.kind != "source"), style: s.obj_styles.get(&f.id).copied(),
+                shape: s.obj_shapes.get(&f.id).copied(), base_shape: s.type_shapes.get(&f.kind).copied(), shape_edited: false,
                 base: s.type_styles.get(&f.kind).copied(), sbd_id: Some(f.id), edited: false,
                 quals: f.quals.clone(), dirty: false,
             }
@@ -237,7 +241,8 @@ fn load(path: &Path) -> Result<Doc, String> {
                 kind: f.kind.to_string(), label: short(&name), name, desc: q("note").or_else(|| q("product")).unwrap_or_default(),
                 range: f.location.to_gb_format(), start, end, strand: location_strand(&f.location), lane: 0,
                 show: f.kind != "source", // SeqBuilder lists source but leaves it hidden
-                style: None, base: None, sbd_id: None, edited: false, quals, dirty: false,
+                style: None, base: TYPE_LOOKS.0.get(f.kind.as_ref()).copied(), sbd_id: None, edited: false, quals, dirty: false,
+                shape: None, base_shape: TYPE_LOOKS.1.get(f.kind.as_ref()).copied(), shape_edited: false,
             })
         }).collect();
         let circular = rec.is_circular();
@@ -268,6 +273,19 @@ fn kind_style(kind: &str) -> sbd::Style {
     sbd::Style { line: Some(line), weight: 1.0, fill: Some(fill), shadow: None }
 }
 
+/// Type styles and shapes of a SeqBuilder document, used for documents that carry none (GenBank, FASTA),
+/// so they are drawn as SeqBuilder draws them after import.
+static TYPE_LOOKS: std::sync::LazyLock<(std::collections::HashMap<String, sbd::Style>, std::collections::HashMap<String, sbd::Shape>)> =
+    std::sync::LazyLock::new(|| sbd::read(SBD_TEMPLATE).map(|t| (t.type_styles, t.type_shapes)).unwrap_or_default());
+
+const SHAPES: [&str; 6] = ["Box", "Filled Arrow", "Filled Double Arrow", "Triangle Glyph", "Stroked Arrow", "Stroked Goalpost"];
+const LINKAGES: [&str; 3] = ["Solid", "Dashed", "None"];
+const LABEL_POSITIONS: [&str; 3] = ["Above", "Inside", "Below"];
+
+fn shape(f: &Feat) -> sbd::Shape {
+    f.shape.or(f.base_shape).unwrap_or(sbd::Shape { shape: 2, linkage: 1, label: 2, attached: true })
+}
+
 fn look(f: &Feat) -> sbd::Style {
     f.style.or(f.base).unwrap_or_else(|| kind_style(&f.kind))
 }
@@ -280,6 +298,45 @@ fn rgb(c: [u8; 3]) -> Color32 {
 fn colors(f: &Feat) -> (Color32, Color32) {
     let s = look(f);
     (s.fill.map_or(Color32::TRANSPARENT, rgb), s.line.map_or(Color32::TRANSPARENT, rgb))
+}
+
+/// One feature span on a straight track (Linear view), in its Style tab shape.
+fn draw_track_feature(p: &egui::Painter, r: Rect, strand: i8, shape: u32, fill: Color32, line: Color32, st: sbd::Style) {
+    let fill = if shape == 5 { Color32::TRANSPARENT } else { fill };
+    let outline = Stroke::new(st.weight as f32, line);
+    let head = 7.0f32.min(r.width() / 2.0);
+    let (lt, rt) = match shape {
+        2 | 5 => (strand < 0, strand >= 0),
+        3 => (true, true),
+        _ => (false, false),
+    };
+    let body = Rect::from_x_y_ranges(r.left() + if lt { head } else { 0.0 }..=r.right() - if rt { head } else { 0.0 }, r.y_range());
+    let tri = |tip: f32, back: f32| vec![Pos2::new(tip, r.center().y), Pos2::new(back, r.top() - 2.0), Pos2::new(back, r.bottom() + 2.0)];
+    let mut parts: Vec<Vec<Pos2>> = vec![];
+    if lt { parts.push(tri(r.left(), body.left())); }
+    if rt { parts.push(tri(r.right(), body.right())); }
+    match shape {
+        4 => {
+            let c = r.center().x;
+            let t = if strand < 0 { tri(c - head / 2.0, c + head / 2.0) } else { tri(c + head / 2.0, c - head / 2.0) };
+            if let Some(sh) = st.shadow { p.add(Shape::convex_polygon(t.iter().map(|q| *q + Vec2::splat(2.0)).collect(), rgb(sh), Stroke::NONE)); }
+            p.add(Shape::convex_polygon(t, fill, outline));
+        }
+        6 => {
+            let stroke = Stroke::new((st.weight as f32).max(1.5), if line == Color32::TRANSPARENT { fill } else { line });
+            p.line_segment([r.left_center(), r.right_center()], stroke);
+            p.line_segment([r.left_top(), r.left_bottom()], stroke);
+            p.line_segment([r.right_top(), r.right_bottom()], stroke);
+        }
+        _ => {
+            if let Some(sh) = st.shadow {
+                p.rect_filled(body.translate(Vec2::splat(2.0)), 1.0, rgb(sh));
+                for t in &parts { p.add(Shape::convex_polygon(t.iter().map(|q| *q + Vec2::splat(2.0)).collect(), rgb(sh), Stroke::NONE)); }
+            }
+            p.rect(body, 1.0, fill, outline, egui::StrokeKind::Inside);
+            for t in parts { p.add(Shape::convex_polygon(t, fill, Stroke::new(outline.width.min(2.0), line))); }
+        }
+    }
 }
 
 /// SeqBuilder shows short sequences in bp and long ones in kb ("4361 bp", "114.842 kb").
@@ -482,7 +539,8 @@ impl App {
         let name = "New Feature".to_string();
         d.feats.push(Feat {
             kind: "misc_feature".into(), label: name.clone(), desc: String::new(), range: format!("{}..{b}", a + 1),
-            start: a, end: b, strand: 1, lane: 0, show: true, style: None, base: None, sbd_id: None, edited: false,
+            start: a, end: b, strand: 1, lane: 0, show: true, style: None, sbd_id: None, edited: false,
+            base: TYPE_LOOKS.0.get("misc_feature").copied(), shape: None, base_shape: TYPE_LOOKS.1.get("misc_feature").copied(), shape_edited: false,
             quals: vec![format!("dnas_title=\"{name}\"")], dirty: true, name,
         });
         d.lanes = assign_lanes(&mut d.feats, d.seq.len());
@@ -540,6 +598,12 @@ impl App {
         for f in d.feats.iter_mut().filter(|f| f.edited) {
             let Some(id) = f.sbd_id else { continue };
             s.set_feature_style(id, f.style);
+            f.edited = false;
+        }
+        for f in d.feats.iter_mut().filter(|f| f.shape_edited) {
+            let (Some(id), Some(sh)) = (f.sbd_id, f.shape) else { continue };
+            s.set_feature_shape(id, sh);
+            f.shape_edited = false;
             f.edited = false;
         }
         let path = to.unwrap_or_else(|| d.path.clone());
@@ -855,17 +919,22 @@ impl App {
                 if changed { (f.style, f.edited) = (Some(st), true); }
                 ui.add_space(6.0);
                 ui.small("Feature");
-                // ponytail: shape, linkage and label position are not decoded from STYLE yet; shown to keep the layout.
+                let mut sh = shape(f);
+                let mut ch = false;
+                egui::Grid::new("feature_shape").num_columns(2).show(ui, |ui| {
+                    for (label, field, names) in [("Shape:", &mut sh.shape, &SHAPES[..]), ("Linkage:", &mut sh.linkage, &LINKAGES[..]), ("Label Position:", &mut sh.label, &LABEL_POSITIONS[..])] {
+                        ui.label(label);
+                        let current = names.get((*field as usize).wrapping_sub(1)).copied().unwrap_or("?");
+                        egui::ComboBox::from_id_salt(label).selected_text(current).show_ui(ui, |ui| {
+                            for (k, n) in names.iter().enumerate() { ch |= ui.selectable_value(field, k as u32 + 1, *n).changed(); }
+                        });
+                        ui.end_row();
+                    }
+                });
+                ch |= ui.checkbox(&mut sh.attached, "Label Attached").changed();
+                if ch { (f.shape, f.shape_edited) = (Some(sh), true); }
+                ui.add_space(6.0);
                 ui.add_enabled_ui(false, |ui| {
-                    egui::Grid::new("feature_shape").num_columns(2).show(ui, |ui| {
-                        for (label, value) in [("Shape:", "Box"), ("Linkage:", "Solid"), ("Label Position:", "Inside")] {
-                            ui.label(label);
-                            egui::ComboBox::from_id_salt(label).selected_text(value).show_ui(ui, |_| {});
-                            ui.end_row();
-                        }
-                    });
-                    ui.checkbox(&mut false, "Label Attached");
-                    ui.add_space(6.0);
                     ui.small("Font");
                     ui.horizontal(|ui| { ui.label("Selected Item"); ui.label("Helvetica 12"); });
                 }).response.on_disabled_hover_text("Not implemented yet");
@@ -988,25 +1057,56 @@ impl App {
                 p.line_segment([at(mid, rad - 6.0), at(mid, rad + 6.0)], Stroke::new(3.0, mark));
                 continue;
             }
-            let head = (8.0 / rad).min(a1 - a0);
-            let (b0, b1, tip, back) = if f.strand < 0 { (a0 + head, a1, a0, a0 + head) } else { (a0, a1 - head, a1, a1 - head) };
-            let arrow = vec![at(tip, rad), at(back, rad + 7.0), at(back, rad - 7.0)];
-            if let Some(sh) = st.shadow {
-                let off = |v: &Vec<Pos2>| v.iter().map(|q| *q + Vec2::splat(2.0)).collect::<Vec<_>>();
-                if b1 > b0 { p.add(Shape::line(off(&arc(b0, b1, rad)), Stroke::new(8.0, rgb(sh)))); }
-                p.add(Shape::convex_polygon(off(&arrow), rgb(sh), Stroke::NONE));
-            }
-            if b1 > b0 {
-                let mut band = arc(b0, b1, rad + 4.0);
-                band.extend(arc(b1, b0, rad - 4.0));
-                band.push(band[0]);
-                p.add(Shape::line(arc(b0, b1, rad), Stroke::new(8.0, fill)));
-                p.add(Shape::line(band, outline));
-            }
-            p.add(Shape::convex_polygon(arrow, fill, Stroke::new(outline.width.min(2.0), line))); // sharp tip
+            let sh = shape(f);
+            let fill = if sh.shape == 5 { Color32::TRANSPARENT } else { fill }; // Stroked Arrow: outline only
+            let head = (8.0 / rad).min((a1 - a0) / 2.0);
+            // arrow heads as (tip, back) angles
+            let heads: Vec<(f32, f32)> = match sh.shape {
+                2 | 5 => vec![if f.strand < 0 { (a0, a0 + head) } else { (a1, a1 - head) }],
+                3 => vec![(a0, a0 + head), (a1, a1 - head)],
+                _ => vec![],
+            };
+            let b0 = if heads.iter().any(|h| h.0 == a0) { a0 + head } else { a0 };
+            let b1 = if heads.iter().any(|h| h.0 == a1) { a1 - head } else { a1 };
+            let off = |v: &Vec<Pos2>| v.iter().map(|q| *q + Vec2::splat(2.0)).collect::<Vec<_>>();
             let mid = (a0 + a1) / 2.0;
+            match sh.shape {
+                4 => {
+                    // Triangle Glyph: one triangle at the middle, pointing along the strand
+                    let h = (6.0 / rad).min((a1 - a0) / 2.0).max(4.0 / rad);
+                    let (tip, back) = if f.strand < 0 { (mid - h, mid + h) } else { (mid + h, mid - h) };
+                    let tri = vec![at(tip, rad), at(back, rad + 7.0), at(back, rad - 7.0)];
+                    if let Some(c) = st.shadow { p.add(Shape::convex_polygon(off(&tri), rgb(c), Stroke::NONE)); }
+                    p.add(Shape::convex_polygon(tri, fill, Stroke::new(outline.width.min(2.0), line)));
+                }
+                6 => {
+                    // Stroked Goalpost: the span as a line with posts at both ends
+                    let colour = if line == Color32::TRANSPARENT { fill } else { line };
+                    let stroke = Stroke::new((st.weight as f32).max(1.5), colour);
+                    p.add(Shape::line(arc(a0, a1, rad), stroke));
+                    for a in [a0, a1] { p.line_segment([at(a, rad - 5.0), at(a, rad + 5.0)], stroke); }
+                }
+                _ => {
+                    let arrows: Vec<Vec<Pos2>> = heads.iter().map(|&(tip, back)| vec![at(tip, rad), at(back, rad + 7.0), at(back, rad - 7.0)]).collect();
+                    if let Some(c) = st.shadow {
+                        if b1 > b0 { p.add(Shape::line(off(&arc(b0, b1, rad)), Stroke::new(8.0, rgb(c)))); }
+                        for a in &arrows { p.add(Shape::convex_polygon(off(a), rgb(c), Stroke::NONE)); }
+                    }
+                    if b1 > b0 {
+                        let mut band = arc(b0, b1, rad + 4.0);
+                        band.extend(arc(b1, b0, rad - 4.0));
+                        band.push(band[0]);
+                        p.add(Shape::line(arc(b0, b1, rad), Stroke::new(8.0, fill)));
+                        p.add(Shape::line(band, outline));
+                    }
+                    for a in arrows { p.add(Shape::convex_polygon(a, fill, Stroke::new(outline.width.min(2.0), line))); } // sharp tips
+                }
+            }
             let galley = p.layout_no_wrap(f.label.clone(), small.clone(), fg);
-            let lrect = Align2::CENTER_CENTER.anchor_size(at(mid, rad - 13.0), galley.size());
+            // Label Position: Above = outward, Inside = on the band when it fits, Below = toward the centre
+            let fits = galley.size().x + 4.0 < (b1 - b0) * rad && sh.shape != 4 && sh.shape != 6;
+            let lr = match sh.label { 1 => rad + 13.0, 2 if fits => rad, _ => rad - 13.0 };
+            let lrect = Align2::CENTER_CENTER.anchor_size(at(mid, lr), galley.size());
             if placed.iter().any(|q| q.intersects(lrect)) || lrect.distance_to_pos(c) < 30.0 { continue; }
             placed.push(lrect);
             p.galley(lrect.min, galley, fg);
@@ -1056,11 +1156,15 @@ impl App {
             let st = look(f);
             let fy = y + 28.0 + f.lane as f32 * 16.0;
             let spans = if f.start < f.end { vec![(f.start, f.end)] } else { vec![(f.start, doc.seq.len()), (0, f.end)] };
+            let sh = shape(f);
             for (s, e) in spans {
                 let r = Rect::from_min_max(Pos2::new(x(s), fy - 5.0), Pos2::new(x(e).max(x(s) + 2.0), fy + 5.0));
-                if let Some(sh) = st.shadow { p.rect_filled(r.translate(Vec2::splat(2.0)), 1.0, rgb(sh)); }
-                p.rect(r, 1.0, fill, Stroke::new(st.weight as f32, line), egui::StrokeKind::Inside);
-                p.with_clip_rect(r).text(r.center(), Align2::CENTER_CENTER, &f.label, small.clone(), fg);
+                draw_track_feature(p, r, f.strand, sh.shape, fill, line, st);
+                match sh.label {
+                    1 => { p.text(r.center_top() - Vec2::new(0.0, 1.0), Align2::CENTER_BOTTOM, &f.label, small.clone(), fg); }
+                    3 => { p.text(r.center_bottom() + Vec2::new(0.0, 1.0), Align2::CENTER_TOP, &f.label, small.clone(), fg); }
+                    _ => { p.with_clip_rect(r).text(r.center(), Align2::CENTER_CENTER, &f.label, small.clone(), fg); }
+                }
             }
         }
         let mut placed: Vec<Rect> = vec![];

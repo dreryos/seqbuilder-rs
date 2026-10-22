@@ -16,7 +16,9 @@
 //         with a few bytes of their own before their items). Styles live in VSSTYLE blocks: OBJINFO.STYLE
 //         per object, TYPEINFO.TDATA{TINFO,STYLE} per feature type. There is one VSSTYLE per view state:
 //         ALLDSTAT, the open view (InfSpltF...SeqView) and every default layout in DefLayLs; SeqBuilder
-//         draws from the view copies, so an edit has to reach all of them.
+//         draws from the view copies, so an edit has to reach all of them. Shapes live in VSFEAT:
+//         VSFSTYLE.STYLE per object (sorted by id) and TSTYLE.TYPES{TINFO,STYLE} per feature type, each
+//         u32 id, shape, linkage, label position, label attached, then a STYLEEXT item.
 // Writing keeps every chunk as read and replaces only the ones that were edited, then lays the file
 // out again: header, chunk data, each object's entries followed by its group header, object table.
 use std::collections::HashMap;
@@ -71,6 +73,19 @@ pub struct Style {
     pub shadow: Option<[u8; 3]>,
 }
 
+/// How a feature is drawn (Style tab ▸ Feature). Values count from 1 in the order of SeqBuilder's menus.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shape {
+    pub shape: u32,   // 1 Box, 2 Filled Arrow, 3 Filled Double Arrow, 4 Triangle Glyph, 5 Stroked Arrow, 6 Stroked Goalpost
+    pub linkage: u32, // 1 Solid, 2 Dashed, 3 None
+    pub label: u32,   // 1 Above, 2 Inside, 3 Below
+    pub attached: bool,
+}
+
+fn shape_of(r: &[u8]) -> Option<(u32, Shape)> {
+    Some((u32le(r, 0)?, Shape { shape: u32le(r, 4)?, linkage: u32le(r, 8)?, label: u32le(r, 12)?, attached: u32le(r, 16)? != 0 }))
+}
+
 pub struct Sbd {
     container: Container,
     pub seq: Vec<u8>,
@@ -80,9 +95,12 @@ pub struct Sbd {
     pub type_styles: HashMap<String, Style>,
     pub obj_styles: HashMap<u32, Style>, // by UVFT id
     pub shown: HashMap<u32, bool>,       // Show checkbox by UVFT id (VSFEAT.STATE)
+    pub type_shapes: HashMap<String, Shape>,
+    pub obj_shapes: HashMap<u32, Shape>, // by UVFT id
 }
 
 const FEATURE_OBJECT: u32 = 9; // object type of features in STYLE records
+const STYLEEXT: &[u8] = b"STYLEEXT\x02\0\0\0\x01\0"; // trailer of every VSFEAT STYLE record seen
 const FXIF: &[u8] = b"CommonBlockFmt\0\0\0IgnoreXI\x01\0\0\0\x01"; // the same in every sample
 
 fn u32be(d: &[u8], o: usize) -> Option<u32> {
@@ -443,6 +461,27 @@ impl Sbd {
         self.shown.insert(id, shown);
     }
 
+    /// Style tab ▸ Feature: shape, linkage and label of feature `id`, kept in every VSFEAT copy.
+    pub fn set_feature_shape(&mut self, id: u32, sh: Shape) {
+        let record = |tail: &[u8]| {
+            let mut r: Vec<u8> = [id, sh.shape, sh.linkage, sh.label, sh.attached as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+            r.extend(tail);
+            r
+        };
+        if let Some(tl) = self.container.chunk_mut(b"UVTL") {
+            edit_all(tl, "VSFEAT", |vf| block(vf, props(vf).into_iter().map(|(k, v)| {
+                if k != "VSFSTYLE" { return (k, v.to_vec()); }
+                let mut rows: Vec<Vec<u8>> = props(v).into_iter().map(|(_, r)| r.to_vec()).collect();
+                let tail = rows.first().map_or(STYLEEXT.to_vec(), |r| r[20..].to_vec());
+                rows.retain(|r| u32le(r, 0) != Some(id));
+                let at = rows.iter().position(|r| u32le(r, 0).unwrap_or(0) > id).unwrap_or(rows.len());
+                rows.insert(at, record(&tail));
+                (k, block(v, rows.into_iter().map(|r| ("STYLE", r))))
+            })));
+        }
+        self.obj_shapes.insert(id, sh);
+    }
+
     /// Sequence ▸ Linear / Circular: SeqBuilder records the topology in UVSI SeqShape and UVTL SBLinear.
     pub fn set_circular(&mut self, circular: bool) {
         if let Some(si) = self.container.chunk_mut(b"UVSI") {
@@ -614,11 +653,19 @@ pub fn read(d: &[u8]) -> Result<Sbd, String> {
             }
         }
     }
+    let vsfeat = get(*b"UVTL").next().and_then(|c| ["ALLDSTAT", "CMNSTATE", "VSFEAT"].iter().try_fold(c.2, |b, k| child(b, k)));
+    let obj_shapes = vsfeat.and_then(|v| child(v, "VSFSTYLE"))
+        .map(|v| props(v).into_iter().filter_map(|(_, r)| shape_of(r)).collect()).unwrap_or_default();
+    let type_shapes = vsfeat.and_then(|v| child(v, "TSTYLE")).map(|ts| props(ts).into_iter().filter_map(|(_, t)| {
+        let ti = child(t, "TINFO")?;
+        let n = u32le(ti, 0)? as usize;
+        Some((text(ti.get(4..4 + n)?), shape_of(child(t, "STYLE")?)?.1))
+    }).collect()).unwrap_or_default();
     let shown = get(*b"UVTL").next()
         .and_then(|c| ["ALLDSTAT", "CMNSTATE", "VSFEAT", "STATE"].iter().try_fold(c.2, |b, k| child(b, k)))
         .map(|st| feature_state(st).into_iter().collect()).unwrap_or_default();
     drop(chunks);
-    Ok(Sbd { container, shown, seq, header, circular, feats, type_styles, obj_styles })
+    Ok(Sbd { container, shown, type_shapes, obj_shapes, seq, header, circular, feats, type_styles, obj_styles })
 }
 
 #[cfg(test)]
@@ -716,6 +763,22 @@ mod tests {
             assert_eq!(sb_linear(&ours), sb_linear(&want), "{to}: SBLinear");
             assert_eq!(read(&ours).unwrap().circular, circular);
         }
+    }
+
+    /// Shape, linkage, label and shadow for bla must match what SeqBuilder Pro saved in pBR322_shape.sbd.
+    #[test]
+    fn shape_and_shadow_match_seqbuilder() {
+        let mut d = read(&std::fs::read("testdata/pBR322.sbd").unwrap()).unwrap();
+        let want = read(&std::fs::read("testdata/pBR322_shape.sbd").unwrap()).unwrap();
+        assert_eq!(d.type_shapes["CDS"], Shape { shape: 2, linkage: 1, label: 2, attached: true });
+        assert_eq!(want.obj_shapes[&38], Shape { shape: 2, linkage: 2, label: 1, attached: true });
+        d.set_feature_shape(38, want.obj_shapes[&38]);
+        d.set_feature_style(38, Some(want.obj_styles[&38]));
+        let vsfstyle = |s: &Sbd| items_of(s, "VSFEAT").iter().map(|v| child(v, "VSFSTYLE").unwrap().to_vec()).collect::<Vec<_>>();
+        assert_eq!(vsfstyle(&d).len(), 9);
+        assert!(vsfstyle(&d) == vsfstyle(&want));
+        assert!(items_of(&d, "VSSTYLE") == items_of(&want, "VSSTYLE"));
+        assert_eq!(read(&d.to_bytes()).unwrap().obj_shapes[&38], want.obj_shapes[&38]);
     }
 
     #[test]
