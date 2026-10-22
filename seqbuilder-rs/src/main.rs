@@ -300,6 +300,30 @@ fn colors(f: &Feat) -> (Color32, Color32) {
     (s.fill.map_or(Color32::TRANSPARENT, rgb), s.line.map_or(Color32::TRANSPARENT, rgb))
 }
 
+/// Standard genetic code, TCAG order.
+const CODONS: &[u8; 64] = b"FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG";
+
+fn translate(codon: &[u8]) -> char {
+    let n = |b: u8| match b.to_ascii_uppercase() { b'T' | b'U' => Some(0), b'C' => Some(1), b'A' => Some(2), b'G' => Some(3), _ => None };
+    match (n(codon[0]), n(codon[1]), n(codon[2])) {
+        (Some(a), Some(b), Some(c)) => CODONS[a * 16 + b * 4 + c] as char,
+        _ => 'X',
+    }
+}
+
+/// The amino acid of reading frame `k` (0-2 forward from base 1, 3-5 reverse from the last base)
+/// whose codon has base `i` in the middle, if there is one.
+fn frame_residue(seq: &[u8], i: usize, k: usize) -> Option<char> {
+    if i == 0 || i + 1 >= seq.len() { return None; }
+    let codon = &seq[i - 1..=i + 1];
+    if k < 3 {
+        ((i - 1) % 3 == k).then(|| translate(codon))
+    } else {
+        let j = seq.len() - 2 - i; // codon start on the reverse strand
+        (j % 3 == k - 3).then(|| translate(&codon.iter().rev().map(|&b| complement(b)).collect::<Vec<u8>>()))
+    }
+}
+
 /// One feature span on a straight track (Linear view), in its Style tab shape.
 fn draw_track_feature(p: &egui::Painter, r: Rect, strand: i8, shape: u32, fill: Color32, line: Color32, st: sbd::Style) {
     let fill = if shape == 5 { Color32::TRANSPARENT } else { fill };
@@ -381,6 +405,12 @@ struct App {
     anchor: usize,
     grouping: usize, // 0 = none, 3, 10
     complement: bool, // show the complementary strand in the Sequence view
+    hide_enzymes: bool,
+    translations: bool,
+    hide_rulers: bool,
+    spacing: bool,
+    hide_side: bool,
+    hide_table: bool,
     zoom: f32,
     view: View,
     tab: Tab,
@@ -758,14 +788,46 @@ impl App {
         if let Some(f) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) { self.open(&f); }
     }
 
+    /// SeqBuilder's tool strip, top to bottom; tools not made yet are shown disabled.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
-            ui.add(egui::Button::selectable(true, "↖")).on_hover_text("Select");
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            let toggle = |ui: &mut egui::Ui, on: &mut bool, icon: &str, tip: &str| {
+                if ui.add(egui::Button::selectable(*on, icon)).on_hover_text(tip).clicked() { *on = !*on; }
+            };
+            let mut enzymes = !self.hide_enzymes;
+            let mut rulers = !self.hide_rulers;
+            let mut side = !self.hide_side;
+            toggle(ui, &mut self.complement, "⇄", "Strand");
+            toggle(ui, &mut enzymes, "✂", "Enzymes");
+            toggle(ui, &mut self.translations, "Ⓣ", "Translations and ORFs");
+            toggle(ui, &mut rulers, "📏", "Rulers");
+            toggle(ui, &mut self.spacing, "↕", "Vertical Spacing");
+            toggle(ui, &mut side, "◫", "Show/Hide Side Panels");
+            (self.hide_enzymes, self.hide_rulers, self.hide_side) = (!enzymes, !rulers, !side);
             ui.separator();
-            if ui.button("+").on_hover_text("Zoom in").clicked() { self.zoom = (self.zoom * 1.25).min(8.0); }
-            if ui.button("−").on_hover_text("Zoom out").clicked() { self.zoom = (self.zoom / 1.25).max(0.25); }
-            if ui.button("⤢").on_hover_text("Fit to view").clicked() { self.zoom = 1.0; }
+            for (icon, tip) in [("▤", "Open Agarose Gel"), ("★", "Auto-annotate this sequence"), ("📚", "Open Feature Library"),
+                ("📁", "Vector Catalog"), ("ELN", "Send document to selected SciNote sub-folder")] {
+                ui.add_enabled(false, egui::Button::new(icon)).on_disabled_hover_text(format!("{tip} (not implemented yet)"));
+            }
+            ui.separator();
+            if ui.button("▦").on_hover_text("Compact EditSeq Layout").clicked() { self.layout(View::Sequence, false, true, true); }
+            if ui.button("☰").on_hover_text("Full Sequence Layout").clicked() { self.layout(View::Sequence, true, true, false); }
+            ui.add_enabled(false, egui::Button::new("⚟")).on_disabled_hover_text("Primer Design Layout (not implemented yet)");
+            if ui.button("↺").on_hover_text("Default Layout").clicked() {
+                let circular = self.doc.as_ref().is_some_and(|d| d.circular);
+                self.layout(if circular { View::Circular } else { View::Linear }, false, false, false);
+            }
+            ui.separator();
+            ui.add(egui::Button::selectable(true, "↖")).on_hover_text("Range");
+            if ui.button("🔍+").on_hover_text("Zoom In").clicked() { self.zoom = (self.zoom * 1.25).min(8.0); }
+            if ui.button("🔍−").on_hover_text("Zoom Out").clicked() { self.zoom = (self.zoom / 1.25).max(0.25); }
         });
+    }
+
+    /// The layout buttons: which view, which strands, which panels.
+    fn layout(&mut self, view: View, complement: bool, hide_table: bool, hide_side: bool) {
+        (self.view, self.complement, self.hide_table, self.hide_side) = (view, complement, hide_table, hide_side);
     }
 
     fn info_bar(&self, ui: &mut egui::Ui) {
@@ -1192,10 +1254,18 @@ impl App {
         let avail = ui.available_width() - gutter - right_w - 16.0;
         let per_col = cw * if grouping == 0 { 1.0 } else { 1.0 + 0.6 / grouping as f32 };
         let bpr = (((avail / per_col) as usize) / 10 * 10).max(10);
-        let strands = if self.complement { 2 } else { 1 };
-        // lines per row: enzymes, strand(s), axis, feature lanes (at least one empty track, as SeqBuilder shows)
-        let tracks = 1 + strands + 1 + doc.lanes.max(1);
-        let row_h = lh * tracks as f32 + 8.0;
+        // Lines of a row, as the tool strip switches them: enzymes, 5' strand, ruler axis, 3' strand,
+        // reading frames 1-6, then feature lanes (at least one empty track, as SeqBuilder shows).
+        let mut next = 0usize;
+        let mut take = |on: bool, n: usize| on.then(|| { next += n; next - n });
+        let enz_line = take(!self.hide_enzymes, 1);
+        let top_line = take(true, 1).unwrap_or(0);
+        let axis_line = take(!self.hide_rulers, 1);
+        let bottom_line = take(self.complement, 1);
+        let frame_line = take(self.translations, 6);
+        let feat_line = take(true, doc.lanes.max(1)).unwrap_or(0);
+        let tracks = next;
+        let row_h = lh * tracks as f32 + if self.spacing { 18.0 } else { 8.0 };
         let rows = doc.seq.len().div_ceil(bpr).max(1); // an empty sequence still shows a row to type into
         let v = ui.visuals();
         let (fg, dim, sel_bg) = (v.text_color(), v.weak_text_color(), v.selection.bg_fill);
@@ -1220,7 +1290,7 @@ impl App {
 
         let mut area = egui::ScrollArea::vertical().auto_shrink(false);
         if let Some(pos) = self.scroll_to.take() { area = area.vertical_scroll_offset((pos / bpr) as f32 * row_h); }
-        let (mut sel, mut anchor, show_comp, caret) = (self.sel, self.anchor, self.complement, self.caret);
+        let (mut sel, mut anchor, caret) = (self.sel, self.anchor, self.caret);
         area.show_rows(ui, row_h, rows, |ui, range| {
             let origin = ui.cursor().min - Vec2::new(0.0, range.start as f32 * row_h);
             let base_at = |p: Pos2| -> usize {
@@ -1231,8 +1301,8 @@ impl App {
             };
             for row in range {
                 let y = origin.y + row as f32 * row_h;
-                let ys = y + lh; // top strand line
-                let ya = ys + lh * strands as f32; // axis line
+                let line_y = |l: usize| y + lh * l as f32;
+                let ys = line_y(top_line);
                 let (a, b) = (row * bpr, ((row + 1) * bpr).min(doc.seq.len()));
                 let rect = Rect::from_min_size(Pos2::new(origin.x, y), Vec2::new(ui.available_width(), row_h));
                 let resp = ui.allocate_rect(rect, Sense::click_and_drag());
@@ -1246,11 +1316,16 @@ impl App {
                 p.rect_stroke(band, 2.0, Stroke::new(1.0, frame), egui::StrokeKind::Outside);
                 // track markers
                 let mx = origin.x + cw;
-                p.text(Pos2::new(mx, ys), Align2::LEFT_TOP, "5'", font.clone(), fg);
-                for t in 1..tracks - 1 { p.text(Pos2::new(mx, ys + lh * t as f32), Align2::LEFT_TOP, "o", FontId::proportional(9.0), dim); }
+                let mark = |l: usize, t: &str, f: FontId, c: Color32| { p.text(Pos2::new(mx, line_y(l)), Align2::LEFT_TOP, t, f, c); };
+                mark(top_line, "5'", font.clone(), fg);
+                if let Some(l) = enz_line { mark(l, "o", FontId::proportional(9.0), dim); }
+                if let Some(l) = axis_line { mark(l, "o", FontId::proportional(9.0), dim); }
+                if let Some(l) = bottom_line { mark(l, "3'", font.clone(), fg); }
+                if let Some(l) = frame_line { for k in 0..6 { mark(l + k, &(k + 1).to_string(), FontId::proportional(10.0), dim); } }
+                mark(feat_line, "o", FontId::proportional(9.0), dim);
                 // enzymes above the strand
                 let mut next_free = 0.0;
-                for s in self.sites.iter().filter(|s| (a..b).contains(&s.pos)) {
+                for s in self.sites.iter().filter(|s| enz_line.is_some() && (a..b).contains(&s.pos)) {
                     let px = x(s.pos).max(next_free);
                     let r = p.text(Pos2::new(px, y + 1.0), Align2::LEFT_TOP, &self.enz[s.enz].name, FontId::proportional(10.0), fg);
                     p.line_segment([Pos2::new(x(s.pos), r.bottom()), Pos2::new(x(s.pos), ys)], Stroke::new(0.6, fg));
@@ -1262,20 +1337,31 @@ impl App {
                 }
                 for i in a..b {
                     p.text(Pos2::new(x(i), ys), Align2::LEFT_TOP, (doc.seq[i] as char).to_string(), font.clone(), fg);
-                    if show_comp { p.text(Pos2::new(x(i), ys + lh), Align2::LEFT_TOP, (complement(doc.seq[i]) as char).to_string(), font.clone(), dim); }
+                    if let Some(l) = bottom_line { p.text(Pos2::new(x(i), line_y(l)), Align2::LEFT_TOP, (complement(doc.seq[i]) as char).to_string(), font.clone(), dim); }
+                }
+                if let Some(l) = frame_line {
+                    for i in a..b {
+                        for k in 0..6 {
+                            let Some(aa) = frame_residue(&doc.seq, i, k) else { continue };
+                            let c = if aa == '*' { Color32::RED } else { fg };
+                            p.text(Pos2::new(x(i), line_y(l + k)), Align2::LEFT_TOP, aa.to_string(), font.clone(), c);
+                        }
+                    }
                 }
                 // tick axis: every base, longer every 5 and 10
-                let ay = ya + lh / 2.0;
-                if b > a { p.line_segment([Pos2::new(x(a), ay), Pos2::new(x(b - 1) + cw, ay)], Stroke::new(1.0, fg)); }
-                for i in a..b {
-                    let h = if (i + 1) % 10 == 0 { 5.0 } else if (i + 1) % 5 == 0 { 3.5 } else { 2.0 };
-                    let cx = x(i) + cw / 2.0;
-                    p.line_segment([Pos2::new(cx, ay - h), Pos2::new(cx, ay + h)], Stroke::new(0.8, fg));
+                if let Some(l) = axis_line {
+                    let ay = line_y(l) + lh / 2.0;
+                    if b > a { p.line_segment([Pos2::new(x(a), ay), Pos2::new(x(b - 1) + cw, ay)], Stroke::new(1.0, fg)); }
+                    for i in a..b {
+                        let h = if (i + 1) % 10 == 0 { 5.0 } else if (i + 1) % 5 == 0 { 3.5 } else { 2.0 };
+                        let cx = x(i) + cw / 2.0;
+                        p.line_segment([Pos2::new(cx, ay - h), Pos2::new(cx, ay + h)], Stroke::new(0.8, fg));
+                    }
                 }
                 p.text(Pos2::new(band.right() + cw * 2.0, ys + lh / 2.0), Align2::LEFT_CENTER, b.to_string(), FontId::proportional(11.0), fg);
                 for f in doc.feats.iter().filter(|f| f.show && covers(f, a, b)) {
                     let (s, e) = if f.start < f.end { (f.start.max(a), f.end.min(b)) } else if f.start < b { (f.start.max(a), b) } else { (a, f.end.min(b)) };
-                    let fy = ya + lh * (1 + f.lane) as f32 + 2.0;
+                    let fy = line_y(feat_line + f.lane) + 2.0;
                     let r = Rect::from_min_max(Pos2::new(x(s), fy), Pos2::new(x(e - 1) + cw, fy + lh - 4.0));
                     let (fill, line) = colors(f);
                     p.rect(r, 2.0, fill, Stroke::new(1.0, line), egui::StrokeKind::Inside);
@@ -1322,13 +1408,14 @@ impl eframe::App for App {
             // Debug aid: SEQBUILDER_FEATURE=n opens with that table row picked.
             if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { (self.sel_feat, self.side_top) = (Some(i), SideTop::Style); }
             if std::env::var("SEQBUILDER_NEW").is_ok() { self.new_dna(); }
+            if let Ok(t) = std::env::var("SEQBUILDER_TRACKS") { (self.complement, self.translations) = (t.contains("strand"), t.contains("frames")); }
             if let Some(c) = std::env::var("SEQBUILDER_CARET").ok().and_then(|v| v.parse().ok()) { self.caret = Some(c); }
         }
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
-        egui::Panel::left("tools").exact_size(36.0).resizable(false).show(ui, |ui| self.toolbar(ui));
-        egui::Panel::right("side").resizable(true).default_size(300.0).show(ui, |ui| self.side_panel(ui));
-        egui::Panel::bottom("table").resizable(true).default_size(240.0).show(ui, |ui| self.feature_table(ui));
+        egui::Panel::left("tools").exact_size(48.0).resizable(false).show(ui, |ui| self.toolbar(ui));
+        if !self.hide_side { egui::Panel::right("side").resizable(true).default_size(300.0).show(ui, |ui| self.side_panel(ui)); }
+        if !self.hide_table { egui::Panel::bottom("table").resizable(true).default_size(240.0).show(ui, |ui| self.feature_table(ui)); }
         egui::CentralPanel::default().show(ui, |ui| {
             self.info_bar(ui);
             ui.separator();
@@ -1623,6 +1710,16 @@ mod tests {
         empty.save(None);
         let back = sbd::read(&std::fs::read(&out2).unwrap()).unwrap();
         assert_eq!((back.feats.len(), back.feats[0].end, back.shown[&back.feats[0].id]), (1, 4, true));
+    }
+
+    #[test]
+    fn reading_frames() {
+        let seq = b"ATGAAATAG"; // M K * in frame 1
+        let f1: String = (0..seq.len()).filter_map(|i| frame_residue(seq, i, 0)).collect();
+        assert_eq!(f1, "MK*");
+        // reverse strand CTATTTCAT read from the last base: L F H
+        let r1: String = (0..seq.len()).rev().filter_map(|i| frame_residue(seq, i, 3)).collect();
+        assert_eq!(r1, "LFH");
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
