@@ -1006,7 +1006,7 @@ impl App {
                     for (i, f) in doc.feats.iter_mut().enumerate().filter(|(_, f)| f.kind == "PCR_primer") {
                         let primer = primer_sequence(f, &doc.seq);
                         ui.checkbox(&mut f.show, "");
-                        ui.label("");
+                        ui.label(if f.quals.iter().any(|q| q == "current=1") { "•" } else { "" }); // the active primer
                         ui.label(f.quals.iter().find_map(|q| q.strip_prefix("pair=")).unwrap_or("").trim_matches('"'));
                         if ui.selectable_label(self.sel_feat == Some(i), &f.label).clicked() { pick = Some(i); }
                         ui.label(if f.strand < 0 { "R" } else { "F" });
