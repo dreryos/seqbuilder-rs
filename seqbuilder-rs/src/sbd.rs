@@ -82,6 +82,7 @@ pub struct Sbd {
 }
 
 const FEATURE_OBJECT: u32 = 9; // object type of features in STYLE records
+const FXIF: &[u8] = b"CommonBlockFmt\0\0\0IgnoreXI\x01\0\0\0\x01"; // the same in every sample
 
 fn u32be(d: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_be_bytes(d.get(o..o + 4)?.try_into().ok()?))
@@ -198,10 +199,14 @@ impl Container {
     }
 
     /// Add a chunk right after the last one of its type, in the directory and in the data (as SeqBuilder does).
-    fn add_after_last(&mut self, typ: &[u8; 4], id: u32, data: Vec<u8>) -> Option<()> {
-        let obj = self.objects.iter_mut().find(|o| o.entries.iter().any(|e| e.is(typ)))?;
-        let at = obj.entries.iter().rposition(|e| e.is(typ))?;
+    /// With none of its type yet, it goes after the last chunk of the first `fallback` type present.
+    fn add_after_last(&mut self, typ: &[u8; 4], id: u32, data: Vec<u8>, fallback: &[&[u8; 4]]) -> Option<()> {
+        let anchor = std::iter::once(typ).chain(fallback.iter().copied())
+            .find(|t| self.objects.iter().any(|o| o.entries.iter().any(|e| e.is(t))))?;
+        let obj = self.objects.iter_mut().find(|o| o.entries.iter().any(|e| e.is(anchor)))?;
+        let at = obj.entries.iter().rposition(|e| e.is(anchor))?;
         let mut meta = obj.entries[at].meta;
+        meta[..4].copy_from_slice(typ);
         meta[4..8].copy_from_slice(&id.to_be_bytes());
         let rank = (obj.entries[at].rank.0, obj.entries[at].rank.1 + 1);
         obj.entries.insert(at + 1, Entry { meta, data, rank });
@@ -409,10 +414,9 @@ impl Sbd {
     pub fn add_feature(&mut self, mut f: SbdFeat) -> u32 {
         let used = self.shown.keys().copied().chain(self.container.ids(b"UVFT"));
         f.id = used.max().map_or(0, |m| m + 1);
-        self.container.add_after_last(b"UVFT", f.id, f.encode());
-        let fx = self.container.ids(b"FXIF");
-        let template = fx.last().and_then(|&i| self.container.chunk_id_mut(b"FXIF", Some(i)).map(|d| d.clone()));
-        if let (Some(&last), Some(data)) = (fx.last(), template) { self.container.add_after_last(b"FXIF", last + 1, data); }
+        self.container.add_after_last(b"UVFT", f.id, f.encode(), &[b"UVSI"]);
+        let next = self.container.ids(b"FXIF").last().map_or(1, |l| l + 1);
+        self.container.add_after_last(b"FXIF", next, FXIF.to_vec(), &[b"UVFT"]);
         if let Some(tl) = self.container.chunk_mut(b"UVTL") { edit_feature_state(tl, |rows| rows.push((f.id, true))); }
         self.shown.insert(f.id, true);
         let id = f.id;
@@ -528,9 +532,8 @@ pub fn new_document(template: &[u8], name: &str, header: &str, seq: Vec<u8>, cir
         edit_all(cb, "SeqName", |_| v.clone());
     }
     let feats: Vec<SbdFeat> = feats.into_iter().enumerate().map(|(i, f)| SbdFeat { id: i as u32, ..f }).collect();
-    let fxif = s.container.chunks().find(|c| &c.0 == b"FXIF").map(|c| c.2.to_vec()).ok_or("template has no FXIF")?;
     s.container.replace_all(b"UVFT", feats.iter().map(|f| (f.id, f.encode())).collect()).ok_or("template has no features")?;
-    s.container.replace_all(b"FXIF", (1..=feats.len() as u32).map(|i| (i, fxif.clone())).collect());
+    s.container.replace_all(b"FXIF", (1..=feats.len() as u32).map(|i| (i, FXIF.to_vec())).collect());
     // SeqBuilder lists source features hidden
     s.shown = feats.iter().map(|f| (f.id, f.kind != "source")).collect();
     let rows: Vec<(u32, bool)> = feats.iter().map(|f| (f.id, s.shown[&f.id])).collect();

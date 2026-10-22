@@ -449,6 +449,18 @@ impl App {
         }
     }
 
+    /// File ▸ New DNA (⌘N): an empty, untitled linear sequence ready for typing.
+    fn new_dna(&mut self) {
+        self.doc = Some(Doc {
+            name: "Untitled".into(), definition: String::new(), accession: String::new(), comment: String::new(),
+            seq: vec![], circular: false, feats: vec![], lanes: 0, hits: vec![], path: "Untitled".into(),
+            sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false,
+        });
+        (self.view, self.sel, self.sel_feat, self.caret, self.error) = (View::Sequence, None, None, Some(0), None);
+        (self.undo, self.redo) = (vec![], vec![]);
+        self.compute_hits();
+    }
+
     /// Sequence ▸ Linear / Circular.
     fn set_circular(&mut self, circular: bool) {
         let Some(d) = &mut self.doc else { return };
@@ -599,6 +611,7 @@ impl App {
     fn menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
+                if ui.button("New DNA  ⌘N").clicked() { self.new_dna(); }
                 if ui.button("Open…  ⌘O").clicked() {
                     if let Some(p) = rfd::FileDialog::new().add_filter("Sequence", &["sbd", "gb", "gbk", "genbank", "fasta", "fa", "fas", "seq"]).pick_file() {
                         self.open(&p);
@@ -654,6 +667,7 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) { self.save(None); }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) { self.new_feature(); }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) { self.new_dna(); }
         if !ctx.egui_wants_keyboard_input() {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)) { self.undo_redo(true); }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) { self.undo_redo(false); }
@@ -1024,7 +1038,7 @@ impl App {
         // lines per row: enzymes, strand(s), axis, feature lanes (at least one empty track, as SeqBuilder shows)
         let tracks = 1 + strands + 1 + doc.lanes.max(1);
         let row_h = lh * tracks as f32 + 8.0;
-        let rows = doc.seq.len().div_ceil(bpr);
+        let rows = doc.seq.len().div_ceil(bpr).max(1); // an empty sequence still shows a row to type into
         let v = ui.visuals();
         let (fg, dim, sel_bg) = (v.text_color(), v.weak_text_color(), v.selection.bg_fill);
         let frame = v.widgets.noninteractive.bg_stroke.color;
@@ -1085,7 +1099,7 @@ impl App {
                     next_free = r.right() + 6.0;
                 }
                 if let Some(c) = caret.filter(|&c| (a..b).contains(&c) || (c == b && b == doc.seq.len())) {
-                    let cx = if c < b { x(c) } else { x(b - 1) + cw } - 1.0;
+                    let cx = if c < b || b == a { x(c) } else { x(b - 1) + cw } - 1.0;
                     p.line_segment([Pos2::new(cx, ys - 1.0), Pos2::new(cx, ys + lh)], Stroke::new(2.0, fg));
                 }
                 for i in a..b {
@@ -1094,7 +1108,7 @@ impl App {
                 }
                 // tick axis: every base, longer every 5 and 10
                 let ay = ya + lh / 2.0;
-                p.line_segment([Pos2::new(x(a), ay), Pos2::new(x(b - 1) + cw, ay)], Stroke::new(1.0, fg));
+                if b > a { p.line_segment([Pos2::new(x(a), ay), Pos2::new(x(b - 1) + cw, ay)], Stroke::new(1.0, fg)); }
                 for i in a..b {
                     let h = if (i + 1) % 10 == 0 { 5.0 } else if (i + 1) % 5 == 0 { 3.5 } else { 2.0 };
                     let cx = x(i) + cw / 2.0;
@@ -1149,6 +1163,7 @@ impl eframe::App for App {
             }
             // Debug aid: SEQBUILDER_FEATURE=n opens with that table row picked.
             if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { self.sel_feat = Some(i); }
+            if std::env::var("SEQBUILDER_NEW").is_ok() { self.new_dna(); }
             if let Some(c) = std::env::var("SEQBUILDER_CARET").ok().and_then(|v| v.parse().ok()) { self.caret = Some(c); }
         }
 
@@ -1421,6 +1436,35 @@ mod tests {
         let back = gb_io::reader::parse_slice(out.as_bytes()).unwrap().remove(0);
         assert_eq!((back.seq.len(), back.features.len(), back.is_circular()), (114842, 2, false));
         assert_eq!(back.features[1].location.to_gb_format(), "complement(5087..5124)");
+    }
+
+    /// New DNA, typed bases and a feature saved as .sbd; then a first feature added to a document with none.
+    #[test]
+    fn new_dna_saves_as_sbd() {
+        let mut app = App::default();
+        app.new_dna();
+        let caret = app.caret.unwrap();
+        app.edit_seq(caret, caret, b"atgaaacccgggtttTAA");
+        app.sel = Some((3, 12));
+        app.new_feature();
+        let out = std::env::temp_dir().join("seqbuilder-rs-new.sbd");
+        app.save(Some(out.clone()));
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let back = sbd::read(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!((back.seq.as_slice(), back.circular, back.feats.len()), (&b"atgaaacccgggtttTAA"[..], false, 1));
+        assert_eq!((back.feats[0].start, back.feats[0].end, back.header_field("LOCUS", " ")), (4, 12, String::new()));
+
+        let mut empty = App::default();
+        empty.new_dna();
+        empty.edit_seq(0, 0, b"acgtacgt");
+        let out2 = std::env::temp_dir().join("seqbuilder-rs-new-empty.sbd");
+        empty.save(Some(out2.clone()));
+        empty.open(&out2);
+        empty.sel = Some((0, 4));
+        empty.new_feature();
+        empty.save(None);
+        let back = sbd::read(&std::fs::read(&out2).unwrap()).unwrap();
+        assert_eq!((back.feats.len(), back.feats[0].end, back.shown[&back.feats[0].id]), (1, 4, true));
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
