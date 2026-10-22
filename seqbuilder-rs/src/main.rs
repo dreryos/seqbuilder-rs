@@ -358,6 +358,16 @@ fn primer_tm(p: &[u8]) -> f64 {
     dh * 1000.0 / (ds + 1.987 * (ct / 2.0).ln()) - 273.15
 }
 
+/// Fragment lengths a digest at `sites` leaves (Site Summary ▸ Show Fragment Size).
+fn fragments(sites: &[usize], len: usize, circular: bool) -> Vec<usize> {
+    let mut cuts = sites.to_vec();
+    cuts.sort();
+    if cuts.is_empty() { return vec![len]; }
+    let mut out: Vec<usize> = cuts.windows(2).map(|w| w[1] - w[0]).collect();
+    if circular { out.push(len - cuts[cuts.len() - 1] + cuts[0]); } else { out.insert(0, cuts[0]); out.push(len - cuts[cuts.len() - 1]); }
+    out
+}
+
 /// Standard genetic code, TCAG order.
 const CODONS: &[u8; 64] = b"FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG";
 
@@ -439,7 +449,7 @@ fn todo_tab(ui: &mut egui::Ui, label: &str) {
 enum View { #[default] Circular, Linear, Sequence }
 
 #[derive(Default, PartialEq, Clone, Copy)]
-enum Tab { #[default] Features, Primers, Comment, Minimap, SiteSummary }
+enum Tab { #[default] Features, Primers, Comment, Minimap, SiteSummary, History }
 
 #[derive(Default, PartialEq, Clone, Copy)]
 enum SideTop { Style, #[default] Enzymes }
@@ -479,8 +489,12 @@ struct App {
     goto_text: String,
     scroll_to: Option<usize>,
     caret: Option<usize>,                // insertion point in the Sequence view (before this base)
-    undo: Vec<(Vec<u8>, Vec<Feat>)>,
-    redo: Vec<(Vec<u8>, Vec<Feat>)>,
+    undo: Vec<(String, Vec<u8>, Vec<Feat>)>, // (what was done, sequence and features before it)
+    redo: Vec<(String, Vec<u8>, Vec<Feat>)>,
+    map_title: Option<String>, // Settings ▸ Circular Map ▸ Title (None = off; empty = document name)
+    hide_map_length: bool,
+    primer_options: [bool; 5], // Settings ▸ Primer Design: priming sites, alternate pairs, dimer, pair dimer, hairpin
+    fragment_size: bool,       // Settings ▸ Site Summary ▸ Show Fragment Size
     frames: u32,
 }
 
@@ -565,7 +579,12 @@ impl App {
     /// shift, coordinates inside a deleted stretch clamp to its start, features left empty are deleted.
     fn edit_seq(&mut self, a: usize, b: usize, ins: &[u8]) {
         let Some(d) = &mut self.doc else { return };
-        self.undo.push((d.seq.clone(), d.feats.clone()));
+        let what = match (b - a, ins.len()) {
+            (0, n) => format!("Insert {n} bases at {}", a + 1),
+            (n, 0) => format!("Delete {}..{b} ({n} bases)", a + 1),
+            (n, m) => format!("Replace {}..{b} ({n} bases) with {m}", a + 1),
+        };
+        self.undo.push((what, d.seq.clone(), d.feats.clone()));
         self.redo.clear();
         let (cut, add) = (b - a, ins.len());
         d.seq.splice(a..b, ins.iter().copied());
@@ -589,8 +608,8 @@ impl App {
     fn undo_redo(&mut self, redo: bool) {
         let Some(d) = &mut self.doc else { return };
         let (from, to) = if redo { (&mut self.redo, &mut self.undo) } else { (&mut self.undo, &mut self.redo) };
-        let Some((seq, feats)) = from.pop() else { return };
-        to.push((std::mem::replace(&mut d.seq, seq), std::mem::replace(&mut d.feats, feats)));
+        let Some((what, seq, feats)) = from.pop() else { return };
+        to.push((what, std::mem::replace(&mut d.seq, seq), std::mem::replace(&mut d.feats, feats)));
         // Rewrite everything on the next save; ids of features that came back must not be deleted.
         d.feats.iter_mut().for_each(|f| f.dirty = true);
         d.deleted.retain(|id| !d.feats.iter().any(|f| f.sbd_id == Some(*id)));
@@ -828,11 +847,6 @@ impl App {
                 if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Edit Feature…")).clicked() { self.edit_open = true; }
                 if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Delete Feature")).clicked() { self.delete_feature(); }
             });
-            ui.menu_button("Sequence", |ui| {
-                let circular = self.doc.as_ref().map(|d| d.circular);
-                if ui.add_enabled(circular.is_some(), egui::Button::selectable(circular == Some(false), "Linear")).clicked() { self.set_circular(false); }
-                if ui.add_enabled(circular.is_some(), egui::Button::selectable(circular == Some(true), "Circular")).clicked() { self.set_circular(true); }
-            });
             ui.menu_button("Enzymes", |ui| {
                 if ui.button("Selector Manager…").clicked() { self.selmgr = self.sels.first().map(|s| s.id); }
                 ui.menu_button("Apply Selector", |ui| {
@@ -841,11 +855,19 @@ impl App {
                     }
                 });
             });
+            ui.menu_button("Sequence", |ui| {
+                let circular = self.doc.as_ref().map(|d| d.circular);
+                if ui.add_enabled(circular.is_some(), egui::Button::selectable(circular == Some(false), "Linear")).clicked() { self.set_circular(false); }
+                if ui.add_enabled(circular.is_some(), egui::Button::selectable(circular == Some(true), "Circular")).clicked() { self.set_circular(true); }
+            });
             ui.menu_button("Format", |ui| {
                 ui.label("Residue Grouping");
                 ui.radio_value(&mut self.grouping, 0, "None");
                 ui.radio_value(&mut self.grouping, 3, "Group by 3");
                 ui.radio_value(&mut self.grouping, 10, "Group by 10");
+            });
+            ui.menu_button("View", |ui| {
+                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Clear History")).clicked() { (self.undo, self.redo) = (vec![], vec![]); }
             });
         });
     }
@@ -940,12 +962,13 @@ impl App {
                 ui.selectable_value(&mut self.tab, Tab::Comment, "Comment");
                 ui.selectable_value(&mut self.tab, Tab::Minimap, "Minimap");
                 ui.selectable_value(&mut self.tab, Tab::SiteSummary, "Site Summary");
-                todo_tab(ui, "History");
+                ui.selectable_value(&mut self.tab, Tab::History, "History");
             });
         });
         let Some(doc) = &mut self.doc else { return };
         let mut pick = None;
         let mut jump = None;
+        let mut back_to = None;
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| match self.tab {
             Tab::Features => {
                 let mut toggled = false;
@@ -968,6 +991,13 @@ impl App {
                 if toggled { doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len()); }
             }
             Tab::Comment => { ui.label(if doc.comment.is_empty() { "No comment." } else { &doc.comment }); }
+            Tab::History => {
+                // Sequence edits, oldest first; clicking one goes back to just before it.
+                if self.undo.is_empty() { ui.label("No history."); }
+                for (k, (what, _, _)) in self.undo.iter().enumerate() {
+                    if ui.selectable_label(false, format!("{}. {what}", k + 1)).on_hover_text("Undo back to before this edit").clicked() { back_to = Some(k); }
+                }
+            }
             Tab::Primers => {
                 // SeqBuilder lists PCR_primer features; Score, dTm and Ta OP need its primer design, not made yet.
                 egui::Grid::new("primers").striped(true).num_columns(11).spacing([14.0, 4.0]).show(ui, |ui| {
@@ -1031,6 +1061,7 @@ impl App {
             Tab::SiteSummary => {
                 egui::Grid::new("sites").striped(true).num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
                     for h in ["Enzyme", "Sites", "Positions", "Recognition"] { ui.strong(h); }
+                    if self.fragment_size { ui.strong("Fragments"); }
                     ui.end_row();
                     let mut shown: Vec<usize> = self.shown.iter().copied().collect();
                     shown.sort_by(|&a, &b| self.enz[a].name.cmp(&self.enz[b].name));
@@ -1040,6 +1071,9 @@ impl App {
                         ui.label(hits.len().to_string());
                         ui.label(hits.iter().take(8).map(|p| (p + 1).to_string()).collect::<Vec<_>>().join(", "));
                         ui.monospace(&self.enz[i].rs);
+                        if self.fragment_size {
+                            ui.label(fragments(hits, doc.seq.len(), doc.circular).iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", "));
+                        }
                         ui.end_row();
                     }
                 });
@@ -1057,6 +1091,7 @@ impl App {
             self.sel_feat = Some(i);
             self.side_top = SideTop::Style;
         }
+        if let Some(k) = back_to { while self.undo.len() > k { self.undo_redo(false); } }
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
@@ -1068,11 +1103,41 @@ impl App {
             ui.separator();
             match self.side_bottom {
                 SideBottom::Settings => {
-                    ui.checkbox(&mut self.complement, "Show complementary strand");
-                    ui.label("Residue grouping");
-                    ui.radio_value(&mut self.grouping, 0, "None");
-                    ui.radio_value(&mut self.grouping, 3, "Group by 3");
-                    ui.radio_value(&mut self.grouping, 10, "Group by 10");
+                    // Laid out as SeqBuilder's Settings tab.
+                    let circular = self.doc.as_ref().is_some_and(|d| d.circular);
+                    ui.add_enabled_ui(circular, |ui| {
+                        ui.small("Circular Map");
+                        ui.horizontal(|ui| {
+                            let mut on = self.map_title.is_some();
+                            if ui.checkbox(&mut on, "Title:").changed() { self.map_title = on.then(String::new); }
+                            let mut text = self.map_title.clone().unwrap_or_default();
+                            let hint = self.doc.as_ref().map_or(String::new(), |d| d.name.clone());
+                            if ui.add_enabled(on, egui::TextEdit::singleline(&mut text).hint_text(hint)).changed() { self.map_title = Some(text); }
+                        });
+                        let mut length = !self.hide_map_length;
+                        ui.checkbox(&mut length, format!("Length: {}", self.doc.as_ref().map_or(String::new(), |d| size_label(d.seq.len()))));
+                        self.hide_map_length = !length;
+                    });
+                    ui.add_space(6.0);
+                    ui.small("Primer Design");
+                    let [sites, pairs, dimer, pair_dimer, hairpin] = &mut self.primer_options;
+                    ui.checkbox(sites, "Priming Sites");
+                    ui.checkbox(pairs, "Alternate Pairs");
+                    ui.label("Most Stable:");
+                    ui.horizontal(|ui| { ui.checkbox(dimer, "Dimer"); ui.checkbox(pair_dimer, "Pair Dimer"); });
+                    ui.checkbox(hairpin, "Hairpin");
+                    ui.add_space(6.0);
+                    ui.small("Site Summary");
+                    ui.checkbox(&mut self.fragment_size, "Show Fragment Size");
+                    ui.add_space(6.0);
+                    ui.small("Translations");
+                    ui.add_enabled_ui(false, |ui| {
+                        egui::Grid::new("translations").striped(true).num_columns(4).show(ui, |ui| {
+                            for h in ["", "✓", "Name", "Start   Skip 0"] { ui.label(h); }
+                            ui.end_row();
+                            for k in 1..=4 { ui.label(k.to_string()); ui.label(""); ui.label(""); ui.label(""); ui.end_row(); }
+                        });
+                    }).response.on_disabled_hover_text("Special translation rulers are not implemented yet");
                 }
                 SideBottom::Details if self.sel_feat.is_some() && self.doc.is_some() => self.feature_details(ui),
                 SideBottom::Details => match &self.doc {
@@ -1347,8 +1412,13 @@ impl App {
             p.galley(lrect.min, galley, fg);
         }
 
-        p.text(c - Vec2::new(0.0, 4.0), Align2::CENTER_BOTTOM, &doc.name, FontId::proportional(15.0), fg);
-        p.text(c + Vec2::new(0.0, 4.0), Align2::CENTER_TOP, format!("{} bp", doc.seq.len()), FontId::proportional(13.0), fg);
+        if let Some(t) = &self.map_title {
+            let title = if t.is_empty() { &doc.name } else { t };
+            p.text(c - Vec2::new(0.0, 4.0), Align2::CENTER_BOTTOM, title, FontId::proportional(15.0), fg);
+        }
+        if !self.hide_map_length {
+            p.text(c + Vec2::new(0.0, 4.0), Align2::CENTER_TOP, format!("{} bp", doc.seq.len()), FontId::proportional(13.0), fg);
+        }
     }
 
     fn linear_map(&self, p: &egui::Painter, rect: Rect, ui: &egui::Ui, doc: &Doc) {
@@ -1563,7 +1633,8 @@ impl eframe::App for App {
             if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { (self.sel_feat, self.side_top) = (Some(i), SideTop::Style); }
             if std::env::var("SEQBUILDER_NEW").is_ok() { self.new_dna(); }
             if let Ok(t) = std::env::var("SEQBUILDER_TAB") {
-                self.tab = match t.as_str() { "minimap" => Tab::Minimap, "primers" => Tab::Primers, "comment" => Tab::Comment, "sites" => Tab::SiteSummary, _ => Tab::Features };
+                if t == "settings" { self.side_bottom = SideBottom::Settings; }
+                self.tab = match t.as_str() { "minimap" => Tab::Minimap, "primers" => Tab::Primers, "history" => Tab::History, "comment" => Tab::Comment, "sites" => Tab::SiteSummary, _ => Tab::Features };
             }
             if let Ok(t) = std::env::var("SEQBUILDER_TRACKS") { (self.complement, self.translations) = (t.contains("strand"), t.contains("frames")); }
             if let Some(c) = std::env::var("SEQBUILDER_CARET").ok().and_then(|v| v.parse().ok()) { self.caret = Some(c); }
@@ -1631,7 +1702,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     }
-    let mut app = App { zoom: 1.0, ..Default::default() };
+    let mut app = App { zoom: 1.0, map_title: Some(String::new()), primer_options: [true; 5], ..Default::default() };
     let dir = std::env::var("SEQBUILDER_ENZYMES").map(PathBuf::from).unwrap_or_else(|_| DNASTAR_DIR.into());
     // User-edited selectors live where DataManager's DMConfig.cfg points; fall back to the shipped file.
     let home = std::env::var("HOME").unwrap_or_default();
@@ -1906,6 +1977,13 @@ mod tests {
         assert_eq!(format!("{:.1}", primer_tm(&p)), "77.7"); // SeqBuilder's Primers tab
         let r = primer_sequence(&d.feats[1], &d.seq);
         assert_eq!((r.len(), format!("{:.1}", primer_tm(&r))), (38, "77.7".to_string()));
+    }
+
+    #[test]
+    fn digest_fragments() {
+        assert_eq!(fragments(&[10, 40], 100, true), vec![30, 70]);
+        assert_eq!(fragments(&[40, 10], 100, false), vec![10, 30, 60]);
+        assert_eq!(fragments(&[], 100, true), vec![100]);
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
