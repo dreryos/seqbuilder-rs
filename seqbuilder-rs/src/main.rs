@@ -2,6 +2,7 @@
 // feature table with tabs, Style/Enzymes and Settings/Details side panels.
 mod enzymes;
 mod genbank;
+mod primers;
 mod sbd;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
@@ -336,36 +337,6 @@ fn primer_sequence(f: &Feat, seq: &[u8]) -> Vec<u8> {
     if f.strand < 0 { s.iter().rev().map(|&b| complement(b)).collect() } else { s.to_vec() }
 }
 
-/// SantaLucia (1998) unified nearest-neighbour sums (ΔH kcal/mol, ΔS cal/K·mol) of a primer, without
-/// initiation terms, as SeqBuilder uses them; None for non-ACGT bases.
-fn nn_sums(p: &[u8]) -> Option<(f64, f64, usize)> {
-    let up: Vec<u8> = p.iter().map(|b| b.to_ascii_uppercase()).collect();
-    if up.len() < 2 || up.iter().any(|b| !b"ACGT".contains(b)) { return None; }
-    let nn = |d: &[u8]| -> (f64, f64) {
-        match d {
-            b"AA" | b"TT" => (-7.9, -22.2), b"AT" => (-7.2, -20.4), b"TA" => (-7.2, -21.3),
-            b"CA" | b"TG" => (-8.5, -22.7), b"GT" | b"AC" => (-8.4, -22.4), b"CT" | b"AG" => (-7.8, -21.0),
-            b"GA" | b"TC" => (-8.2, -22.2), b"CG" => (-10.6, -27.2), b"GC" => (-9.8, -24.4), _ => (-8.0, -19.9), // GG, CC
-        }
-    };
-    let (dh, ds) = up.windows(2).map(nn).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
-    Some((dh, ds, up.len()))
-}
-
-/// Primer Tm as SeqBuilder shows it: SantaLucia NN, salt 0.368·(N−1)·ln[Na+] with Create Primer Pairs'
-/// 50 mM, primer 250 nM taken as Ct/2. Matches SeqBuilder to 0.1 °C on seven primers of 16-38 bases.
-fn primer_tm(p: &[u8]) -> f64 {
-    let Some((dh, ds, n)) = nn_sums(p) else { return f64::NAN };
-    let (na, ct) = (0.05f64, 250e-9f64);
-    dh * 1000.0 / (ds + 0.368 * (n - 1) as f64 * na.ln() + 1.987 * (ct / 2.0).ln()) - 273.15
-}
-
-// ponytail: the +0.27 kcal/mol is fitted to SeqBuilder's dG column (exact on six primers), its source is unknown.
-/// Primer duplex ΔG at 25 °C in kcal/mol, SeqBuilder's dG column.
-fn primer_dg(p: &[u8]) -> f64 {
-    nn_sums(p).map_or(f64::NAN, |(dh, ds, _)| dh - 298.15 * ds / 1000.0 + 0.27)
-}
-
 /// Fragment lengths a digest at `sites` leaves (Site Summary ▸ Show Fragment Size).
 fn fragments(sites: &[usize], len: usize, circular: bool) -> Vec<usize> {
     let mut cuts = sites.to_vec();
@@ -448,13 +419,9 @@ fn tick_step(len: f32) -> usize {
     [100, 250, 500, 1000, 2000, 5000, 10000].into_iter().find(|s| len / *s as f32 <= 12.0).unwrap_or(50000)
 }
 
-/// Tabs that SeqBuilder Pro has but this app does not implement yet: shown greyed out to keep the layout.
-fn todo_tab(ui: &mut egui::Ui, label: &str) {
-    ui.add_enabled(false, egui::Button::new(label).frame(false)).on_disabled_hover_text("Not implemented yet");
-}
 
 #[derive(Default, PartialEq, Clone, Copy)]
-enum View { #[default] Circular, Linear, Sequence }
+enum View { #[default] Circular, Linear, Sequence, PrimerDesign }
 
 #[derive(Default, PartialEq, Clone, Copy)]
 enum Tab { #[default] Features, Primers, Comment, Minimap, SiteSummary, History }
@@ -931,7 +898,7 @@ impl App {
             ui.separator();
             if ui.button("▦").on_hover_text("Compact EditSeq Layout").clicked() { self.layout(View::Sequence, false, true, true); }
             if ui.button("☰").on_hover_text("Full Sequence Layout").clicked() { self.layout(View::Sequence, true, true, false); }
-            ui.add_enabled(false, egui::Button::new("⚟")).on_disabled_hover_text("Primer Design Layout (not implemented yet)");
+            if ui.button("⚟").on_hover_text("Primer Design Layout").clicked() { self.layout(View::PrimerDesign, false, false, false); self.tab = Tab::Primers; }
             if ui.button("↺").on_hover_text("Default Layout").clicked() {
                 let circular = self.doc.as_ref().is_some_and(|d| d.circular);
                 self.layout(if circular { View::Circular } else { View::Linear }, false, false, false);
@@ -1021,11 +988,11 @@ impl App {
                         ui.monospace(String::from_utf8_lossy(&primer).to_uppercase());
                         ui.label("");
                         ui.label(primer.len().to_string());
-                        let tm = format!("{:.1}", primer_tm(&primer));
+                        let tm = format!("{:.1}", primers::tm(&primer));
                         ui.label(&tm);
                         ui.label(&tm); // dTm: the primer's Tm on its template, the same for a perfect match
                         ui.label("");
-                        ui.label(format!("{:.1}", primer_dg(&primer)));
+                        ui.label(format!("{:.1}", primers::dg(&primer)));
                         ui.end_row();
                     }
                 });
@@ -1474,6 +1441,138 @@ impl App {
         }
     }
 
+    /// SeqBuilder's working pair: the forward and the reverse PCR_primer marked /current=1, if any.
+    fn working_pair(&self) -> (Option<usize>, Option<usize>) {
+        let Some(d) = &self.doc else { return (None, None) };
+        let pick = |rev: bool| (0..d.feats.len()).find(|&i| {
+            let f = &d.feats[i];
+            f.kind == "PCR_primer" && (f.strand < 0) == rev && f.quals.iter().any(|q| q == "current=1")
+        });
+        (pick(false), pick(true))
+    }
+
+    /// The Primer Design view: working pair, binding sites, dimers, hairpin and the pair table.
+    fn primer_design(&mut self, ui: &mut egui::Ui) {
+        let (fwd, rev) = self.working_pair();
+        let Some(d) = &self.doc else { return };
+        let primer = |i: Option<usize>| i.map(|i| primer_sequence(&d.feats[i], &d.seq).to_ascii_uppercase());
+        let (pf, pr) = (primer(fwd), primer(rev));
+        let describe = |p: &Option<Vec<u8>>| p.as_ref().map_or("None".to_string(), |p| format!("Length={} bp, Tm={:.1}°C", p.len(), primers::tm(p)));
+        let v = ui.visuals();
+        let (fg, red, green) = (v.text_color(), Color32::from_rgb(220, 30, 30), Color32::from_rgb(40, 170, 60));
+        ui.label(format!("Working Pair    Forward: {},    Reverse: {}", describe(&pf), describe(&pr)));
+        ui.separator();
+
+        // Primer binding sites along the whole sequence: forward above the axis, reverse below.
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 70.0), Sense::hover());
+        let p = ui.painter_at(rect);
+        let (x0, x1) = (rect.left() + 70.0, rect.right() - 10.0);
+        let len = d.seq.len().max(1);
+        let x = |pos: usize| x0 + pos as f32 / len as f32 * (x1 - x0);
+        let ay = rect.center().y;
+        p.text(Pos2::new(rect.left(), ay), Align2::LEFT_CENTER, "Primer\nBinding\nSites", FontId::proportional(10.0), fg);
+        p.line_segment([Pos2::new(x0, ay), Pos2::new(x1, ay)], Stroke::new(1.0, fg));
+        let step = tick_step(len as f32);
+        for pos in (step..len).step_by(step) {
+            p.line_segment([Pos2::new(x(pos), ay - 3.0), Pos2::new(x(pos), ay + 3.0)], Stroke::new(1.0, fg));
+            p.text(Pos2::new(x(pos), ay + 4.0), Align2::CENTER_TOP, pos.to_string(), FontId::proportional(9.0), fg);
+        }
+        // each working primer's sites on the top strand above the axis, on the bottom strand below
+        for ps in [&pf, &pr].into_iter().flatten() {
+            for (reverse, y0, y1) in [(false, ay - 22.0, ay - 6.0), (true, ay + 18.0, ay + 34.0)] {
+                for pos in primers::binding_sites(&d.seq, ps, reverse) {
+                    p.line_segment([Pos2::new(x(pos), y0), Pos2::new(x(pos), y1)], Stroke::new(1.0, red));
+                }
+            }
+        }
+        ui.separator();
+
+        // Most stable dimer, pair dimer and hairpin, side by side.
+        // A dimer as SeqBuilder draws it: the overlap in full, each strand's overhang cut to "CC . " / " . CC".
+        let dimer_text = |a: &[u8], b: &[u8], dm: &primers::Dimer| -> String {
+            let text = |s: &[u8]| String::from_utf8_lossy(s).into_owned();
+            let left = |s: &[u8]| if s.len() > 4 { format!("{} . ", text(&s[..2])) } else { text(s) };
+            let right = |s: &[u8]| if s.len() > 4 { format!(" . {}", text(&s[s.len() - 2..])) } else { text(s) };
+            let brev: Vec<u8> = b.iter().rev().copied().collect(); // b 3'→5'; brev[k] sits under a[offset + k]
+            let (na, nb) = (a.len() as isize, b.len() as isize);
+            let (o0, o1) = (dm.offset.max(0), (dm.offset + nb - 1).min(na - 1));
+            let (k0, k1) = ((o0 - dm.offset) as usize, (o1 - dm.offset) as usize);
+            let (o0, o1) = (o0 as usize, o1 as usize);
+            let (tl, bl) = (left(&a[..o0]), left(&brev[..k0]));
+            let w = tl.len().max(bl.len());
+            let marks: String = dm.pairs[o0..=o1].iter().map(|&m| if m { '|' } else { ' ' }).collect();
+            format!("5' {tl:>w$}{}{} 3'\n   {:w$}{marks}\n3' {bl:>w$}{}{} 5'",
+                text(&a[o0..=o1]), right(&a[o1 + 1..]), "", text(&brev[k0..=k1]), right(&brev[k1 + 1..]))
+        };
+        let mono = |ui: &mut egui::Ui, t: String| { ui.add(egui::Label::new(egui::RichText::new(t).monospace()).wrap_mode(egui::TextWrapMode::Extend)); };
+        ui.columns(3, |c| {
+            let active = pr.as_ref().or(pf.as_ref());
+            match active.and_then(|a| primers::dimer(a, a).map(|dm| (a, dm))) {
+                Some((a, dm)) => {
+                    let bad = if dm.dg <= -3.0 { " (BAD!)" } else { "" };
+                    c[0].label(format!("Most stable dimer {} bp, {:.1} kc/m{bad}", dm.len, dm.dg));
+                    mono(&mut c[0], dimer_text(a, a, &dm));
+                }
+                None => { c[0].label("No dimers"); }
+            }
+            match (&pf, &pr) {
+                (Some(a), Some(b)) => match primers::dimer(a, b).filter(|dm| dm.len > 2) {
+                    Some(dm) => { c[1].label(format!("Most stable pair dimer {} bp, {:.1} kc/m", dm.len, dm.dg)); mono(&mut c[1], dimer_text(a, b, &dm)); }
+                    None => { c[1].label("No pair dimers > 2 bp"); }
+                },
+                _ => { c[1].label("No pair dimers > 2 bp"); }
+            }
+            match active.and_then(|a| primers::hairpin(a).map(|h| (a, h))) {
+                Some((a, h)) => {
+                    c[2].label(format!("Hairpin {} bp, {:.1} kc/m (estimate)", h.stem, h.dg));
+                    let stem: String = (0..a.len()).map(|i| if (h.start..h.start + h.stem).contains(&i) || (h.end + 1 - h.stem..=h.end).contains(&i) { '|' } else { ' ' }).collect();
+                    mono(&mut c[2], format!("5' {} 3'\n   {stem}", String::from_utf8_lossy(a)));
+                }
+                None => { c[2].label("No hairpins"); }
+            }
+        });
+        ui.separator();
+
+        // The pair along the sequence and its table.
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+        let p = ui.painter_at(rect);
+        let my = rect.center().y;
+        let (x0, x1) = (rect.left() + 10.0, rect.left() + rect.width() * 0.75);
+        let x = |pos: usize| x0 + pos as f32 / len as f32 * (x1 - x0);
+        p.line_segment([Pos2::new(x0, my), Pos2::new(x1, my)], Stroke::new(1.0, fg));
+        for (i, colour) in [(fwd, green), (rev, red)] {
+            if let Some(i) = i { p.rect_filled(Rect::from_center_size(Pos2::new(x(d.feats[i].start), my), Vec2::new(6.0, 12.0)), 3.0, colour); }
+        }
+        // ponytail: Prod Tm (Davis, Botstein & Roth) and Ta OPT (Rychlik) follow SeqBuilder's labels but are not
+        // checked against SeqBuilder numbers yet; Score and Prod dTm are left empty.
+        egui::Grid::new("pair").striped(true).num_columns(7).show(ui, |ui| {
+            for h in ["Pair Name", "Score", "Prod Tm", "Pri dTm", "Ta OPT", "Prod dTm", "Length"] { ui.strong(h); }
+            ui.end_row();
+            ui.label("");
+            ui.label("");
+            match (fwd, rev, &pf, &pr) {
+                (Some(f), Some(r), Some(a), Some(b)) if d.feats[f].start < d.feats[r].end => {
+                    let product = &d.seq[d.feats[f].start..d.feats[r].end];
+                    let n = product.len() as f64;
+                    let gc = product.iter().filter(|b| matches!(b.to_ascii_uppercase(), b'G' | b'C')).count() as f64 / n;
+                    let prod_tm = 81.5 + 16.6 * 0.05f64.log10() + 41.0 * gc - 675.0 / n;
+                    let (ta, tb) = (primers::tm(a), primers::tm(b));
+                    let ta_opt = 0.3 * ta.min(tb) + 0.7 * prod_tm - 14.9;
+                    ui.label(format!("{prod_tm:.1}"));
+                    ui.label(format!("{:.1}", (ta - tb).abs()));
+                    ui.label(format!("{ta_opt:.1}"));
+                    ui.label("");
+                    ui.label(product.len().to_string());
+                }
+                _ => {
+                    for _ in 0..4 { ui.label("0.0"); }
+                    ui.label(pr.as_ref().or(pf.as_ref()).map_or(0, |p| p.len()).to_string());
+                }
+            }
+            ui.end_row();
+        });
+    }
+
     /// SeqBuilder's Sequence view: fixed column ruler, rows of top strand with a tick axis underneath,
     /// track markers (5', o) on the left, last position on the right, selection filling the whole row.
     fn sequence_view(&mut self, ui: &mut egui::Ui) {
@@ -1637,7 +1736,7 @@ impl eframe::App for App {
         if self.frames < 4 { ctx.request_repaint(); }
         if self.frames == 1 {
             if let Ok(v) = std::env::var("SEQBUILDER_VIEW") {
-                self.view = match v.as_str() { "linear" => View::Linear, "sequence" => View::Sequence, _ => self.view };
+                self.view = match v.as_str() { "linear" => View::Linear, "sequence" => View::Sequence, "primers" => View::PrimerDesign, _ => self.view };
             }
             // Debug aid: SEQBUILDER_FEATURE=n opens with that table row picked.
             if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { (self.sel_feat, self.side_top) = (Some(i), SideTop::Style); }
@@ -1663,7 +1762,7 @@ impl eframe::App for App {
                     ui.add_enabled_ui(circular, |ui| ui.selectable_value(&mut self.view, View::Circular, "Circular"));
                     ui.selectable_value(&mut self.view, View::Linear, "Linear");
                     ui.selectable_value(&mut self.view, View::Sequence, "Sequence");
-                    todo_tab(ui, "Primer Design");
+                    ui.selectable_value(&mut self.view, View::PrimerDesign, "Primer Design");
                 });
             });
             let Some(d) = &self.doc else {
@@ -1674,6 +1773,7 @@ impl eframe::App for App {
                 View::Circular => self.page(ui, |p, r, ui| self.circular_map(p, r, ui, d)),
                 View::Linear => self.page(ui, |p, r, ui| self.linear_map(p, r, ui, d)),
                 View::Sequence => self.sequence_view(ui),
+                View::PrimerDesign => self.primer_design(ui),
             }
         });
         self.selector_manager(ctx);
@@ -1984,14 +2084,14 @@ mod tests {
         let d = load(Path::new("testdata/ALDH2.sbd")).unwrap();
         let p = primer_sequence(&d.feats[0], &d.seq);
         assert_eq!(String::from_utf8_lossy(&p).to_uppercase(), "AGGCTGAGGCAGGAGAATGGCATGAACCCGGGAGGCGG");
-        assert_eq!(format!("{:.1}", primer_tm(&p)), "77.7"); // SeqBuilder's Primers tab
+        assert_eq!(format!("{:.1}", primers::tm(&p)), "77.7"); // SeqBuilder's Primers tab
         let r = primer_sequence(&d.feats[1], &d.seq);
-        assert_eq!((r.len(), format!("{:.1}", primer_tm(&r))), (38, "77.7".to_string()));
+        assert_eq!((r.len(), format!("{:.1}", primers::tm(&r))), (38, "77.7".to_string()));
         // Tm and dG SeqBuilder showed for the primers in pBR322_primers.sbd
         let d = load(Path::new("testdata/pBR322_primers.sbd")).unwrap();
         let shown: Vec<(String, String)> = d.feats.iter().filter(|f| f.kind == "PCR_primer").map(|f| {
             let p = primer_sequence(f, &d.seq);
-            (format!("{:.1}", primer_tm(&p)), format!("{:.1}", primer_dg(&p)))
+            (format!("{:.1}", primers::tm(&p)), format!("{:.1}", primers::dg(&p)))
         }).collect();
         let want = [("68.8", "-43.5"), ("57.3", "-26.4"), ("53.4", "-24.9"), ("57.7", "-28.7"), ("62.1", "-41.4"), ("75.1", "-45.0")];
         assert_eq!(shown, want.map(|(a, b)| (a.to_string(), b.to_string())));
