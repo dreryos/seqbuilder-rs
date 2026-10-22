@@ -328,6 +328,36 @@ fn statistics(ui: &mut egui::Ui, s: &[u8]) {
     });
 }
 
+/// A primer's own sequence: its /primer qualifier, else the bases it covers read on its strand.
+fn primer_sequence(f: &Feat, seq: &[u8]) -> Vec<u8> {
+    if let Some(p) = f.quals.iter().find_map(|q| q.strip_prefix("primer=")) { return p.trim_matches('"').as_bytes().to_vec(); }
+    if f.start >= f.end { return vec![]; }
+    let s = &seq[f.start..f.end];
+    if f.strand < 0 { s.iter().rev().map(|&b| complement(b)).collect() } else { s.to_vec() }
+}
+
+// ponytail: nearest-neighbour Tm (SantaLucia 1998, 50 nM primer, 0.1 M Na+) reproduces SeqBuilder's 77.7 °C for
+// ALDH2's 38-mers, but one value fits several models; check against more SeqBuilder primers.
+fn primer_tm(p: &[u8]) -> f64 {
+    let up: Vec<u8> = p.iter().map(|b| b.to_ascii_uppercase()).collect();
+    if up.len() < 2 || up.iter().any(|b| !b"ACGT".contains(b)) { return f64::NAN; }
+    let nn = |d: &[u8]| -> (f64, f64) {
+        match d {
+            b"AA" | b"TT" => (-7.9, -22.2), b"AT" => (-7.2, -20.4), b"TA" => (-7.2, -21.3),
+            b"CA" | b"TG" => (-8.5, -22.7), b"GT" | b"AC" => (-8.4, -22.4), b"CT" | b"AG" => (-7.8, -21.0),
+            b"GA" | b"TC" => (-8.2, -22.2), b"CG" => (-10.6, -27.2), b"GC" => (-9.8, -24.4), _ => (-8.0, -19.9), // GG, CC
+        }
+    };
+    let (mut dh, mut ds) = up.windows(2).map(nn).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+    for end in [up[0], up[up.len() - 1]] {
+        let (h, s) = if matches!(end, b'G' | b'C') { (0.1, -2.8) } else { (2.3, 4.1) };
+        (dh, ds) = (dh + h, ds + s);
+    }
+    let (na, ct) = (0.1f64, 50e-9f64);
+    ds += 0.368 * up.len() as f64 * na.ln();
+    dh * 1000.0 / (ds + 1.987 * (ct / 2.0).ln()) - 273.15
+}
+
 /// Standard genetic code, TCAG order.
 const CODONS: &[u8; 64] = b"FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG";
 
@@ -409,7 +439,7 @@ fn todo_tab(ui: &mut egui::Ui, label: &str) {
 enum View { #[default] Circular, Linear, Sequence }
 
 #[derive(Default, PartialEq, Clone, Copy)]
-enum Tab { #[default] Features, Comment, Minimap, SiteSummary }
+enum Tab { #[default] Features, Primers, Comment, Minimap, SiteSummary }
 
 #[derive(Default, PartialEq, Clone, Copy)]
 enum SideTop { Style, #[default] Enzymes }
@@ -906,7 +936,7 @@ impl App {
         egui::Panel::bottom("table_tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Features, "Features");
-                todo_tab(ui, "Primers");
+                ui.selectable_value(&mut self.tab, Tab::Primers, "Primers");
                 ui.selectable_value(&mut self.tab, Tab::Comment, "Comment");
                 ui.selectable_value(&mut self.tab, Tab::Minimap, "Minimap");
                 ui.selectable_value(&mut self.tab, Tab::SiteSummary, "Site Summary");
@@ -938,6 +968,28 @@ impl App {
                 if toggled { doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len()); }
             }
             Tab::Comment => { ui.label(if doc.comment.is_empty() { "No comment." } else { &doc.comment }); }
+            Tab::Primers => {
+                // SeqBuilder lists PCR_primer features; Score, dTm and Ta OP need its primer design, not made yet.
+                egui::Grid::new("primers").striped(true).num_columns(11).spacing([14.0, 4.0]).show(ui, |ui| {
+                    for h in ["Show", "Active", "Set Name", "Name", "F/R", "Primer Sequence", "Score", "Length", "Tm", "dTm", "Ta OP"] { ui.strong(h); }
+                    ui.end_row();
+                    for (i, f) in doc.feats.iter_mut().enumerate().filter(|(_, f)| f.kind == "PCR_primer") {
+                        let primer = primer_sequence(f, &doc.seq);
+                        ui.checkbox(&mut f.show, "");
+                        ui.label("");
+                        ui.label(f.quals.iter().find_map(|q| q.strip_prefix("pair=")).unwrap_or("").trim_matches('"'));
+                        if ui.selectable_label(self.sel_feat == Some(i), &f.label).clicked() { pick = Some(i); }
+                        ui.label(if f.strand < 0 { "R" } else { "F" });
+                        ui.monospace(String::from_utf8_lossy(&primer).to_uppercase());
+                        ui.label("");
+                        ui.label(primer.len().to_string());
+                        ui.label(format!("{:.1}", primer_tm(&primer)));
+                        ui.label("");
+                        ui.label("");
+                        ui.end_row();
+                    }
+                });
+            }
             Tab::Minimap => {
                 // One row per checked enzyme: name, number of sites, the sites along the whole sequence.
                 let mut shown: Vec<usize> = self.shown.iter().copied().collect();
@@ -1511,7 +1563,7 @@ impl eframe::App for App {
             if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { (self.sel_feat, self.side_top) = (Some(i), SideTop::Style); }
             if std::env::var("SEQBUILDER_NEW").is_ok() { self.new_dna(); }
             if let Ok(t) = std::env::var("SEQBUILDER_TAB") {
-                self.tab = match t.as_str() { "minimap" => Tab::Minimap, "comment" => Tab::Comment, "sites" => Tab::SiteSummary, _ => Tab::Features };
+                self.tab = match t.as_str() { "minimap" => Tab::Minimap, "primers" => Tab::Primers, "comment" => Tab::Comment, "sites" => Tab::SiteSummary, _ => Tab::Features };
             }
             if let Ok(t) = std::env::var("SEQBUILDER_TRACKS") { (self.complement, self.translations) = (t.contains("strand"), t.contains("frames")); }
             if let Some(c) = std::env::var("SEQBUILDER_CARET").ok().and_then(|v| v.parse().ok()) { self.caret = Some(c); }
@@ -1844,6 +1896,16 @@ mod tests {
             ("% AT", "5.56 [2]"), ("% CA", "11.11 [4]"), ("% CC", "8.33 [3]")] {
             assert_eq!(rows[k], v, "{k}");
         }
+    }
+
+    #[test]
+    fn primers_tab_values() {
+        let d = load(Path::new("testdata/ALDH2.sbd")).unwrap();
+        let p = primer_sequence(&d.feats[0], &d.seq);
+        assert_eq!(String::from_utf8_lossy(&p).to_uppercase(), "AGGCTGAGGCAGGAGAATGGCATGAACCCGGGAGGCGG");
+        assert_eq!(format!("{:.1}", primer_tm(&p)), "77.7"); // SeqBuilder's Primers tab
+        let r = primer_sequence(&d.feats[1], &d.seq);
+        assert_eq!((r.len(), format!("{:.1}", primer_tm(&r))), (38, "77.7".to_string()));
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
