@@ -336,11 +336,11 @@ fn primer_sequence(f: &Feat, seq: &[u8]) -> Vec<u8> {
     if f.strand < 0 { s.iter().rev().map(|&b| complement(b)).collect() } else { s.to_vec() }
 }
 
-// ponytail: nearest-neighbour Tm (SantaLucia 1998, 50 nM primer, 0.1 M Na+) reproduces SeqBuilder's 77.7 °C for
-// ALDH2's 38-mers, but one value fits several models; check against more SeqBuilder primers.
-fn primer_tm(p: &[u8]) -> f64 {
+/// SantaLucia (1998) unified nearest-neighbour sums (ΔH kcal/mol, ΔS cal/K·mol) of a primer, without
+/// initiation terms, as SeqBuilder uses them; None for non-ACGT bases.
+fn nn_sums(p: &[u8]) -> Option<(f64, f64, usize)> {
     let up: Vec<u8> = p.iter().map(|b| b.to_ascii_uppercase()).collect();
-    if up.len() < 2 || up.iter().any(|b| !b"ACGT".contains(b)) { return f64::NAN; }
+    if up.len() < 2 || up.iter().any(|b| !b"ACGT".contains(b)) { return None; }
     let nn = |d: &[u8]| -> (f64, f64) {
         match d {
             b"AA" | b"TT" => (-7.9, -22.2), b"AT" => (-7.2, -20.4), b"TA" => (-7.2, -21.3),
@@ -348,14 +348,22 @@ fn primer_tm(p: &[u8]) -> f64 {
             b"GA" | b"TC" => (-8.2, -22.2), b"CG" => (-10.6, -27.2), b"GC" => (-9.8, -24.4), _ => (-8.0, -19.9), // GG, CC
         }
     };
-    let (mut dh, mut ds) = up.windows(2).map(nn).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
-    for end in [up[0], up[up.len() - 1]] {
-        let (h, s) = if matches!(end, b'G' | b'C') { (0.1, -2.8) } else { (2.3, 4.1) };
-        (dh, ds) = (dh + h, ds + s);
-    }
-    let (na, ct) = (0.1f64, 50e-9f64);
-    ds += 0.368 * up.len() as f64 * na.ln();
-    dh * 1000.0 / (ds + 1.987 * (ct / 2.0).ln()) - 273.15
+    let (dh, ds) = up.windows(2).map(nn).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+    Some((dh, ds, up.len()))
+}
+
+/// Primer Tm as SeqBuilder shows it: SantaLucia NN, salt 0.368·(N−1)·ln[Na+] with Create Primer Pairs'
+/// 50 mM, primer 250 nM taken as Ct/2. Matches SeqBuilder to 0.1 °C on seven primers of 16-38 bases.
+fn primer_tm(p: &[u8]) -> f64 {
+    let Some((dh, ds, n)) = nn_sums(p) else { return f64::NAN };
+    let (na, ct) = (0.05f64, 250e-9f64);
+    dh * 1000.0 / (ds + 0.368 * (n - 1) as f64 * na.ln() + 1.987 * (ct / 2.0).ln()) - 273.15
+}
+
+// ponytail: the +0.27 kcal/mol is fitted to SeqBuilder's dG column (exact on six primers), its source is unknown.
+/// Primer duplex ΔG at 25 °C in kcal/mol, SeqBuilder's dG column.
+fn primer_dg(p: &[u8]) -> f64 {
+    nn_sums(p).map_or(f64::NAN, |(dh, ds, _)| dh - 298.15 * ds / 1000.0 + 0.27)
 }
 
 /// Fragment lengths a digest at `sites` leaves (Site Summary ▸ Show Fragment Size).
@@ -999,9 +1007,9 @@ impl App {
                 }
             }
             Tab::Primers => {
-                // SeqBuilder lists PCR_primer features; Score, dTm and Ta OP need its primer design, not made yet.
-                egui::Grid::new("primers").striped(true).num_columns(11).spacing([14.0, 4.0]).show(ui, |ui| {
-                    for h in ["Show", "Active", "Set Name", "Name", "F/R", "Primer Sequence", "Score", "Length", "Tm", "dTm", "Ta OP"] { ui.strong(h); }
+                // SeqBuilder lists PCR_primer features; Score and Ta OPT need its primer design, not made yet.
+                egui::Grid::new("primers").striped(true).num_columns(12).spacing([14.0, 4.0]).show(ui, |ui| {
+                    for h in ["Show", "Active", "Set Name", "Name", "F/R", "Primer Sequence", "Score", "Length", "Tm", "dTm", "Ta OPT", "dG"] { ui.strong(h); }
                     ui.end_row();
                     for (i, f) in doc.feats.iter_mut().enumerate().filter(|(_, f)| f.kind == "PCR_primer") {
                         let primer = primer_sequence(f, &doc.seq);
@@ -1013,9 +1021,11 @@ impl App {
                         ui.monospace(String::from_utf8_lossy(&primer).to_uppercase());
                         ui.label("");
                         ui.label(primer.len().to_string());
-                        ui.label(format!("{:.1}", primer_tm(&primer)));
+                        let tm = format!("{:.1}", primer_tm(&primer));
+                        ui.label(&tm);
+                        ui.label(&tm); // dTm: the primer's Tm on its template, the same for a perfect match
                         ui.label("");
-                        ui.label("");
+                        ui.label(format!("{:.1}", primer_dg(&primer)));
                         ui.end_row();
                     }
                 });
@@ -1977,6 +1987,14 @@ mod tests {
         assert_eq!(format!("{:.1}", primer_tm(&p)), "77.7"); // SeqBuilder's Primers tab
         let r = primer_sequence(&d.feats[1], &d.seq);
         assert_eq!((r.len(), format!("{:.1}", primer_tm(&r))), (38, "77.7".to_string()));
+        // Tm and dG SeqBuilder showed for the primers in pBR322_primers.sbd
+        let d = load(Path::new("testdata/pBR322_primers.sbd")).unwrap();
+        let shown: Vec<(String, String)> = d.feats.iter().filter(|f| f.kind == "PCR_primer").map(|f| {
+            let p = primer_sequence(f, &d.seq);
+            (format!("{:.1}", primer_tm(&p)), format!("{:.1}", primer_dg(&p)))
+        }).collect();
+        let want = [("68.8", "-43.5"), ("57.3", "-26.4"), ("53.4", "-24.9"), ("57.7", "-28.7"), ("62.1", "-41.4"), ("75.1", "-45.0")];
+        assert_eq!(shown, want.map(|(a, b)| (a.to_string(), b.to_string())));
     }
 
     #[test]
