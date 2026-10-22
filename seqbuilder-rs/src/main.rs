@@ -409,7 +409,7 @@ fn todo_tab(ui: &mut egui::Ui, label: &str) {
 enum View { #[default] Circular, Linear, Sequence }
 
 #[derive(Default, PartialEq, Clone, Copy)]
-enum Tab { #[default] Features, Comment, SiteSummary }
+enum Tab { #[default] Features, Comment, Minimap, SiteSummary }
 
 #[derive(Default, PartialEq, Clone, Copy)]
 enum SideTop { Style, #[default] Enzymes }
@@ -908,13 +908,14 @@ impl App {
                 ui.selectable_value(&mut self.tab, Tab::Features, "Features");
                 todo_tab(ui, "Primers");
                 ui.selectable_value(&mut self.tab, Tab::Comment, "Comment");
-                todo_tab(ui, "Minimap");
+                ui.selectable_value(&mut self.tab, Tab::Minimap, "Minimap");
                 ui.selectable_value(&mut self.tab, Tab::SiteSummary, "Site Summary");
                 todo_tab(ui, "History");
             });
         });
         let Some(doc) = &mut self.doc else { return };
         let mut pick = None;
+        let mut jump = None;
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| match self.tab {
             Tab::Features => {
                 let mut toggled = false;
@@ -937,6 +938,44 @@ impl App {
                 if toggled { doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len()); }
             }
             Tab::Comment => { ui.label(if doc.comment.is_empty() { "No comment." } else { &doc.comment }); }
+            Tab::Minimap => {
+                // One row per checked enzyme: name, number of sites, the sites along the whole sequence.
+                let mut shown: Vec<usize> = self.shown.iter().copied().collect();
+                shown.sort_by(|&a, &b| self.enz[a].name.cmp(&self.enz[b].name));
+                let (row_h, name_w, freq_w) = (24.0, 70.0, 40.0);
+                let size = Vec2::new(ui.available_width(), 22.0 + row_h * shown.len() as f32);
+                let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                let p = ui.painter_at(rect);
+                let v = ui.visuals();
+                let (fg, track_bg, site) = (v.text_color(), v.faint_bg_color, Color32::from_rgb(40, 70, 220));
+                let (x0, x1) = (rect.left() + name_w + freq_w, rect.right() - 12.0);
+                let len = doc.seq.len().max(1);
+                let x = |pos: usize| x0 + pos as f32 / len as f32 * (x1 - x0);
+                let top = rect.top() + 20.0;
+                p.text(Pos2::new(rect.left() + 2.0, top - 2.0), Align2::LEFT_BOTTOM, "Name", FontId::proportional(12.0), fg);
+                p.text(Pos2::new(rect.left() + name_w + 2.0, top - 2.0), Align2::LEFT_BOTTOM, "Freq", FontId::proportional(12.0), fg);
+                p.line_segment([Pos2::new(x0, top), Pos2::new(x1, top)], Stroke::new(1.5, fg));
+                let step = tick_step(len as f32);
+                for pos in (step..len).step_by(step) {
+                    p.line_segment([Pos2::new(x(pos), top - 4.0), Pos2::new(x(pos), top)], Stroke::new(1.0, fg));
+                    p.text(Pos2::new(x(pos), top - 4.0), Align2::CENTER_BOTTOM, pos.to_string(), FontId::proportional(9.0), fg);
+                }
+                for (k, &e) in shown.iter().enumerate() {
+                    let y = top + 2.0 + row_h * k as f32;
+                    let mid = y + row_h / 2.0;
+                    p.text(Pos2::new(rect.left() + 2.0, mid), Align2::LEFT_CENTER, &self.enz[e].name, FontId::proportional(12.0), fg);
+                    p.text(Pos2::new(rect.left() + name_w + freq_w / 2.0, mid), Align2::CENTER_CENTER, doc.hits[e].len().to_string(), FontId::proportional(12.0), fg);
+                    p.rect_filled(Rect::from_x_y_ranges(x0..=x1, y + 2.0..=y + row_h - 2.0), 0.0, track_bg);
+                    p.line_segment([Pos2::new(x0, mid), Pos2::new(x1, mid)], Stroke::new(1.0, fg));
+                    for &pos in &doc.hits[e] {
+                        p.line_segment([Pos2::new(x(pos), y + 2.0), Pos2::new(x(pos), y + row_h - 2.0)], Stroke::new(1.0, site));
+                    }
+                }
+                // a click on a track goes there in the sequence
+                if let Some(pp) = resp.interact_pointer_pos().filter(|pp| resp.clicked() && pp.x >= x0) {
+                    jump = Some((((pp.x - x0) / (x1 - x0)) * len as f32).clamp(0.0, len as f32 - 1.0) as usize);
+                }
+            }
             Tab::SiteSummary => {
                 egui::Grid::new("sites").striped(true).num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
                     for h in ["Enzyme", "Sites", "Positions", "Recognition"] { ui.strong(h); }
@@ -954,6 +993,9 @@ impl App {
                 });
             }
         });
+        if let Some(pos) = jump {
+            (self.view, self.caret, self.scroll_to, self.sel) = (View::Sequence, Some(pos), Some(pos), None);
+        }
         if let Some(i) = pick {
             let f = &doc.feats[i];
             if f.start < f.end {
@@ -1468,6 +1510,9 @@ impl eframe::App for App {
             // Debug aid: SEQBUILDER_FEATURE=n opens with that table row picked.
             if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { (self.sel_feat, self.side_top) = (Some(i), SideTop::Style); }
             if std::env::var("SEQBUILDER_NEW").is_ok() { self.new_dna(); }
+            if let Ok(t) = std::env::var("SEQBUILDER_TAB") {
+                self.tab = match t.as_str() { "minimap" => Tab::Minimap, "comment" => Tab::Comment, "sites" => Tab::SiteSummary, _ => Tab::Features };
+            }
             if let Ok(t) = std::env::var("SEQBUILDER_TRACKS") { (self.complement, self.translations) = (t.contains("strand"), t.contains("frames")); }
             if let Some(c) = std::env::var("SEQBUILDER_CARET").ok().and_then(|v| v.parse().ok()) { self.caret = Some(c); }
         }
