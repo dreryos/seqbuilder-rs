@@ -300,6 +300,34 @@ fn colors(f: &Feat) -> (Color32, Color32) {
     (s.fill.map_or(Color32::TRANSPARENT, rgb), s.line.map_or(Color32::TRANSPARENT, rgb))
 }
 
+/// Base composition rows of the Details panel: single bases, A+T, G+C, ambiguous, CpG and all
+/// dinucleotides, as "percent [count]".
+fn base_stats(s: &[u8]) -> Vec<(String, String)> {
+    let up: Vec<u8> = s.iter().map(|b| b.to_ascii_uppercase()).collect();
+    let n = up.len();
+    let count = |c: u8| up.iter().filter(|&&b| b == c).count();
+    let (a, c, g, t) = (count(b'A'), count(b'C'), count(b'G'), count(b'T') + count(b'U'));
+    let pct = |k: usize, of: usize| format!("{:.2} [{k}]", if of == 0 { 0.0 } else { 100.0 * k as f64 / of as f64 });
+    let pairs = n.saturating_sub(1);
+    let di = |x: u8, y: u8| up.windows(2).filter(|w| w[0] == x && w[1] == y).count();
+    let mut rows = vec![
+        ("% A".to_string(), pct(a, n)), ("% A+T".into(), pct(a + t, n)), ("% Ambiguous".into(), pct(n - a - c - g - t, n)),
+        ("% C".into(), pct(c, n)), ("% G".into(), pct(g, n)), ("% G+C".into(), pct(g + c, n)), ("% T".into(), pct(t, n)),
+        ("% diCG".into(), pct(di(b'C', b'G'), pairs)), ("Total number of bases".into(), n.to_string()),
+    ];
+    for x in *b"ACGT" {
+        for y in *b"ACGT" { rows.push((format!("% {}{}", x as char, y as char), pct(di(x, y), pairs))); }
+    }
+    rows
+}
+
+fn statistics(ui: &mut egui::Ui, s: &[u8]) {
+    ui.label(egui::RichText::new("Statistics:").italics());
+    egui::Grid::new("statistics").striped(true).num_columns(2).show(ui, |ui| {
+        for (k, v) in base_stats(s) { ui.label(k); ui.label(v); ui.end_row(); }
+    });
+}
+
 /// Standard genetic code, TCAG order.
 const CODONS: &[u8; 64] = b"FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG";
 
@@ -417,6 +445,7 @@ struct App {
     side_top: SideTop,
     side_bottom: SideBottom,
     goto_open: bool,
+    edit_open: bool, // Features ▸ Edit Feature… dialog
     goto_text: String,
     scroll_to: Option<usize>,
     caret: Option<usize>,                // insertion point in the Sequence view (before this base)
@@ -440,6 +469,34 @@ impl App {
             }
             Err(e) => self.error = Some(format!("{}: {e}", path.display())),
         }
+    }
+
+    /// Details ▸ Feature selection, as SeqBuilder shows it: type, location, orientation, qualifiers, statistics.
+    fn feature_details(&self, ui: &mut egui::Ui) {
+        let (Some(d), Some(i)) = (&self.doc, self.sel_feat) else { return };
+        let Some(f) = d.feats.get(i) else { return };
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Feature selection");
+            ui.separator();
+            ui.label(egui::RichText::new("Feature Information:").italics());
+            egui::Grid::new("feature_info").num_columns(2).show(ui, |ui| {
+                let orientation = if f.strand < 0 { "Reverse" } else { "Forward" };
+                for (k, v) in [("Feature Type:", f.kind.as_str()), ("Location:", f.range.as_str()), ("Orientation:", orientation)] {
+                    ui.label(k); ui.label(v); ui.end_row();
+                }
+                for q in f.quals.iter().filter(|q| !q.starts_with("dnas_title=")) {
+                    let (k, v) = q.split_once('=').unwrap_or((q, ""));
+                    ui.label(format!("{k}:"));
+                    ui.add(egui::Label::new(v.trim_matches('"')).wrap_mode(egui::TextWrapMode::Wrap));
+                    ui.end_row();
+                }
+            });
+            if f.start < f.end {
+                let mut bases = d.seq[f.start..f.end].to_vec();
+                if f.strand < 0 { bases = bases.iter().rev().map(|&b| complement(b)).collect(); }
+                statistics(ui, &bases);
+            }
+        });
     }
 
     /// Details for the feature picked in the table, editable (name, type, range, strand, note).
@@ -738,6 +795,7 @@ impl App {
             });
             ui.menu_button("Features", |ui| {
                 if ui.add_enabled(self.sel.is_some(), egui::Button::new("New Feature  ⌘K")).clicked() { self.new_feature(); }
+                if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Edit Feature…")).clicked() { self.edit_open = true; }
                 if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Delete Feature")).clicked() { self.delete_feature(); }
             });
             ui.menu_button("Sequence", |ui| {
@@ -866,7 +924,9 @@ impl App {
                     for (i, f) in doc.feats.iter_mut().enumerate() {
                         toggled |= ui.checkbox(&mut f.show, "").changed();
                         ui.label(&f.kind);
-                        if ui.selectable_label(self.sel_feat == Some(i), &f.label).clicked() { pick = Some(i); }
+                        let name = ui.selectable_label(self.sel_feat == Some(i), &f.label);
+                        if name.clicked() { pick = Some(i); }
+                        if name.double_clicked() { self.edit_open = true; }
                         ui.label(&f.range);
                         ui.label(if f.strand < 0 { "◀" } else { "▶" });
                         ui.label((if f.start < f.end { f.end - f.start } else { doc.seq.len() - f.start + f.end }).to_string());
@@ -920,7 +980,7 @@ impl App {
                     ui.radio_value(&mut self.grouping, 3, "Group by 3");
                     ui.radio_value(&mut self.grouping, 10, "Group by 10");
                 }
-                SideBottom::Details if self.sel_feat.is_some() && self.doc.is_some() => self.feature_editor(ui),
+                SideBottom::Details if self.sel_feat.is_some() && self.doc.is_some() => self.feature_details(ui),
                 SideBottom::Details => match &self.doc {
                     None => { ui.label("No document open."); }
                     Some(_) if self.sel.is_some() => {
@@ -928,7 +988,7 @@ impl App {
                         ui.heading("Region selection");
                         ui.separator();
                         ui.label(format!("Selection: Forward {}..{}, length = {}", a + 1, b, b - a));
-                        if let Some(s) = self.selected() { ui.label(format!("GC content: {:.1}%", gc_percent(s))); }
+                        if let Some(s) = self.selected() { statistics(ui, s); }
                     }
                     Some(d) => {
                         ui.heading(&d.name);
@@ -1439,6 +1499,11 @@ impl eframe::App for App {
             }
         });
         self.selector_manager(ctx);
+        if self.edit_open && self.sel_feat.is_some() {
+            let mut open = true;
+            egui::Window::new("Edit Feature").open(&mut open).collapsible(false).show(ctx, |ui| self.feature_editor(ui));
+            self.edit_open = open;
+        }
         if self.goto_open {
             let mut open = true;
             egui::Window::new("Go to Position").open(&mut open).collapsible(false).show(ctx, |ui| {
@@ -1720,6 +1785,20 @@ mod tests {
         // reverse strand CTATTTCAT read from the last base: L F H
         let r1: String = (0..seq.len()).rev().filter_map(|i| frame_residue(seq, i, 3)).collect();
         assert_eq!(r1, "LFH");
+    }
+
+    /// Statistics SeqBuilder Pro's Details panel showed for a 37-base feature of an edited ALDH2
+    /// (its 1240..1276 is 1253..1289 of the saved ALDH2.sbd).
+    #[test]
+    fn base_statistics_match_seqbuilder() {
+        let d = load(Path::new("testdata/ALDH2.sbd")).unwrap();
+        let rows: std::collections::HashMap<String, String> = base_stats(&d.seq[1252..1289]).into_iter().collect();
+        for (k, v) in [("% A", "21.62 [8]"), ("% A+T", "56.76 [21]"), ("% Ambiguous", "0.00 [0]"), ("% C", "32.43 [12]"),
+            ("% G", "10.81 [4]"), ("% G+C", "43.24 [16]"), ("% T", "35.14 [13]"), ("% diCG", "0.00 [0]"),
+            ("Total number of bases", "37"), ("% AA", "2.78 [1]"), ("% AC", "8.33 [3]"), ("% AG", "5.56 [2]"),
+            ("% AT", "5.56 [2]"), ("% CA", "11.11 [4]"), ("% CC", "8.33 [3]")] {
+            assert_eq!(rows[k], v, "{k}");
+        }
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
