@@ -26,8 +26,8 @@ struct Feat {
     strand: i8,    // 1 forward, -1 reverse
     lane: usize,
     show: bool,
-    style: Option<(Color32, Color32)>, // (fill, line) of this feature, from the document or the Style tab
-    base: Option<(Color32, Color32)>,  // the document's style for this feature type
+    style: Option<sbd::Style>,         // this feature's own style, from the document or the Style tab
+    base: Option<sbd::Style>,          // the document's style for this feature type
     sbd_id: Option<u32>,               // UVFT id when read from a .sbd
     edited: bool,                      // style changed since the last save
     quals: Vec<String>,                // "key=value" qualifier lines, quoting included
@@ -194,20 +194,15 @@ fn load(path: &Path) -> Result<Doc, String> {
         Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false }
     } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sbd")) {
         let s = sbd::read(&text)?;
-        let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
         let feats = s.feats.iter().map(|f| {
             let (lo, hi) = (f.start.min(f.end), f.start.max(f.end));
             let q = |k: &str| f.qual(k);
-            let colors = |st: &sbd::Style| {
-                let fill = st.fill.map_or(Color32::TRANSPARENT, rgb);
-                (fill, st.line.map_or(fill, rgb))
-            };
             Feat {
                 kind: f.kind.clone(), name: f.name.clone(), label: short(&f.name), desc: q("note").or_else(|| q("product")).unwrap_or_default(),
                 range: if f.complement { format!("complement({lo}..{hi})") } else { format!("{lo}..{hi}") },
                 start: lo.saturating_sub(1), end: hi, strand: if f.complement { -1 } else { 1 }, lane: 0,
-                show: s.shown.get(&f.id).copied().unwrap_or(f.kind != "source"), style: s.obj_styles.get(&f.id).map(colors),
-                base: s.type_styles.get(&f.kind).map(colors), sbd_id: Some(f.id), edited: false,
+                show: s.shown.get(&f.id).copied().unwrap_or(f.kind != "source"), style: s.obj_styles.get(&f.id).copied(),
+                base: s.type_styles.get(&f.kind).copied(), sbd_id: Some(f.id), edited: false,
                 quals: f.quals.clone(), dirty: false,
             }
         }).collect();
@@ -258,22 +253,33 @@ fn load(path: &Path) -> Result<Doc, String> {
     Ok(doc)
 }
 
-fn kind_color(kind: &str) -> (Color32, Color32) {
-    let rgb = Color32::from_rgb;
-    match kind {
-        "CDS" | "gene" | "mat_peptide" => (rgb(215, 228, 255), rgb(70, 110, 220)),
-        "promoter" => (rgb(170, 225, 160), rgb(40, 130, 40)),
-        "rep_origin" => (rgb(240, 235, 120), rgb(150, 140, 20)),
-        "terminator" => (rgb(240, 170, 170), rgb(170, 40, 40)),
-        "primer_bind" => (rgb(170, 210, 245), rgb(30, 110, 190)),
-        "misc_binding" | "protein_bind" => (rgb(215, 190, 245), rgb(130, 60, 200)),
-        "misc_feature" => (rgb(230, 200, 160), rgb(130, 75, 20)),
-        _ => (rgb(215, 215, 220), rgb(110, 110, 125)),
-    }
+/// Style for documents that carry none (GenBank, FASTA).
+fn kind_style(kind: &str) -> sbd::Style {
+    let (fill, line) = match kind {
+        "CDS" | "gene" | "mat_peptide" => ([215, 228, 255], [70, 110, 220]),
+        "promoter" => ([170, 225, 160], [40, 130, 40]),
+        "rep_origin" => ([240, 235, 120], [150, 140, 20]),
+        "terminator" => ([240, 170, 170], [170, 40, 40]),
+        "primer_bind" => ([170, 210, 245], [30, 110, 190]),
+        "misc_binding" | "protein_bind" => ([215, 190, 245], [130, 60, 200]),
+        "misc_feature" => ([230, 200, 160], [130, 75, 20]),
+        _ => ([215, 215, 220], [110, 110, 125]),
+    };
+    sbd::Style { line: Some(line), weight: 1.0, fill: Some(fill), shadow: None }
 }
 
+fn look(f: &Feat) -> sbd::Style {
+    f.style.or(f.base).unwrap_or_else(|| kind_style(&f.kind))
+}
+
+fn rgb(c: [u8; 3]) -> Color32 {
+    Color32::from_rgb(c[0], c[1], c[2])
+}
+
+/// (fill, outline) as drawn; a style without fill or line draws none.
 fn colors(f: &Feat) -> (Color32, Color32) {
-    f.style.or(f.base).unwrap_or_else(|| kind_color(&f.kind))
+    let s = look(f);
+    (s.fill.map_or(Color32::TRANSPARENT, rgb), s.line.map_or(Color32::TRANSPARENT, rgb))
 }
 
 /// SeqBuilder shows short sequences in bp and long ones in kb ("4361 bp", "114.842 kb").
@@ -531,11 +537,9 @@ impl App {
             let Some(id) = f.sbd_id else { continue };
             if s.shown.get(&id) != Some(&f.show) { s.set_feature_shown(id, f.show); }
         }
-        let rgb = |c: Color32| [c.r(), c.g(), c.b()];
         for f in d.feats.iter_mut().filter(|f| f.edited) {
             let Some(id) = f.sbd_id else { continue };
-            let weight = s.obj_styles.get(&id).or(s.type_styles.get(&f.kind)).map_or(1.0, |st| st.weight);
-            s.set_feature_style(id, f.style.map(|(fill, line)| sbd::Style { fill: (fill.a() > 0).then(|| rgb(fill)), line: Some(rgb(line)), weight }));
+            s.set_feature_style(id, f.style);
             f.edited = false;
         }
         let path = to.unwrap_or_else(|| d.path.clone());
@@ -823,15 +827,48 @@ impl App {
             SideTop::Style => {
                 let feat = self.sel_feat.and_then(|i| self.doc.as_mut()?.feats.get_mut(i));
                 let Some(f) = feat else { ui.label("Select a feature in the table."); return };
+                // Laid out as SeqBuilder's styleInfo panel (SeqBuilder.xrc).
                 ui.strong(&f.label);
-                ui.label(&f.kind);
-                let (mut fill, mut line) = colors(f);
+                let mut st = look(f);
                 let mut changed = false;
-                egui::Grid::new("style").num_columns(2).show(ui, |ui| {
-                    ui.label("Fill:"); changed |= ui.color_edit_button_srgba(&mut fill).changed(); ui.end_row();
-                    ui.label("Line:"); changed |= ui.color_edit_button_srgba(&mut line).changed(); ui.end_row();
+                let colour = |ui: &mut egui::Ui, on: &mut Option<[u8; 3]>, label: &str, default: [u8; 3]| {
+                    let mut enabled = on.is_some();
+                    let mut c = on.unwrap_or(default);
+                    let mut ch = ui.checkbox(&mut enabled, label).changed();
+                    ch |= ui.color_edit_button_srgb(&mut c).changed();
+                    if ch { *on = enabled.then_some(c); }
+                    ch
+                };
+                egui::Grid::new("style").num_columns(4).show(ui, |ui| {
+                    let last_fill = st.fill.unwrap_or([255, 255, 255]);
+                    changed |= colour(ui, &mut st.line, "Line:", [0, 0, 0]);
+                    ui.label("Weight:");
+                    egui::ComboBox::from_id_salt("weight").selected_text(format!("{}", st.weight)).width(50.0).show_ui(ui, |ui| {
+                        for w in [0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0] { changed |= ui.selectable_value(&mut st.weight, w, format!("{w}")).changed(); }
+                    });
+                    ui.end_row();
+                    changed |= colour(ui, &mut st.fill, "Fill:", last_fill);
+                    ui.end_row();
+                    changed |= colour(ui, &mut st.shadow, "Shadow:", [192, 192, 192]);
+                    ui.end_row();
                 });
-                if changed { f.style = Some((fill, line)); f.edited = true; }
+                if changed { (f.style, f.edited) = (Some(st), true); }
+                ui.add_space(6.0);
+                ui.small("Feature");
+                // ponytail: shape, linkage and label position are not decoded from STYLE yet; shown to keep the layout.
+                ui.add_enabled_ui(false, |ui| {
+                    egui::Grid::new("feature_shape").num_columns(2).show(ui, |ui| {
+                        for (label, value) in [("Shape:", "Box"), ("Linkage:", "Solid"), ("Label Position:", "Inside")] {
+                            ui.label(label);
+                            egui::ComboBox::from_id_salt(label).selected_text(value).show_ui(ui, |_| {});
+                            ui.end_row();
+                        }
+                    });
+                    ui.checkbox(&mut false, "Label Attached");
+                    ui.add_space(6.0);
+                    ui.small("Font");
+                    ui.horizontal(|ui| { ui.label("Selected Item"); ui.label("Helvetica 12"); });
+                }).response.on_disabled_hover_text("Not implemented yet");
             }
             SideTop::Enzymes => {
                 if self.enz.is_empty() { ui.label("No enzymes loaded (File ▸ Open Enzyme Files…)."); return; }
@@ -942,16 +979,31 @@ impl App {
             if rad < 20.0 { continue; }
             let (a0, a1) = span(f.start, f.end);
             let (fill, line) = colors(f);
+            let st = look(f);
+            let outline = Stroke::new(st.weight as f32, line);
+            if (a1 - a0) * rad < 6.0 {
+                // a few bases: a radial mark, since thick outlines on tiny shapes spike out
+                let mid = (a0 + a1) / 2.0;
+                let mark = if fill == Color32::TRANSPARENT { line } else { fill };
+                p.line_segment([at(mid, rad - 6.0), at(mid, rad + 6.0)], Stroke::new(3.0, mark));
+                continue;
+            }
             let head = (8.0 / rad).min(a1 - a0);
             let (b0, b1, tip, back) = if f.strand < 0 { (a0 + head, a1, a0, a0 + head) } else { (a0, a1 - head, a1, a1 - head) };
+            let arrow = vec![at(tip, rad), at(back, rad + 7.0), at(back, rad - 7.0)];
+            if let Some(sh) = st.shadow {
+                let off = |v: &Vec<Pos2>| v.iter().map(|q| *q + Vec2::splat(2.0)).collect::<Vec<_>>();
+                if b1 > b0 { p.add(Shape::line(off(&arc(b0, b1, rad)), Stroke::new(8.0, rgb(sh)))); }
+                p.add(Shape::convex_polygon(off(&arrow), rgb(sh), Stroke::NONE));
+            }
             if b1 > b0 {
                 let mut band = arc(b0, b1, rad + 4.0);
                 band.extend(arc(b1, b0, rad - 4.0));
                 band.push(band[0]);
                 p.add(Shape::line(arc(b0, b1, rad), Stroke::new(8.0, fill)));
-                p.add(Shape::line(band, Stroke::new(1.0, line)));
+                p.add(Shape::line(band, outline));
             }
-            p.add(Shape::convex_polygon(vec![at(tip, rad), at(back, rad + 7.0), at(back, rad - 7.0)], fill, Stroke::new(1.0, line)));
+            p.add(Shape::convex_polygon(arrow, fill, Stroke::new(outline.width.min(2.0), line))); // sharp tip
             let mid = (a0 + a1) / 2.0;
             let galley = p.layout_no_wrap(f.label.clone(), small.clone(), fg);
             let lrect = Align2::CENTER_CENTER.anchor_size(at(mid, rad - 13.0), galley.size());
@@ -1001,11 +1053,13 @@ impl App {
         }
         for f in doc.feats.iter().filter(|f| f.show) {
             let (fill, line) = colors(f);
+            let st = look(f);
             let fy = y + 28.0 + f.lane as f32 * 16.0;
             let spans = if f.start < f.end { vec![(f.start, f.end)] } else { vec![(f.start, doc.seq.len()), (0, f.end)] };
             for (s, e) in spans {
                 let r = Rect::from_min_max(Pos2::new(x(s), fy - 5.0), Pos2::new(x(e).max(x(s) + 2.0), fy + 5.0));
-                p.rect(r, 1.0, fill, Stroke::new(1.0, line), egui::StrokeKind::Inside);
+                if let Some(sh) = st.shadow { p.rect_filled(r.translate(Vec2::splat(2.0)), 1.0, rgb(sh)); }
+                p.rect(r, 1.0, fill, Stroke::new(st.weight as f32, line), egui::StrokeKind::Inside);
                 p.with_clip_rect(r).text(r.center(), Align2::CENTER_CENTER, &f.label, small.clone(), fg);
             }
         }
@@ -1162,7 +1216,7 @@ impl eframe::App for App {
                 self.view = match v.as_str() { "linear" => View::Linear, "sequence" => View::Sequence, _ => self.view };
             }
             // Debug aid: SEQBUILDER_FEATURE=n opens with that table row picked.
-            if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { self.sel_feat = Some(i); }
+            if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { (self.sel_feat, self.side_top) = (Some(i), SideTop::Style); }
             if std::env::var("SEQBUILDER_NEW").is_ok() { self.new_dna(); }
             if let Some(c) = std::env::var("SEQBUILDER_CARET").ok().and_then(|v| v.parse().ok()) { self.caret = Some(c); }
         }
@@ -1284,7 +1338,7 @@ mod tests {
             assert_eq!((&a.kind, a.start, a.end, a.strand), (&b.kind, b.start, b.end, b.strand), "{}", b.range);
         }
         let red = load(Path::new("testdata/pBR322_blaRED.sbd")).unwrap();
-        assert_eq!(red.feats[38].style.unwrap().0, Color32::from_rgb(255, 0, 0));
+        assert_eq!(red.feats[38].style.unwrap().fill, Some([255, 0, 0]));
     }
 
     #[test]
@@ -1292,7 +1346,7 @@ mod tests {
         let mut app = App::default();
         app.open(Path::new("testdata/pBR322.sbd"));
         let f = &mut app.doc.as_mut().unwrap().feats[38];
-        f.style = Some((Color32::from_rgb(0, 200, 0), Color32::from_rgb(0, 0, 255)));
+        f.style = Some(sbd::Style { line: Some([0, 0, 255]), weight: 1.0, fill: Some([0, 200, 0]), shadow: None });
         f.edited = true;
         let out = std::env::temp_dir().join("seqbuilder-rs-test.sbd");
         app.save(Some(out.clone()));

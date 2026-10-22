@@ -68,6 +68,7 @@ pub struct Style {
     pub line: Option<[u8; 3]>,
     pub weight: f64,
     pub fill: Option<[u8; 3]>,
+    pub shadow: Option<[u8; 3]>,
 }
 
 pub struct Sbd {
@@ -353,6 +354,7 @@ fn style(s: &[u8]) -> Option<(u32, u32, Style)> {
         line: (s[8] != 0).then(|| rgb(9)),
         weight: f64::from_le_bytes(s[12..20].try_into().ok()?),
         fill: (s[20] != 0).then(|| rgb(21)),
+        shadow: (s.get(24).is_some_and(|&b| b != 0) && s.len() >= 28).then(|| rgb(25)),
     }))
 }
 
@@ -384,6 +386,8 @@ fn restyle(vs: &[u8], id: u32, kind: &str, st: Option<Style>) -> Vec<u8> {
             r[12..20].copy_from_slice(&st.weight.to_le_bytes());
             r[20] = st.fill.is_some() as u8;
             if let Some(c) = st.fill { r[21..24].copy_from_slice(&c); }
+            r[24] = st.shadow.is_some() as u8;
+            if let Some(c) = st.shadow { r[25..28].copy_from_slice(&c); }
             rest.insert(0, ("STYLE", r)); // SeqBuilder puts the newest object style first
         }
         block(oi, rest)
