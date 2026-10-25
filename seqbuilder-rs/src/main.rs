@@ -974,7 +974,8 @@ impl App {
                 }
             }
             Tab::Primers => {
-                // SeqBuilder lists PCR_primer features; Score and Ta OPT need its primer design, not made yet.
+                // SeqBuilder lists PCR_primer features. Score comes from a /score qualifier it writes when it
+                // creates a pair, Ta OPT only applies to pairs; neither is produced here.
                 egui::Grid::new("primers").striped(true).num_columns(12).spacing([14.0, 4.0]).show(ui, |ui| {
                     for h in ["Show", "Active", "Set Name", "Name", "F/R", "Primer Sequence", "Score", "Length", "Tm", "dTm", "Ta OPT", "dG"] { ui.strong(h); }
                     ui.end_row();
@@ -1514,7 +1515,7 @@ impl App {
                 .min_by(|x, y| x.1.dg.total_cmp(&y.1.dg));
             match selfdimer {
                 Some((a, dm)) => {
-                    let bad = if primers::is_bad(dm.dg) { " (BAD!)" } else { "" };
+                    let bad = if primers::dimer_is_bad(dm.dg) { " (BAD!)" } else { "" };
                     c[0].label(format!("Most stable dimer {} bp, {:.1} kc/m{bad}", dm.len, dm.dg));
                     mono(&mut c[0], dimer_text(a, a, &dm));
                 }
@@ -1522,7 +1523,8 @@ impl App {
             }
             match (&pf, &pr) {
                 (Some(a), Some(b)) => match primers::dimer(a, b).filter(|dm| dm.len > 2) {
-                    // ponytail: SeqBuilder scored this pair "3 bp, -0.0"; the stretch length agrees, its energy does not yet
+                    // ponytail: SeqBuilder scored this pair "3 bp, -0.0"; the stretch length agrees, its energy does not yet.
+                    // SeqBuilder computes dimer energies outside the display code, which is not decoded yet.
                     Some(dm) => { c[1].label(format!("Most stable pair dimer {} bp, {:.1} kc/m (estimate)", dm.len, dm.dg)); mono(&mut c[1], dimer_text(a, b, &dm)); }
                     None => { c[1].label("No pair dimers > 2 bp"); }
                 },
@@ -1533,7 +1535,7 @@ impl App {
                 .min_by(|x, y| x.1.dg.total_cmp(&y.1.dg));
             match hairpin {
                 Some((a, h)) => {
-                    let bad = if primers::is_bad(h.dg) { " (BAD!)" } else { "" };
+                    let bad = if primers::hairpin_is_bad(h.dg) { " (BAD!)" } else { "" };
                     c[2].label(format!("Hairpin {} bp, {:.1} kc/m{bad}", h.stem, h.dg));
                     let stem: String = (0..a.len()).map(|i| if (h.start..h.start + h.stem).contains(&i) || (h.end + 1 - h.stem..=h.end).contains(&i) { '|' } else { ' ' }).collect();
                     mono(&mut c[2], format!("5' {} 3'\n   {stem}", String::from_utf8_lossy(a)));
@@ -1553,7 +1555,8 @@ impl App {
         for (i, colour) in [(fwd, green), (rev, red)] {
             if let Some(i) = i { p.rect_filled(Rect::from_center_size(Pos2::new(x(d.feats[i].start), my), Vec2::new(6.0, 12.0)), 3.0, colour); }
         }
-        // Score is SeqBuilder's own primer rating, not reproduced; the rest matches its pair table.
+        // Score is not computed here: PrimerColComparer::CompareScores reads it from the feature's
+        // /score qualifier, so SeqBuilder stores it when it creates a pair. The rest matches its pair table.
         egui::Grid::new("pair").striped(true).num_columns(7).show(ui, |ui| {
             for h in ["Pair Name", "Score", "Prod Tm", "Pri dTm", "Ta OPT", "Prod dTm", "Length"] { ui.strong(h); }
             ui.end_row();

@@ -1,5 +1,17 @@
 // Primer analysis as SeqBuilder's Primer Design view shows it: Tm and dG, dimers, hairpins and binding
-// sites. Energies are SantaLucia (1998) unified nearest-neighbour values without initiation terms.
+// sites.
+//
+// The formulas and constants here were read out of SeqBuilder Pro 19's own code (Ghidra):
+// PCRConditionData holds _deltaH_DNA and _deltaS_DNA, 4x4 tables of doubles indexed
+// [second base][first base] over A,C,G,T, whose values are SantaLucia (1998) unified; makeDeltaG()
+// fills a third table with ΔS·T/1000 − ΔH, the magnitude of ΔG at the ΔG temperature; and
+// ComputePrimingSites::CalcFalsePrimerStats sums those tables and writes Tm and dG.
+// _deltaS_DNAini is 0.0108 and the salt and primer concentrations come from the Create Primer Pairs
+// dialog (50 mM, 250 nM).
+const SALT: f64 = 0.05;      // [Na+] in M (PCRConditionData salt field, mM)
+const PRIMER_CT: f64 = 250e-9; // primer concentration in M; the Tm uses Ct/2
+const DG_TEMP_C: f64 = 25.0; // ΔG temperature
+const DS_INI: f64 = 0.0108;  // _deltaS_DNAini
 
 fn complement(b: u8) -> u8 {
     match b { b'A' => b'T', b'T' => b'A', b'G' => b'C', b'C' => b'G', _ => b'N' }
@@ -22,26 +34,26 @@ fn upper(p: &[u8]) -> Vec<u8> {
     p.iter().map(|b| b.to_ascii_uppercase()).collect()
 }
 
-/// ΔG at 25 °C of a perfectly paired stretch (kcal/mol).
+/// ΔG of a perfectly paired stretch at the ΔG temperature (kcal/mol), without the initiation term.
 fn duplex_dg(s: &[u8]) -> f64 {
-    nn_sums(s).map_or(0.0, |(dh, ds)| dh - 298.15 * ds / 1000.0)
+    nn_sums(s).map_or(0.0, |(dh, ds)| dh - (DG_TEMP_C + 273.15) * ds / 1000.0)
 }
 
-/// Tm as SeqBuilder shows it: salt 0.368·(N−1)·ln[Na+] at 50 mM, primer 250 nM taken as Ct/2.
-/// Matches SeqBuilder to 0.1 °C on eight primers of 16-38 bases.
+/// Tm: ΣΔH·1000 / (0.368·(N−1)·ln[Na+] + ΣΔS + ΔS_ini + R·ln(Ct/2)) − 273.15, as
+/// CalcFalsePrimerStats computes it for a perfectly matched primer.
 pub fn tm(p: &[u8]) -> f64 {
     let p = upper(p);
     let Some((dh, ds)) = nn_sums(&p) else { return f64::NAN };
-    let (na, ct) = (0.05f64, 250e-9f64);
-    dh * 1000.0 / (ds + 0.368 * (p.len() - 1) as f64 * na.ln() + 1.987 * (ct / 2.0).ln()) - 273.15
+    let denom = 0.368 * (p.len() - 1) as f64 * SALT.ln() + ds + DS_INI + 1.987 * (PRIMER_CT / 2.0).ln();
+    dh * 1000.0 / denom - 273.15
 }
 
-// ponytail: the +0.27 kcal/mol is fitted to SeqBuilder's dG column (exact on six primers), its source is unknown.
-/// The whole primer's duplex ΔG at 25 °C, SeqBuilder's dG column.
+/// The whole primer's ΔG, SeqBuilder's dG column: the nearest-neighbour sum at the ΔG temperature plus
+/// the initiation term ΔS_ini × T(°C) = 0.27 kcal/mol at 25 °C.
 pub fn dg(p: &[u8]) -> f64 {
     let p = upper(p);
     if nn_sums(&p).is_none() { return f64::NAN; }
-    duplex_dg(&p) + 0.27
+    duplex_dg(&p) + DS_INI * DG_TEMP_C
 }
 
 /// Two primers paired antiparallel: `offset` is where `b`'s 3' end sits under `a` (index in `a`).
@@ -116,9 +128,18 @@ pub fn hairpin(p: &[u8]) -> Option<Hairpin> {
     best
 }
 
-// ponytail: "BAD!" splits SeqBuilder's -2.3 and -3.3 (bad) from -0.2 and -0.0 (fine); -2 is a guess between.
-pub fn is_bad(dg: f64) -> bool {
-    dg <= -2.0
+/// A hairpin is marked "(BAD!)" when its ΔG reaches −1.0 (DisplayObjMisprimingHairpin::DrawHairpin
+/// tests the stored magnitude against 1.0).
+pub fn hairpin_is_bad(dg: f64) -> bool {
+    dg <= -1.0
+}
+
+// ponytail: DrawDimer also has a softer rule that looks at the 3'-terminal pair; only the plain
+// threshold is implemented, so a dimer between -2.07 and -2.53 may be marked differently.
+/// A dimer is marked "(BAD!)" when it is more stable than a single GC step, which is the threshold
+/// DrawDimer reads out of the ΔG table (ΔG(GC) at the ΔG temperature).
+pub fn dimer_is_bad(dg: f64) -> bool {
+    dg < duplex_dg(b"GC")
 }
 
 /// Where the primer's 3'-terminal 12 bases (SeqBuilder's "Unique at 3' for 12 bp") match the sequence, on
@@ -132,17 +153,17 @@ pub fn binding_sites(seq: &[u8], primer: &[u8], reverse: bool) -> Vec<usize> {
     seq.windows(k).enumerate().filter(|(_, w)| *w == target.as_slice()).map(|(i, _)| i + three_prime).collect()
 }
 
-/// Product Tm: 81.5 + 16.6·log([Na+]/(1 + 0.7[Na+])) + 0.41·%GC − 500/N at 50 mM. Of the usual product
-/// formulas this one alone gives all of SeqBuilder's Prod Tm and Prod dTm values (84.2/26.4, 84.3/27.0).
+/// Product Tm: 81.5 + 16.6·log10[Na+] + 41·GC fraction − 675/N, the GC-based formula
+/// CalcFalsePrimerStats uses.
 pub fn product_tm(product: &[u8]) -> f64 {
     let n = product.len() as f64;
-    let gc = product.iter().filter(|b| matches!(b.to_ascii_uppercase(), b'G' | b'C')).count() as f64 * 100.0 / n;
-    let na = 0.05f64;
-    81.5 + 16.6 * (na / (1.0 + 0.7 * na)).log10() + 0.41 * gc - 500.0 / n
+    let gc = product.iter().filter(|b| matches!(b.to_ascii_uppercase(), b'G' | b'C')).count() as f64 / n;
+    81.5 + 16.6 * SALT.log10() + 41.0 * gc - 675.0 / n
 }
 
-/// The pair table of the Primer Design view: (Prod Tm, Pri dTm, Ta OPT, Prod dTm).
-/// Ta OPT is Rychlik's 0.3·Tm(lower primer) + 0.7·Tm(product) − 14.9.
+/// The pair table of the Primer Design view: (Prod Tm, Pri dTm, Ta OPT, Prod dTm), where
+/// SeqDataHolder::ComputeProductAnnealingTemperature gives Ta OPT = 0.7·ProdTm + 0.3·min(Tm) − 14.9
+/// and Prod dTm = ProdTm − min(Tm).
 pub fn pair_values(forward: &[u8], reverse: &[u8], product: &[u8]) -> (f64, f64, f64, f64) {
     let (tf, tr, tp) = (tm(forward), tm(reverse), product_tm(product));
     let low = tf.min(tr);
@@ -162,6 +183,17 @@ mod tests {
         assert_eq!(format!("{:.1}", tm(rev)), "77.7");
     }
 
+    /// The nearest-neighbour tables read out of SeqBuilder's _deltaH_DNA and _deltaS_DNA.
+    #[test]
+    fn nn_tables_are_santalucia() {
+        assert_eq!(nn_sums(b"CG"), Some((-10.6, -27.2)));
+        assert_eq!(nn_sums(b"GC"), Some((-9.8, -24.4)));
+        assert_eq!(nn_sums(b"AT"), Some((-7.2, -20.4)));
+        assert_eq!(nn_sums(b"TA"), Some((-7.2, -21.3)));
+        // the dimer threshold DrawDimer reads from the table
+        assert_eq!(format!("{:.3}", duplex_dg(b"GC")), "-2.525");
+    }
+
     /// Values SeqBuilder's Primer Design view showed for pBR322 pairs and ALDH2.
     #[test]
     fn matches_seqbuilder_primer_design() {
@@ -172,11 +204,11 @@ mod tests {
         assert_eq!(d.offset, 16); // the 3'-end CCGG, as SeqBuilder draws it
         let h = hairpin(r1483).unwrap();
         assert_eq!((h.stem, format!("{:.1}", h.dg)), (4, "-2.3".to_string())); // "Hairpin 4 bp, -2.3 kc/m (BAD!)"
-        assert!(is_bad(d.dg) && is_bad(h.dg));
+        assert!(dimer_is_bad(d.dg) && hairpin_is_bad(h.dg));
         assert!(hairpin(f704).is_none()); // "No hairpins > 1 bp"
         let h = hairpin(b"CCGCCTCCCGGGTTCATGCCATTCTCCTGCCTCAGCCT").unwrap();
         assert_eq!((h.stem, format!("{:.1}", h.dg)), (3, "-0.2".to_string())); // ALDH2 "Hairpin 3 bp, -0.2 kc/m"
-        assert!(!is_bad(h.dg));
+        assert!(!hairpin_is_bad(h.dg)); // -0.2 is above the -1.0 hairpin threshold
 
         let seq = std::fs::read("testdata/pBR322.gb").unwrap();
         let seq = gb_io::reader::parse_slice(&seq).unwrap().remove(0).seq;
