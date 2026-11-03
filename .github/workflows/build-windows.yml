@@ -19,6 +19,10 @@ jobs:
         with:
           workspaces: seqbuilder-rs
 
+      - name: Run tests
+        working-directory: seqbuilder-rs
+        run: cargo test
+
       - name: Build release binary
         working-directory: seqbuilder-rs
         run: cargo build --release
