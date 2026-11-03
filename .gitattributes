@@ -1,0 +1,9 @@
+# Text files check out with LF everywhere (Windows CI included).
+* text=auto eol=lf
+
+# Binary DNASTAR formats — never convert line endings.
+*.sbd -text
+*.ezd -text
+*.pri -text
+# SeqBuilder Pro exports GenBank with CRLF; keep those bytes as-is.
+*.gbk -text
