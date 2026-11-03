@@ -1,0 +1,30 @@
+name: Build Windows portable
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: seqbuilder-rs
+
+      - name: Build release binary
+        working-directory: seqbuilder-rs
+        run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seqbuilder-rs-windows-portable
+          path: seqbuilder-rs/target/release/seqbuilder-rs.exe
