@@ -12,6 +12,9 @@ use std::f32::consts::{PI, TAU};
 use std::path::{Path, PathBuf};
 
 const DNASTAR_DIR: &str = "/Applications/DNASTAR/Lasergene19";
+// Bundled copies of the enzyme data so the app runs standalone (e.g. portable Windows build).
+const EZD_BUNDLED: &[u8] = include_bytes!("../assets/Enzymes.ezd");
+const SEL_BUNDLED: &str = include_str!("../assets/EnzymeSelectors.sel");
 // New .sbd documents start from this SeqBuilder Pro document (New DNA "acgt" with one feature).
 const SBD_TEMPLATE: &[u8] = include_bytes!("../testdata/template.sbd");
 
@@ -740,15 +743,12 @@ impl App {
         }
     }
 
-    fn load_enzymes(&mut self, ezd: &Path, sel: &Path) {
-        match std::fs::read(ezd) {
-            Ok(b) => self.enz = enzymes::parse_ezd(&b),
-            Err(e) => self.error = Some(format!("{}: {e}", ezd.display())),
-        }
-        match std::fs::read_to_string(sel).map_err(|e| e.to_string()).and_then(|t| enzymes::parse_sel(&t)) {
+    fn load_enzymes(&mut self, ezd: &[u8], sel: &str) {
+        match enzymes::parse_sel(sel) {
             Ok(s) => self.sels = s,
-            Err(e) => self.error = Some(format!("{}: {e}", sel.display())),
+            Err(e) => self.error = Some(e),
         }
+        self.enz = enzymes::parse_ezd(ezd);
         self.shown.clear();
         self.compute_hits();
     }
@@ -802,7 +802,9 @@ impl App {
                 if ui.button("Open Enzyme Files…").clicked() {
                     let ezd = rfd::FileDialog::new().add_filter("Enzyme file", &["ezd"]).pick_file();
                     let sel = ezd.as_ref().and_then(|_| rfd::FileDialog::new().add_filter("Selector file", &["sel"]).pick_file());
-                    if let (Some(e), Some(s)) = (ezd, sel) { self.load_enzymes(&e, &s); }
+                    if let (Some(e), Some(s)) = (ezd, sel) {
+                        if let (Ok(b), Ok(t)) = (std::fs::read(e), std::fs::read_to_string(s)) { self.load_enzymes(&b, &t); }
+                    }
                 }
             });
             ui.menu_button("Edit", |ui| {
@@ -1809,6 +1811,40 @@ impl eframe::App for App {
     }
 }
 
+/// Enzyme data source resolution, mirroring SeqBuilder Pro: a live DNASTAR install wins,
+/// with the bundled copies as fallback so portable builds run on machines without DNASTAR.
+/// `SEQBUILDER_ENZYMES` overrides the install directory.
+fn enzyme_dir() -> Option<PathBuf> {
+    if let Ok(d) = std::env::var("SEQBUILDER_ENZYMES") {
+        let d = PathBuf::from(d);
+        if d.join("Enzymes.ezd").exists() { return Some(d); }
+    }
+    let d = PathBuf::from(DNASTAR_DIR);
+    d.join("Enzymes.ezd").exists().then_some(d)
+}
+
+/// User-edited selectors live where DataManager's DMConfig.cfg points.
+fn user_selectorfile() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    std::fs::read_to_string(format!("{home}/Library/Preferences/DNASTAR/DataManager/1.0/DMConfig.cfg")).ok()
+        .and_then(|c| c.lines().find_map(|l| l.strip_prefix("selectorfile=").map(PathBuf::from)))
+        .filter(|p| p.exists())
+}
+
+fn enzyme_ezd() -> Vec<u8> {
+    enzyme_dir().and_then(|d| std::fs::read(d.join("Enzymes.ezd")).ok()).unwrap_or_else(|| EZD_BUNDLED.to_vec())
+}
+
+fn enzyme_sel() -> String {
+    if let Some(p) = user_selectorfile() {
+        if let Ok(s) = std::fs::read_to_string(p) { return s; }
+    }
+    if let Some(d) = enzyme_dir() {
+        if let Ok(s) = std::fs::read_to_string(d.join("EnzymeSelectors.sel")) { return s; }
+    }
+    SEL_BUNDLED.to_string()
+}
+
 fn main() -> eframe::Result {
     // seqbuilder-rs --export-genbank in.sbd out.gb  (batch conversion, no window)
     let args: Vec<String> = std::env::args().collect();
@@ -1820,13 +1856,7 @@ fn main() -> eframe::Result {
         }
     }
     let mut app = App { zoom: 1.0, map_title: Some(String::new()), primer_options: [true; 5], ..Default::default() };
-    let dir = std::env::var("SEQBUILDER_ENZYMES").map(PathBuf::from).unwrap_or_else(|_| DNASTAR_DIR.into());
-    // User-edited selectors live where DataManager's DMConfig.cfg points; fall back to the shipped file.
-    let home = std::env::var("HOME").unwrap_or_default();
-    let user_sel = std::fs::read_to_string(format!("{home}/Library/Preferences/DNASTAR/DataManager/1.0/DMConfig.cfg")).ok()
-        .and_then(|c| c.lines().find_map(|l| l.strip_prefix("selectorfile=").map(PathBuf::from)))
-        .filter(|p| p.exists());
-    app.load_enzymes(&dir.join("Enzymes.ezd"), &user_sel.unwrap_or_else(|| dir.join("EnzymeSelectors.sel")));
+    app.load_enzymes(&enzyme_ezd(), &enzyme_sel());
     if let Some(p) = std::env::args().nth(1) { app.open(Path::new(&p)); }
     let opts = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]), ..Default::default() };
     eframe::run_native("SeqBuilder RS", opts, Box::new(|_| Ok(Box::new(app))))
@@ -2112,13 +2142,11 @@ mod tests {
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
+    /// Runs against the bundled shipped files so it is deterministic on every machine/CI.
     #[test]
     fn dnastar_unique_six_cutters_on_pbr322() {
-        let dir = Path::new(DNASTAR_DIR);
-        let (Ok(ezd), Ok(sel)) = (std::fs::read(dir.join("Enzymes.ezd")), std::fs::read_to_string(dir.join("EnzymeSelectors.sel"))) else {
-            eprintln!("DNASTAR not installed, skipping");
-            return;
-        };
+        let ezd = EZD_BUNDLED;
+        let sel = SEL_BUNDLED;
         let mut app = App::default();
         app.enz = enzymes::parse_ezd(&ezd);
         app.sels = enzymes::parse_sel(&sel).unwrap();
