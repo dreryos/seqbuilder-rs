@@ -15,6 +15,7 @@
 // complement features.
 
 use crate::complement;
+use crate::genetic::GeneticCode;
 
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum StartFilter {
@@ -45,8 +46,8 @@ pub struct Orf {
     pub len_aa: usize,
 }
 
-fn is_stop(c: &[u8]) -> bool { matches!(c, b"TAA" | b"TAG" | b"TGA") }
-fn is_start(c: &[u8]) -> bool { c == b"ATG" }
+fn is_stop(c: &[u8], code: &GeneticCode) -> bool { code.is_stop(c) }
+fn is_start(c: &[u8], code: &GeneticCode) -> bool { code.is_start(c) }
 
 /// True when `i` lies inside the (possibly origin-wrapping) span of `o`.
 #[allow(dead_code)] // exercised by the orf unit tests; UI hit-testing uses screen rects
@@ -60,18 +61,18 @@ pub fn span_len(o: &Orf, n: usize) -> usize {
 }
 
 /// All ORFs of `seq` under `opts`, sorted for display: strand (+ then -), frame, start.
-pub fn find_orfs(seq: &[u8], circular: bool, opts: &OrfOpts) -> Vec<Orf> {
+pub fn find_orfs(seq: &[u8], circular: bool, opts: &OrfOpts, code: &GeneticCode) -> Vec<Orf> {
     let n = seq.len();
     if n < 3 { return vec![] }
     let mut out: Vec<Orf> = Vec::new();
     // Forward strand: raw spans are already plus-strand spans.
-    for (s, e, frame, start_codon, aa) in scan(seq, circular, opts) {
+    for (s, e, frame, start_codon, aa) in scan(seq, circular, opts, code) {
         let (start, end) = circle_span(n, s, e);
         out.push(Orf { start, end, strand: 1, frame, start_codon, len_aa: aa });
     }
     // Reverse strand: scan the reverse complement, then map spans back to plus coordinates.
     let rc: Vec<u8> = seq.iter().rev().map(|&b| complement(b)).collect();
-    for (s, e, f, start_codon, aa) in scan(&rc, circular, opts) {
+    for (s, e, f, start_codon, aa) in scan(&rc, circular, opts, code) {
         let (start, end) = reverse_span(n, s, e);
         out.push(Orf { start, end, strand: -1, frame: f + 3, start_codon, len_aa: aa });
     }
@@ -100,7 +101,7 @@ fn reverse_span(n: usize, s: usize, e: usize) -> (usize, usize) {
 /// Scan one strand (the caller passes the reverse complement for the minus
 /// strand) collecting raw spans (start < n, end <= start + n): frame 1..=3
 /// within the strand, start-codon flag, amino-acid length.
-fn scan(seq: &[u8], circular: bool, opts: &OrfOpts) -> Vec<(usize, usize, u8, bool, usize)> {
+fn scan(seq: &[u8], circular: bool, opts: &OrfOpts, code: &GeneticCode) -> Vec<(usize, usize, u8, bool, usize)> {
     let n = seq.len();
     // uppercase so lowercase GenBank sequence blocks parse the same (codons are case-insensitive)
     let up: Vec<u8> = seq.iter().map(|b| b.to_ascii_uppercase()).collect();
@@ -122,7 +123,7 @@ fn scan(seq: &[u8], circular: bool, opts: &OrfOpts) -> Vec<(usize, usize, u8, bo
         let mut stops: Vec<usize> = Vec::new();
         let mut i = f;
         while i + 3 <= walk_limit {
-            if is_stop(&ext[i..i + 3]) { stops.push(i); }
+            if is_stop(&ext[i..i + 3], code) { stops.push(i); }
             i += 3;
         }
         let last_codon_end = f + (walk_limit - f) / 3 * 3;
@@ -142,7 +143,7 @@ fn scan(seq: &[u8], circular: bool, opts: &OrfOpts) -> Vec<(usize, usize, u8, bo
             regions.retain(|&(rs, _, _)| rs < n);
             for r in &mut regions {
                 r.1 = r.1.min(r.0 + n);
-                r.2 = r.2 && r.1 + 3 <= m && is_stop(&ext[r.1..r.1 + 3]);
+                r.2 = r.2 && r.1 + 3 <= m && is_stop(&ext[r.1..r.1 + 3], code);
             }
         }
         for (rs, re, closed) in regions {
@@ -151,7 +152,7 @@ fn scan(seq: &[u8], circular: bool, opts: &OrfOpts) -> Vec<(usize, usize, u8, bo
             if !matches!(opts.starts, StartFilter::Without) {
                 let mut a = rs;
                 while a + 3 <= re && a < n {
-                    if is_start(&ext[a..a + 3]) {
+                    if is_start(&ext[a..a + 3], code) {
                         let e = if closed { re + 3 } else { re };
                         let aa = if closed { (e - a) / 3 - 1 } else { (e - a).div_ceil(3) };
                         if aa >= opts.min_aa { out.push((a, e, f as u8 + 1, true, aa)); }
@@ -161,7 +162,7 @@ fn scan(seq: &[u8], circular: bool, opts: &OrfOpts) -> Vec<(usize, usize, u8, bo
             }
             // ORFs without a start codon: the inter-stop region itself
             if !matches!(opts.starts, StartFilter::With) {
-                let begins_start = re - rs >= 3 && is_start(&ext[rs..rs + 3]);
+                let begins_start = re - rs >= 3 && is_start(&ext[rs..rs + 3], code);
                 if !begins_start {
                     let aa = (re - rs) / 3;
                     if aa >= opts.min_aa { out.push((rs, re, f as u8 + 1, false, aa)); }
@@ -183,7 +184,7 @@ mod tests {
     use super::*;
 
     fn orfs(seq: &str, starts: StartFilter, min_aa: usize) -> Vec<Orf> {
-        find_orfs(seq.as_bytes(), false, &OrfOpts { min_aa, starts })
+        find_orfs(seq.as_bytes(), false, &OrfOpts { min_aa, starts }, &GeneticCode::standard())
     }
 
     #[test]
@@ -230,10 +231,10 @@ mod tests {
     fn reverse_strand_maps_to_plus_coordinates() {
         // plus = TTAAAACAT, whose reverse complement is ATGTTTTAA:
         // rc frame 1 reads ATG TTT TAA, a 2-aa ORF covering the whole circle
-        let v = find_orfs(b"TTAAAACAT", true, &OrfOpts { min_aa: 1, starts: StartFilter::With });
+        let v = find_orfs(b"TTAAAACAT", true, &OrfOpts { min_aa: 1, starts: StartFilter::With }, &GeneticCode::standard());
         assert!(v.iter().any(|o| o.strand < 0 && o.len_aa == 2), "reverse ORF over the whole circle");
         // rc [3, 12) of a 12-mer maps to plus [0, 9)
-        let v = find_orfs(b"TTAAAACATTTT", true, &OrfOpts { min_aa: 1, starts: StartFilter::With });
+        let v = find_orfs(b"TTAAAACATTTT", true, &OrfOpts { min_aa: 1, starts: StartFilter::With }, &GeneticCode::standard());
         let rev: Vec<&Orf> = v.iter().filter(|o| o.strand < 0).collect();
         assert!(rev.iter().any(|o| o.start == 0 && o.end == 9), "rc [3,12) -> plus [0,9), got {:?}", rev);
     }
@@ -244,7 +245,7 @@ mod tests {
         // the ATG's ORF is closed by the stop after the origin, so it wraps (start > end).
         // TAA GGG CCC TTT TTT CCC CCC ATG | TAA...
         let seq = b"TAAGGGCCCTTTTTTCCCCCATG";
-        let v = find_orfs(seq, true, &OrfOpts { min_aa: 1, starts: StartFilter::With });
+        let v = find_orfs(seq, true, &OrfOpts { min_aa: 1, starts: StartFilter::With }, &GeneticCode::standard());
         assert!(v.iter().any(|o| o.start > o.end), "ORF crossing the origin wraps, got {v:?}");
         // and the wrapped ORF covers both its parts
         let w = v.iter().find(|o| o.start > o.end).unwrap();
@@ -255,7 +256,7 @@ mod tests {
     fn circular_no_duplicate_regions() {
         // the same circle scanned twice (doubled sequence) must not duplicate ORFs
         let seq = b"ATGAAATAACCCGGGTTT";
-        let v = find_orfs(seq, true, &OrfOpts { min_aa: 1, starts: StartFilter::Both });
+        let v = find_orfs(seq, true, &OrfOpts { min_aa: 1, starts: StartFilter::Both }, &GeneticCode::standard());
         let mut keys: Vec<(i8, u8, usize, usize, bool)> =
             v.iter().map(|o| (o.strand, o.frame, o.start, o.end, o.start_codon)).collect();
         keys.sort();
@@ -268,7 +269,7 @@ mod tests {
         // every ORF's frame matches its start offset from the strand's origin
         let seq = b"ATGAAATAACCCGGGTTTAAAGGGCCCATG";
         let n = seq.len();
-        for o in find_orfs(seq, false, &OrfOpts { min_aa: 1, starts: StartFilter::Both }) {
+        for o in find_orfs(seq, false, &OrfOpts { min_aa: 1, starts: StartFilter::Both }, &GeneticCode::standard()) {
             if o.strand > 0 {
                 assert_eq!(((o.start % 3) + 1) as u8, o.frame, "{o:?}");
             } else if o.end - o.start < n {
@@ -287,7 +288,7 @@ mod tests {
         let seq: Vec<u8> = gb.split('\n').skip_while(|l| !l.starts_with("ORIGIN")).skip(1)
             .flat_map(|l| l.chars().filter(|c| c.is_ascii_alphabetic()))
             .map(|c| c as u8).collect();
-        let v = find_orfs(&seq, true, &OrfOpts { min_aa: 100, starts: StartFilter::With });
+        let v = find_orfs(&seq, true, &OrfOpts { min_aa: 100, starts: StartFilter::With }, &GeneticCode::from_ncbi(11).unwrap());
         assert!(v.iter().any(|o| o.strand < 0 && o.len_aa >= 286), "bla ORF (286 aa, reverse) not found in {:?}", v.iter().map(|o| (o.strand, o.len_aa)).collect::<Vec<_>>());
     }
 }

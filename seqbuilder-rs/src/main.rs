@@ -2,12 +2,14 @@
 // feature table with tabs, Style/Enzymes and Settings/Details side panels.
 mod enzymes;
 mod genbank;
+mod genetic;
 mod orf;
 mod primers;
 mod sbd;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use enzymes::{Enzyme, Selector};
+use genetic::GeneticCode;
 use orf::{Orf, OrfOpts};
 use std::collections::HashSet;
 use std::f32::consts::{PI, TAU};
@@ -352,33 +354,22 @@ fn fragments(sites: &[usize], len: usize, circular: bool) -> Vec<usize> {
     out
 }
 
-/// Standard genetic code, TCAG order.
-const CODONS: &[u8; 64] = b"FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG";
-
-fn translate(codon: &[u8]) -> char {
-    let n = |b: u8| match b.to_ascii_uppercase() { b'T' | b'U' => Some(0), b'C' => Some(1), b'A' => Some(2), b'G' => Some(3), _ => None };
-    match (n(codon[0]), n(codon[1]), n(codon[2])) {
-        (Some(a), Some(b), Some(c)) => CODONS[a * 16 + b * 4 + c] as char,
-        _ => 'X',
-    }
-}
-
 /// The amino acid of reading frame `k` (0-2 forward from base 1, 3-5 reverse from the last base)
 /// whose codon has base `i` in the middle, if there is one.
-fn frame_residue(seq: &[u8], i: usize, k: usize) -> Option<char> {
+fn frame_residue(seq: &[u8], i: usize, k: usize, code: &GeneticCode) -> Option<char> {
     if i == 0 || i + 1 >= seq.len() { return None; }
     let codon = &seq[i - 1..=i + 1];
     if k < 3 {
-        ((i - 1) % 3 == k).then(|| translate(codon))
+        ((i - 1) % 3 == k).then(|| code.translate(codon))
     } else {
         let j = seq.len() - 2 - i; // codon start on the reverse strand
-        (j % 3 == k - 3).then(|| translate(&codon.iter().rev().map(|&b| complement(b)).collect::<Vec<u8>>()))
+        (j % 3 == k - 3).then(|| code.translate(&codon.iter().rev().map(|&b| complement(b)).collect::<Vec<u8>>()))
     }
 }
 
 /// The protein of an ORF in one-letter code, reading through the origin when it wraps.
 /// The minus-strand span reads descending in plus coordinates, start codon at the high end.
-fn orf_protein(d: &Doc, o: &Orf) -> String {
+fn orf_protein(d: &Doc, o: &Orf, code: &GeneticCode) -> String {
     let n = d.seq.len();
     let span = orf::span_len(o, n);
     let idx: Vec<usize> = (0..span).map(|k| (o.start + k) % n).collect();
@@ -386,7 +377,7 @@ fn orf_protein(d: &Doc, o: &Orf) -> String {
     if o.strand < 0 {
         bases = bases.iter().rev().map(|&b| complement(b)).collect();
     }
-    bases.chunks(3).filter(|c| c.len() == 3).map(|c| translate(c)).collect()
+    bases.chunks(3).filter(|c| c.len() == 3).map(|c| code.translate(c)).collect()
 }
 
 /// One feature span on a straight track (Linear view), in its Style tab shape.
@@ -494,6 +485,10 @@ struct App {
     orfs: Vec<Orf>,
     orf_open: bool,          // options dialog
     orf_sel: Option<usize>,  // selected ORF index into self.orfs
+    // Sequence > Select Genetic Code (GenBank /transl_table is picked up on open)
+    gen_code: GeneticCode,
+    gen_open: bool,          // Genetic Code editor dialog
+    gen_pick: Option<usize>, // codon index picked in the editor
 }
 
 impl App {
@@ -501,10 +496,18 @@ impl App {
         match load(path) {
             Ok(d) => {
                 self.view = if d.circular { View::Circular } else { View::Sequence };
+                // GenBank CDS /transl_table qualifiers select the document's
+                // genetic code, as SeqBuilder Pro picks up (e.g. 11 for bacteria).
+                if let Some(t) = d.feats.iter().find_map(|f| {
+                    f.quals.iter().find_map(|q| q.strip_prefix("transl_table=")).and_then(|v| v.trim().parse::<u8>().ok())
+                }) {
+                    if let Some(c) = GeneticCode::from_ncbi(t) { self.gen_code = c; }
+                }
                 self.doc = Some(d);
                 self.error = None;
                 self.sel = None;
                 self.sel_feat = None;
+                self.orf_sel = None;
                 self.compute_hits();
                 // SeqBuilder opens a sequence showing its default selector's enzymes.
                 if let Some(id) = self.sels.iter().find(|s| s.name.contains("Unique Six+")).map(|s| s.id) { self.apply_selector(id); }
@@ -564,7 +567,7 @@ impl App {
             ui.add_space(6.0);
             ui.label(egui::RichText::new("Protein (one letter):").italics());
             ui.separator();
-            let protein = orf_protein(d, o);
+            let protein = orf_protein(d, o, &self.gen_code);
             for chunk in protein.as_bytes().chunks(60) {
                 ui.monospace(String::from_utf8_lossy(chunk).into_owned());
             }
@@ -804,10 +807,10 @@ impl App {
     }
 
     fn compute_hits(&mut self) {
-        let opts = self.orf_opts.clone();
+        let (opts, code) = (self.orf_opts.clone(), self.gen_code.clone());
         if let Some(d) = &mut self.doc {
             d.hits = self.enz.iter().map(|e| find_sites(&d.seq, d.circular, &e.site, self.potential)).collect();
-            self.orfs = orf::find_orfs(&d.seq, d.circular, &opts);
+            self.orfs = orf::find_orfs(&d.seq, d.circular, &opts, &code);
         }
         self.refresh_sites();
     }
@@ -890,6 +893,15 @@ impl App {
                 if ui.add_enabled(circular.is_some(), egui::Button::selectable(circular == Some(true), "Circular")).clicked() { self.set_circular(true); }
                 ui.separator();
                 if ui.button("ORF Detection Options…").clicked() { self.orf_open = true; }
+                ui.menu_button("Select Genetic Code", |ui| {
+                    for c in genetic::NCBI_CODES {
+                        if ui.add(egui::Button::selectable(self.gen_code.id == c.id, format!("{}. {}", c.id, c.name))).clicked() {
+                            self.gen_code = GeneticCode::from_ncbi(c.id).unwrap();
+                            self.compute_hits();
+                        }
+                    }
+                });
+                if ui.button("Edit Genetic Code…").clicked() { self.gen_open = true; }
             });
             ui.menu_button("Format", |ui| {
                 ui.label("Residue Grouping");
@@ -1757,7 +1769,7 @@ impl App {
                 if let Some(l) = frame_line {
                     for i in a..b {
                         for k in 0..6 {
-                            let Some(aa) = frame_residue(&doc.seq, i, k) else { continue };
+                            let Some(aa) = frame_residue(&doc.seq, i, k, &self.gen_code) else { continue };
                             let c = if aa == '*' { Color32::RED } else { fg };
                             p.text(Pos2::new(x(i), line_y(l + k)), Align2::LEFT_TOP, aa.to_string(), font.clone(), c);
                         }
@@ -1858,6 +1870,7 @@ impl eframe::App for App {
                 self.tab = match t.as_str() { "minimap" => Tab::Minimap, "primers" => Tab::Primers, "history" => Tab::History, "comment" => Tab::Comment, "sites" => Tab::SiteSummary, _ => Tab::Features };
             }
             if let Ok(t) = std::env::var("SEQBUILDER_TRACKS") { (self.complement, self.translations) = (t.contains("strand"), t.contains("frames")); }
+            if std::env::var("SEQBUILDER_GENOPEN").is_ok() { self.gen_open = true; }
             if let Some(c) = std::env::var("SEQBUILDER_CARET").ok().and_then(|v| v.parse().ok()) { self.caret = Some(c); }
         }
 
@@ -1930,6 +1943,64 @@ impl eframe::App for App {
                 if ui.button("OK").clicked() { self.orf_open = false; }
             });
             self.orf_open &= open;
+        }
+        if self.gen_open {
+            let mut open = true;
+            let mut recompute = false;
+            egui::Window::new("Edit Genetic Code").open(&mut open).default_size([560.0, 430.0]).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Description");
+                    egui::ComboBox::from_id_salt("gen_code_choice").selected_text(self.gen_code.name.clone()).width(340.0).show_ui(ui, |ui| {
+                        for c in genetic::NCBI_CODES {
+                            if ui.selectable_label(self.gen_code.id == c.id, format!("{}. {}", c.id, c.name)).clicked() {
+                                self.gen_code = GeneticCode::from_ncbi(c.id).unwrap();
+                                recompute = true;
+                            }
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.label("Edit Genetic Code: click a codon, then pick its amino acid or start below.");
+                ui.separator();
+                egui::Grid::new("codon_grid").num_columns(16).spacing([2.0, 2.0]).show(ui, |ui| {
+                    for i in 0..64usize {
+                        let codon = String::from_utf8_lossy(&genetic::index_codon(i)).into_owned();
+                        let label = format!("{codon} {}{}", self.gen_code.aa_at(i), if self.gen_code.is_start_index(i) { "•" } else { "" });
+                        let text = egui::RichText::new(label).monospace().size(10.0);
+                        let btn = if self.gen_pick == Some(i) { egui::Button::new(text.strong()) } else { egui::Button::new(text) };
+                        if ui.add_sized([40.0, 20.0], btn).clicked() { self.gen_pick = Some(i); }
+                        if (i + 1) % 16 == 0 { ui.end_row(); }
+                    }
+                });
+                ui.separator();
+                if let Some(i) = self.gen_pick {
+                    let codon = String::from_utf8_lossy(&genetic::index_codon(i)).into_owned();
+                    ui.label(format!("Codon {codon}:"));
+                    ui.horizontal(|ui| {
+                        for aa in b"ACDEFGHIKLMNPQRSTVWY*" {
+                            let a = *aa as char;
+                            if ui.small_button(a.to_string()).clicked() {
+                                self.gen_code.set_aa(i, a);
+                                self.gen_code.id = 0;
+                                recompute = true;
+                            }
+                        }
+                    });
+                    let mut start = self.gen_code.is_start_index(i);
+                    if ui.checkbox(&mut start, "Start codon (initiation)").changed() {
+                        self.gen_code.toggle_start(i);
+                        self.gen_code.id = 0;
+                        recompute = true;
+                    }
+                } else {
+                    ui.weak("Pick a codon above to edit it.");
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("OK").clicked() { self.gen_open = false; }
+                });
+            });
+            self.gen_open &= open;
+            if recompute { self.compute_hits(); }
         }
     }
 }
@@ -2216,12 +2287,23 @@ mod tests {
     }
 
     #[test]
+    fn genbank_transl_table_selects_code() {
+        let mut app = App::default();
+        app.open(Path::new("testdata/pBR322.gb"));
+        assert_eq!(app.gen_code.id, 11, "bacterial code picked from /transl_table");
+        assert!(!app.orfs.is_empty(), "ORFs computed on open");
+        // the bla gene's 286-aa ORF is on the reverse strand
+        assert!(app.orfs.iter().any(|o| o.strand < 0 && o.len_aa >= 286));
+    }
+
+    #[test]
     fn reading_frames() {
         let seq = b"ATGAAATAG"; // M K * in frame 1
-        let f1: String = (0..seq.len()).filter_map(|i| frame_residue(seq, i, 0)).collect();
+        let code = GeneticCode::standard();
+        let f1: String = (0..seq.len()).filter_map(|i| frame_residue(seq, i, 0, &code)).collect();
         assert_eq!(f1, "MK*");
         // reverse strand CTATTTCAT read from the last base: L F H
-        let r1: String = (0..seq.len()).rev().filter_map(|i| frame_residue(seq, i, 3)).collect();
+        let r1: String = (0..seq.len()).rev().filter_map(|i| frame_residue(seq, i, 3, &code)).collect();
         assert_eq!(r1, "LFH");
     }
 
