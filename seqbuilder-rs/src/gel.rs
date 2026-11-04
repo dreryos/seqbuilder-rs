@@ -68,10 +68,13 @@ pub fn parse_gelbox_tdl(text: &str) -> Vec<GelBox> {
 
 /// Fragment lengths of a digest: top-strand cut positions (already resolved
 /// through `cloning::hit_top_cut`, forward and reverse hits included) for a
-/// circular or linear molecule. A circular molecule cut at 0 or 1 points
-/// stays whole.
+/// circular or linear molecule. On a linear molecule, cuts at 0 or `len` are
+/// the molecule's own ends, not cuts, and are excluded; a circular molecule
+/// cut at 0 or 1 points stays whole. An empty sequence has no fragments.
 pub fn digest_fragments(seq_len: usize, circular: bool, cuts: &[usize]) -> Vec<u32> {
+    if seq_len == 0 { return vec![]; }
     let mut cuts: Vec<usize> = cuts.iter().copied().filter(|&c| c < seq_len).collect();
+    if !circular { cuts.retain(|&c| c > 0); }
     cuts.sort_unstable();
     cuts.dedup();
     if cuts.is_empty() { return vec![seq_len as u32]; }
@@ -143,10 +146,15 @@ mod tests {
         assert_eq!(digest_fragments(100, true, &[30, 70]), vec![40, 60]);
         // circular cut at 0 only: whole molecule
         assert_eq!(digest_fragments(100, true, &[0]), vec![100]);
+        // linear cut at boundary 0 is the molecule's own end, not a cut
+        assert_eq!(digest_fragments(100, false, &[0]), vec![100]);
+        assert_eq!(digest_fragments(100, false, &[100]), vec![100]);
         // no cuts: whole molecule
         assert_eq!(digest_fragments(100, false, &[]), vec![100]);
         // cuts outside the sequence are ignored
         assert_eq!(digest_fragments(100, false, &[140, 60]), vec![60, 40]);
+        // empty sequence: no bands at all
+        assert_eq!(digest_fragments(0, false, &[]), vec![]);
     }
 
     #[test]

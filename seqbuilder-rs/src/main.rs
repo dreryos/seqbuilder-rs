@@ -817,6 +817,9 @@ impl App {
         }
         self.enz = enzymes::parse_ezd(ezd);
         self.shown.clear();
+        // the enzyme database was replaced: gel selections index into the old
+        // vector and would panic or silently point at a different enzyme
+        self.gel_enzs.clear();
         self.compute_hits();
     }
 
@@ -1117,8 +1120,18 @@ impl App {
             });
             ui.separator();
             ui.menu_button("Digest enzymes", |ui| {
+                // only enzymes with at least one resolvable cut on this
+                // molecule (recognition hits whose cuts exist in bounds —
+                // e.g. BsaI on a short linear fragment may match but not cut)
                 let cutting: Vec<usize> = self.doc.as_ref().map(|d| {
-                    let mut v: Vec<usize> = d.hits.iter().enumerate().filter(|(_, h)| !h.is_empty()).map(|(i, _)| i).collect();
+                    let potential = self.potential;
+                    let mut v = vec![];
+                    for (i, hits) in d.hits.iter().enumerate() {
+                        if hits.is_empty() { continue; }
+                        let e = &self.enz[i];
+                        let resolvable = hits.iter().any(|&p| cloning::hit_top_cut(&d.seq, p, e.site.as_bytes(), e.top_cut, e.bot_cut, d.circular, |pat, b| iupac(pat, b, potential)).is_some());
+                        if resolvable { v.push(i); }
+                    }
                     v.sort_by_key(|&i| self.enz[i].name.clone());
                     v
                 }).unwrap_or_default();
@@ -1183,7 +1196,7 @@ impl App {
             let every = if ladder.sizes.len() <= 12 { 1 } else { 5 };
             for (i, &bp) in ladder.sizes.iter().enumerate() {
                 let y = band_y(bp);
-                p.rect_filled(egui::Rect::from_min_size(egui::pos2(x0 + 3.0, y), egui::vec2(lane_w - 6.0, 3.0)), 1.0, egui::Color32::from_rgba_premultiplied(255, 190, 90, 210));
+                p.rect_filled(egui::Rect::from_min_size(egui::pos2(x0 + 3.0, y), egui::vec2(lane_w - 6.0, 3.0)), 1.0, egui::Color32::from_rgba_unmultiplied(255, 190, 90, 210));
                 bands.push((x0, x1, y, bp, 1.0));
                 if i % every == 0 {
                     p.text(egui::pos2(x1 + 2.0, y - 6.0), egui::Align2::LEFT_TOP, format!("{bp}"), egui::FontId::monospace(10.0), egui::Color32::from_gray(150));
@@ -1202,7 +1215,7 @@ impl App {
                 // equimolar digest: a band's mass share is its length
                 let bright = 0.25 + 0.75 * f as f32 / total.max(1) as f32;
                 let alpha = (255.0 * bright).min(230.0) as u8;
-                p.rect_filled(egui::Rect::from_min_size(egui::pos2(x0 + 3.0, y), egui::vec2(lane_w - 6.0, 3.5)), 1.0, egui::Color32::from_rgba_premultiplied(255, 200, 110, alpha));
+                p.rect_filled(egui::Rect::from_min_size(egui::pos2(x0 + 3.0, y), egui::vec2(lane_w - 6.0, 3.5)), 1.0, egui::Color32::from_rgba_unmultiplied(255, 200, 110, alpha));
                 bands.push((x0, x1, y, f, bright));
             }
         }
