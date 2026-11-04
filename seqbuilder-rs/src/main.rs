@@ -2,6 +2,7 @@
 // feature table with tabs, Style/Enzymes and Settings/Details side panels.
 mod cloning;
 mod enzymes;
+mod gel;
 mod genbank;
 mod genetic;
 mod orf;
@@ -432,7 +433,7 @@ fn tick_step(len: f32) -> usize {
 
 
 #[derive(Default, PartialEq, Clone, Copy)]
-enum View { #[default] Circular, Linear, Sequence, PrimerDesign }
+enum View { #[default] Circular, Linear, Sequence, PrimerDesign, Gel }
 
 #[derive(Default, PartialEq, Clone, Copy)]
 enum Tab { #[default] Features, Primers, Comment, Minimap, SiteSummary, History }
@@ -497,6 +498,11 @@ struct App {
     gib_open: bool,                       // Gibson / In-Fusion dialog
     gib_min: usize,                       // minimum overlap in bp
     gib_frags: Vec<(String, Vec<u8>)>,    // fragments loaded in the dialog
+    gel_ladder: usize,                    // index into the bundled Markers.tdl ladders
+    gel_box: usize,                       // index into the bundled Gelbox.tdl boxes
+    gel_lanes: usize,                     // chosen well count of the gel box
+    gel_enzs: Vec<usize>,                 // enzymes digested into the sample lanes
+    gel_show_ladder: bool,                // run the molecular ruler in lane 1
 }
 
 impl App {
@@ -811,6 +817,9 @@ impl App {
         }
         self.enz = enzymes::parse_ezd(ezd);
         self.shown.clear();
+        // the enzyme database was replaced: gel selections index into the old
+        // vector and would panic or silently point at a different enzyme
+        self.gel_enzs.clear();
         self.compute_hits();
     }
 
@@ -1051,6 +1060,210 @@ impl App {
         }
     }
 
+    // ---- Agarose gel (GelView in SeqBuilder Pro; File ▸ New Agarose Gel) ----
+
+    /// View::Gel: agarose gel simulation of restriction digests — a molecular
+    /// ruler lane from the bundled Markers.tdl, the document digested by the
+    /// chosen enzymes, drawn in a box from Gelbox.tdl. Band migration is
+    /// log-linear in size; digest band brightness follows the fragment's mass
+    /// share of an equimolar digest.
+    fn gel_view(&mut self, ui: &mut egui::Ui) {
+        let ladders = gel::parse_markers_tdl(gel::MARKERS_TDL);
+        let boxes_ = gel::parse_gelbox_tdl(gel::GELBOX_TDL);
+        if ladders.is_empty() || boxes_.is_empty() { ui.label("gel data missing"); return; }
+        self.gel_ladder = self.gel_ladder.min(ladders.len() - 1);
+        self.gel_box = self.gel_box.min(boxes_.len() - 1);
+        let lanes_options = boxes_[self.gel_box].lanes.clone();
+        if self.gel_lanes == 0 || !lanes_options.contains(&(self.gel_lanes as u32)) {
+            self.gel_lanes = lanes_options[0] as usize;
+        }
+
+        // digest of the open document by the chosen enzymes (every hit of
+        // every chosen enzyme counts, not just the shown sites)
+        let frags = self.doc.as_ref().map(|d| {
+            let potential = self.potential;
+            let mut cuts = vec![];
+            for &e in &self.gel_enzs {
+                let enz = &self.enz[e];
+                if let Some(hits) = d.hits.get(e) {
+                    for &p in hits {
+                        if let Some(c) = cloning::hit_top_cut(&d.seq, p, enz.site.as_bytes(), enz.top_cut, enz.bot_cut, d.circular, |pat, b| iupac(pat, b, potential)) {
+                            cuts.push(c);
+                        }
+                    }
+                }
+            }
+            gel::digest_fragments(d.seq.len(), d.circular, &cuts)
+        }).unwrap_or_default();
+
+        // ---- toolbar (wrapped: two long selectors plus the digest controls
+        // must stay reachable at narrow window widths) ----
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Ladder");
+            // brand + product + name: products like Thermo Fisher's
+            // GeneRuler / O'RangeRuler / TrackIt share a brand and display
+            // name but carry different band sizes
+            let ladder_label = |l: &gel::Ladder| if l.product.is_empty() {
+                format!("{} — {}", l.brand, l.name)
+            } else {
+                format!("{} {} — {}", l.brand, l.product, l.name)
+            };
+            egui::ComboBox::from_id_salt("gel_ladder").selected_text(ladder_label(&ladders[self.gel_ladder])).show_ui(ui, |ui| {
+                for (i, l) in ladders.iter().enumerate() {
+                    ui.selectable_value(&mut self.gel_ladder, i, ladder_label(l));
+                }
+            });
+            ui.separator();
+            ui.label("Gel box");
+            let box_text = format!("{} ({}×{} cm)", boxes_[self.gel_box].model, boxes_[self.gel_box].width_cm, boxes_[self.gel_box].length_cm);
+            egui::ComboBox::from_id_salt("gel_box").selected_text(box_text).show_ui(ui, |ui| {
+                for (i, b) in boxes_.iter().enumerate() {
+                    ui.selectable_value(&mut self.gel_box, i, format!("{} ({}×{} cm)", b.model, b.width_cm, b.length_cm));
+                }
+            });
+            let opts = boxes_[self.gel_box].lanes.clone();
+            ui.separator();
+            ui.label("Wells");
+            egui::ComboBox::from_id_salt("gel_wells").selected_text(format!("{}", self.gel_lanes)).show_ui(ui, |ui| {
+                for l in opts { ui.selectable_value(&mut self.gel_lanes, l as usize, format!("{l}")); }
+            });
+            ui.separator();
+            ui.menu_button("Digest enzymes", |ui| {
+                // enzymes with at least one resolvable cut on this molecule
+                // (recognition hits whose cuts exist in bounds — e.g. BsaI on
+                // a short linear fragment may match but not cut), plus any
+                // already-selected enzyme so it can be deselected even after
+                // the document changed and it no longer cuts
+                let cutting: Vec<usize> = self.doc.as_ref().map(|d| {
+                    let potential = self.potential;
+                    let mut v = vec![];
+                    for (i, hits) in d.hits.iter().enumerate() {
+                        if hits.is_empty() { continue; }
+                        let e = &self.enz[i];
+                        let resolvable = hits.iter().any(|&p| cloning::hit_top_cut(&d.seq, p, e.site.as_bytes(), e.top_cut, e.bot_cut, d.circular, |pat, b| iupac(pat, b, potential)).is_some());
+                        if resolvable || self.gel_enzs.contains(&i) { v.push(i); }
+                    }
+                    // selections that no longer even match stay listed too
+                    for &sel in &self.gel_enzs {
+                        if !v.contains(&sel) { v.push(sel); }
+                    }
+                    v.sort_by_key(|&i| self.enz[i].name.clone());
+                    v
+                }).unwrap_or_default();
+                if cutting.is_empty() {
+                    ui.weak("no enzymes cut this sequence");
+                }
+                for e in cutting {
+                    let name = self.enz[e].name.clone();
+                    let on = self.gel_enzs.contains(&e);
+                    if ui.button(format!("{} {}", if on { "✓" } else { "·" }, name)).clicked() {
+                        if on { self.gel_enzs.retain(|&x| x != e); } else { self.gel_enzs.push(e); self.gel_enzs.sort_unstable(); }
+                    }
+                }
+            });
+            ui.separator();
+            ui.checkbox(&mut self.gel_show_ladder, "Ruler lane");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let frag_info: String = if frags.is_empty() { "uncut".into() } else { format!("{} fragments", frags.len()) };
+                ui.weak(frag_info);
+            });
+        });
+
+        // ---- gel drawing ----
+        let ladder = &ladders[self.gel_ladder];
+        let sample_label = if self.gel_enzs.is_empty() {
+            "uncut".to_string()
+        } else {
+            self.gel_enzs.iter().map(|&e| self.enz[e].name.clone()).collect::<Vec<_>>().join("+")
+        };
+        // migration range: everything on the gel, clamped to the ladder's span
+        let mut min_bp = ladder.sizes.iter().copied().min().unwrap_or(100);
+        let mut max_bp = ladder.sizes.iter().copied().max().unwrap_or(10000);
+        for &f in &frags {
+            min_bp = min_bp.min(f.max(1));
+            max_bp = max_bp.max(f);
+        }
+        // never claim more height than the panel offers: bands at the bottom
+        // would be clipped out of view in narrow layouts
+        let height = ui.available_height().min(440.0);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+        let p = ui.painter_at(rect);
+        // UV transilluminator background
+        p.rect_filled(rect, 4.0, egui::Color32::from_rgb(6, 6, 10));
+        // the gel medium with its wells at the top
+        let medium = egui::Rect::from_min_max(
+            rect.min + egui::vec2(10.0, 34.0),
+            rect.max - egui::vec2(10.0, 12.0),
+        );
+        p.rect_filled(medium, 2.0, egui::Color32::from_rgb(16, 16, 24));
+        let well_h = 9.0;
+        p.rect_filled(egui::Rect::from_min_size(medium.min, egui::vec2(medium.width(), well_h)), 0.0, egui::Color32::from_rgb(8, 8, 14));
+        let run_top = medium.min.y + well_h + 4.0;
+        let run_bottom = medium.max.y - 6.0;
+
+        let lane_w = medium.width() / self.gel_lanes as f32;
+        // bands: (x0, x1, y, hover label, brightness) for hover lookup
+        let mut bands: Vec<(f32, f32, f32, String, f32)> = vec![];
+
+        let band_y = |bp: u32| run_top + gel::migration_fraction(bp, min_bp, max_bp) * (run_bottom - run_top);
+
+        if self.gel_show_ladder {
+            let (x0, x1) = (medium.min.x + lane_w, medium.min.x + 2.0 * lane_w);
+            p.text(egui::pos2(x0 + 2.0, medium.min.y - 16.0), egui::Align2::LEFT_TOP, "M", egui::FontId::proportional(11.0), egui::Color32::from_gray(170));
+            let every = if ladder.sizes.len() <= 12 { 1 } else { 5 };
+            for (i, &bp) in ladder.sizes.iter().enumerate() {
+                let y = band_y(bp);
+                p.rect_filled(egui::Rect::from_min_size(egui::pos2(x0 + 3.0, y), egui::vec2(lane_w - 6.0, 3.0)), 1.0, egui::Color32::from_rgba_unmultiplied(255, 190, 90, 210));
+                bands.push((x0, x1, y, format!("{bp} bp"), 1.0));
+                if i % every == 0 {
+                    // bp labels go into the empty well lane left of the ruler,
+                    // away from the digest lane's bands
+                    p.text(egui::pos2(x0 - 4.0, y - 6.0), egui::Align2::RIGHT_TOP, format!("{bp}"), egui::FontId::monospace(10.0), egui::Color32::from_gray(150));
+                }
+            }
+        }
+
+        if !self.doc.as_ref().is_none() {
+            let offset = if self.gel_show_ladder { 2.0 } else { 1.0 };
+            let (x0, x1) = (medium.min.x + offset * lane_w, medium.min.x + (offset + 1.0) * lane_w);
+            let short: String = if sample_label.len() > 14 { sample_label.chars().take(13).collect::<String>() + "…" } else { sample_label.clone() };
+            p.text(egui::pos2(x0 + 2.0, medium.min.y - 16.0), egui::Align2::LEFT_TOP, short, egui::FontId::proportional(11.0), egui::Color32::from_gray(170));
+            // group equal-size fragments: each length is drawn once, with the
+            // summed mass of all fragments of that size (drawing them
+            // separately would stack alpha and over-brighten the band)
+            let total_mass: f32 = frags.iter().map(|&f| f as f32).sum();
+            let mut sorted = frags.clone();
+            sorted.sort_unstable();
+            let mut grouped: Vec<(u32, u32)> = vec![]; // (bp, count)
+            for f in sorted {
+                if let Some(last) = grouped.last_mut() { if last.0 == f { last.1 += 1; continue; } }
+                grouped.push((f, 1));
+            }
+            for (bp, count) in grouped {
+                let y = band_y(bp);
+                // equimolar digest: a band's mass share is its combined length
+                let bright = 0.25 + 0.75 * bp as f32 * count as f32 / total_mass.max(1.0);
+                let alpha = (255.0 * bright).min(230.0) as u8;
+                p.rect_filled(egui::Rect::from_min_size(egui::pos2(x0 + 3.0, y), egui::vec2(lane_w - 6.0, 3.5)), 1.0, egui::Color32::from_rgba_unmultiplied(255, 200, 110, alpha));
+                bands.push((x0, x1, y, if count > 1 { format!("{} × {} bp", count, bp) } else { format!("{} bp", bp) }, bright));
+            }
+        }
+        p.rect_stroke(medium, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Middle);
+
+        // hover: show the size of the band closest to the cursor
+        if let Some(mp) = resp.hover_pos() {
+            if medium.contains(mp) {
+                let best = bands.iter()
+                    .filter(|(x0, x1, y, _, _)| mp.x >= *x0 && mp.x <= *x1 && (mp.y - *y).abs() < 5.0)
+                    .min_by(|a, b| (mp.y - a.2).abs().partial_cmp(&(mp.y - b.2).abs()).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some((_, _, _, label, _)) = best {
+                    let tpos = egui::pos2(mp.x + 12.0, mp.y - 18.0);
+                    p.text(tpos, egui::Align2::LEFT_TOP, label.clone(), egui::FontId::proportional(12.0), egui::Color32::WHITE);
+                }
+            }
+        }
+    }
+
     /// Enzymes passing selector `id` on the current sequence.
     fn selector_result(&self, id: u32) -> Vec<usize> {
         let Some(d) = &self.doc else { return vec![] };
@@ -1082,6 +1295,11 @@ impl App {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("New DNA  ⌘N").clicked() { self.new_dna(); }
+                if ui.button("New Agarose Gel").clicked() {
+                    self.view = View::Gel;
+                    self.gel_show_ladder = true;
+                    self.gel_enzs.clear();
+                }
                 if ui.button("Open…  ⌘O").clicked() {
                     if let Some(p) = rfd::FileDialog::new().add_filter("Sequence", &["sbd", "gb", "gbk", "genbank", "fasta", "fa", "fas", "seq"]).pick_file() {
                         self.open(&p);
@@ -2111,7 +2329,16 @@ impl eframe::App for App {
         if self.frames < 4 { ctx.request_repaint(); }
         if self.frames == 1 {
             if let Ok(v) = std::env::var("SEQBUILDER_VIEW") {
-                self.view = match v.as_str() { "linear" => View::Linear, "sequence" => View::Sequence, "primers" => View::PrimerDesign, _ => self.view };
+                self.view = match v.as_str() { "linear" => View::Linear, "sequence" => View::Sequence, "primers" => View::PrimerDesign, "gel" => View::Gel, _ => self.view };
+                if self.view == View::Gel {
+                    self.gel_show_ladder = true;
+                    // SEQBUILDER_GEL="EcoRI,BamHI" digests with those enzymes
+                    if let Ok(names) = std::env::var("SEQBUILDER_GEL") {
+                        for n in names.split(',') {
+                            if let Some(i) = self.enz.iter().position(|e| e.name == n.trim()) { self.gel_enzs.push(i); }
+                        }
+                    }
+                }
             }
             // Debug aid: SEQBUILDER_FEATURE=n opens with that table row picked.
             if let Some(i) = std::env::var("SEQBUILDER_FEATURE").ok().and_then(|v| v.parse().ok()) { (self.sel_feat, self.side_top) = (Some(i), SideTop::Style); }
@@ -2139,17 +2366,22 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.view, View::Linear, "Linear");
                     ui.selectable_value(&mut self.view, View::Sequence, "Sequence");
                     ui.selectable_value(&mut self.view, View::PrimerDesign, "Primer Design");
+                    ui.selectable_value(&mut self.view, View::Gel, "Agarose Gel");
                 });
             });
-            let Some(d) = &self.doc else {
+            // the gel view also runs without a document (ruler only)
+            if self.view == View::Gel {
+                self.gel_view(ui);
+            } else if let Some(d) = &self.doc {
+                match self.view {
+                    View::Circular => self.page(ui, |p, r, ui| self.circular_map(p, r, ui, d)),
+                    View::Linear => self.page(ui, |p, r, ui| self.linear_map(p, r, ui, d)),
+                    View::Sequence => self.sequence_view(ui),
+                    View::PrimerDesign => self.primer_design(ui),
+                    View::Gel => unreachable!(),
+                }
+            } else {
                 ui.centered_and_justified(|ui| ui.label("File ▸ Open… or drop a GenBank / FASTA file here"));
-                return;
-            };
-            match self.view {
-                View::Circular => self.page(ui, |p, r, ui| self.circular_map(p, r, ui, d)),
-                View::Linear => self.page(ui, |p, r, ui| self.linear_map(p, r, ui, d)),
-                View::Sequence => self.sequence_view(ui),
-                View::PrimerDesign => self.primer_design(ui),
             }
         });
         self.selector_manager(ctx);
