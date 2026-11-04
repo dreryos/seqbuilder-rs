@@ -2,11 +2,13 @@
 // feature table with tabs, Style/Enzymes and Settings/Details side panels.
 mod enzymes;
 mod genbank;
+mod orf;
 mod primers;
 mod sbd;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use enzymes::{Enzyme, Selector};
+use orf::{Orf, OrfOpts};
 use std::collections::HashSet;
 use std::f32::consts::{PI, TAU};
 use std::path::{Path, PathBuf};
@@ -374,6 +376,19 @@ fn frame_residue(seq: &[u8], i: usize, k: usize) -> Option<char> {
     }
 }
 
+/// The protein of an ORF in one-letter code, reading through the origin when it wraps.
+/// The minus-strand span reads descending in plus coordinates, start codon at the high end.
+fn orf_protein(d: &Doc, o: &Orf) -> String {
+    let n = d.seq.len();
+    let span = orf::span_len(o, n);
+    let idx: Vec<usize> = (0..span).map(|k| (o.start + k) % n).collect();
+    let mut bases: Vec<u8> = idx.iter().map(|&i| d.seq[i]).collect();
+    if o.strand < 0 {
+        bases = bases.iter().rev().map(|&b| complement(b)).collect();
+    }
+    bases.chunks(3).filter(|c| c.len() == 3).map(|c| translate(c)).collect()
+}
+
 /// One feature span on a straight track (Linear view), in its Style tab shape.
 fn draw_track_feature(p: &egui::Painter, r: Rect, strand: i8, shape: u32, fill: Color32, line: Color32, st: sbd::Style) {
     let fill = if shape == 5 { Color32::TRANSPARENT } else { fill };
@@ -474,6 +489,11 @@ struct App {
     primer_options: [bool; 5], // Settings ▸ Primer Design: priming sites, alternate pairs, dimer, pair dimer, hairpin
     fragment_size: bool,       // Settings ▸ Site Summary ▸ Show Fragment Size
     frames: u32,
+    // ORF Detection (Sequence ▸ ORF Detection Options, matching SeqBuilder Pro)
+    orf_opts: OrfOpts,
+    orfs: Vec<Orf>,
+    orf_open: bool,          // options dialog
+    orf_sel: Option<usize>,  // selected ORF index into self.orfs
 }
 
 impl App {
@@ -517,6 +537,36 @@ impl App {
                 let mut bases = d.seq[f.start..f.end].to_vec();
                 if f.strand < 0 { bases = bases.iter().rev().map(|&b| complement(b)).collect(); }
                 statistics(ui, &bases);
+            }
+        });
+    }
+
+    /// Details ▸ ORF selection: name, frame, range, length, start codon, protein.
+    fn orf_details(&self, ui: &mut egui::Ui) {
+        let (Some(d), Some(oi)) = (&self.doc, self.orf_sel) else { return };
+        let Some(o) = self.orfs.get(oi) else { return };
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading(format!("ORF {}", oi + 1));
+            ui.separator();
+            let span = orf::span_len(o, d.seq.len());
+            let range = if o.start <= o.end { format!("{}..{}", o.start + 1, o.end) } else { format!("{}..{}", o.start + 1, o.end) };
+            egui::Grid::new("orf_info").num_columns(2).show(ui, |ui| {
+                for (k, v) in [
+                    ("Strand:", if o.strand < 0 { "Reverse" } else { "Forward" }.to_string()),
+                    ("Frame:", o.frame.to_string()),
+                    ("Range:", range),
+                    ("Length:", format!("{} aa / {} bp", o.len_aa, span)),
+                    ("Start codon:", if o.start_codon { "Yes" } else { "No" }.to_string()),
+                ] {
+                    ui.label(k); ui.label(v); ui.end_row();
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Protein (one letter):").italics());
+            ui.separator();
+            let protein = orf_protein(d, o);
+            for chunk in protein.as_bytes().chunks(60) {
+                ui.monospace(String::from_utf8_lossy(chunk).into_owned());
             }
         });
     }
@@ -754,8 +804,10 @@ impl App {
     }
 
     fn compute_hits(&mut self) {
+        let opts = self.orf_opts.clone();
         if let Some(d) = &mut self.doc {
             d.hits = self.enz.iter().map(|e| find_sites(&d.seq, d.circular, &e.site, self.potential)).collect();
+            self.orfs = orf::find_orfs(&d.seq, d.circular, &opts);
         }
         self.refresh_sites();
     }
@@ -836,6 +888,8 @@ impl App {
                 let circular = self.doc.as_ref().map(|d| d.circular);
                 if ui.add_enabled(circular.is_some(), egui::Button::selectable(circular == Some(false), "Linear")).clicked() { self.set_circular(false); }
                 if ui.add_enabled(circular.is_some(), egui::Button::selectable(circular == Some(true), "Circular")).clicked() { self.set_circular(true); }
+                ui.separator();
+                if ui.button("ORF Detection Options…").clicked() { self.orf_open = true; }
             });
             ui.menu_button("Format", |ui| {
                 ui.label("Residue Grouping");
@@ -1119,6 +1173,7 @@ impl App {
                         });
                     }).response.on_disabled_hover_text("Special translation rulers are not implemented yet");
                 }
+                SideBottom::Details if self.orf_sel.is_some() && self.doc.is_some() => self.orf_details(ui),
                 SideBottom::Details if self.sel_feat.is_some() && self.doc.is_some() => self.feature_details(ui),
                 SideBottom::Details => match &self.doc {
                     None => { ui.label("No document open."); }
@@ -1300,6 +1355,22 @@ impl App {
             let a = ang(pos);
             p.line_segment([at(a, r - 5.0), at(a, r)], Stroke::new(1.0, fg));
             p.text(at(a, r - 12.0), Align2::CENTER_CENTER, pos.to_string(), small.clone(), fg);
+        }
+
+        // ORF rings outside the backbone, one per reading frame (Translations and ORFs)
+        if self.translations {
+            for (oi, o) in self.orfs.iter().enumerate() {
+                let rad = r + 8.0 + (o.frame - 1) as f32 * 5.0;
+                let (a0, a1) = span(o.start, o.end);
+                let color = if self.orf_sel == Some(oi) {
+                    ui.visuals().selection.bg_fill
+                } else if o.start_codon {
+                    Color32::from_rgb(66, 133, 244)
+                } else {
+                    Color32::from_rgb(251, 146, 60)
+                };
+                p.add(Shape::line(arc(a0, a1, rad), Stroke::new(3.0, color)));
+            }
         }
 
         // features inside the backbone, as outlined arrows
@@ -1633,6 +1704,8 @@ impl App {
         let mut area = egui::ScrollArea::vertical().auto_shrink(false);
         if let Some(pos) = self.scroll_to.take() { area = area.vertical_scroll_offset((pos / bpr) as f32 * row_h); }
         let (mut sel, mut anchor, caret) = (self.sel, self.anchor, self.caret);
+        let mut orf_hit: Option<usize> = None;
+        let mut row_clicked = false;
         area.show_rows(ui, row_h, rows, |ui, range| {
             let origin = ui.cursor().min - Vec2::new(0.0, range.start as f32 * row_h);
             let base_at = |p: Pos2| -> usize {
@@ -1689,6 +1762,27 @@ impl App {
                             p.text(Pos2::new(x(i), line_y(l + k)), Align2::LEFT_TOP, aa.to_string(), font.clone(), c);
                         }
                     }
+                    // ORF bars along the bottom edge of each reading-frame line
+                    let hover = ui.input(|i| i.pointer.interact_pos());
+                    for (oi, o) in self.orfs.iter().enumerate() {
+                        let d = o.frame as usize - 1;
+                        let ly = line_y(l + d);
+                        let (s, e) = if o.start <= o.end { (o.start.max(a), o.end.min(b)) } else if o.start < b { (o.start.max(a), b) } else { (a, o.end.min(b)) };
+                        if s >= e { continue }
+                        let color = if self.orf_sel == Some(oi) {
+                            ui.visuals().selection.bg_fill
+                        } else if o.start_codon {
+                            Color32::from_rgb(66, 133, 244)
+                        } else {
+                            Color32::from_rgb(251, 146, 60)
+                        };
+                        let r = Rect::from_min_max(Pos2::new(x(s), ly + lh - 5.5), Pos2::new(x(e - 1) + cw, ly + lh - 1.5));
+                        p.rect(r, 2.0, color, Stroke::new(1.0, color.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                        if r.width() > 44.0 {
+                            p.text(r.left_center() + Vec2::new(3.0, 0.0), Align2::LEFT_CENTER, format!("ORF {}", oi + 1), FontId::proportional(9.0), Color32::BLACK);
+                        }
+                        if resp.clicked() && hover.is_some_and(|h| r.contains(h)) { orf_hit = Some(oi); }
+                    }
                 }
                 // tick axis: every base, longer every 5 and 10
                 if let Some(l) = axis_line {
@@ -1715,6 +1809,7 @@ impl App {
                     if resp.drag_started() || resp.clicked() {
                         anchor = if ui.input(|inp| inp.modifiers.shift) { sel.map_or(i, |s| s.0) } else { i };
                     }
+                    if resp.clicked() { row_clicked = true; }
                     sel = Some((anchor.min(i), anchor.max(i)));
                 }
             }
@@ -1725,6 +1820,14 @@ impl App {
         }
         self.sel = sel;
         self.anchor = anchor;
+        if let Some(oi) = orf_hit {
+            self.orf_sel = Some(oi);
+            self.sel_feat = None;
+            self.sel = None;
+            self.caret = None;
+        } else if row_clicked {
+            self.orf_sel = None;
+        }
     }
 }
 
@@ -1807,6 +1910,26 @@ impl eframe::App for App {
                 }
             });
             self.goto_open &= open;
+        }
+        if self.orf_open {
+            let mut open = true;
+            egui::Window::new("ORF Detection Options").open(&mut open).collapsible(false).show(ctx, |ui| {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Minimum ORF size");
+                    changed |= ui.add(egui::DragValue::new(&mut self.orf_opts.min_aa).range(1..=100_000)).changed();
+                    ui.label("AA's");
+                });
+                ui.add_space(6.0);
+                changed |= ui.radio_value(&mut self.orf_opts.starts, orf::StartFilter::With, "Show only ORFs with start codon").changed();
+                changed |= ui.radio_value(&mut self.orf_opts.starts, orf::StartFilter::Without, "Show only ORFs without start codon").changed();
+                changed |= ui.radio_value(&mut self.orf_opts.starts, orf::StartFilter::Both, "Show both ORF with and without start codon").changed();
+                if changed { self.compute_hits(); }
+                ui.add_space(6.0);
+                ui.label(format!("{} ORFs detected", self.orfs.len()));
+                if ui.button("OK").clicked() { self.orf_open = false; }
+            });
+            self.orf_open &= open;
         }
     }
 }
