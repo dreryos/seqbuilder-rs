@@ -1,5 +1,6 @@
 // SeqBuilder-like DNA viewer laid out like SeqBuilder Pro: tool strip, map page with view tabs,
 // feature table with tabs, Style/Enzymes and Settings/Details side panels.
+mod cloning;
 mod enzymes;
 mod genbank;
 mod genetic;
@@ -491,6 +492,11 @@ struct App {
     gen_open: bool,          // Genetic Code editor dialog
     gen_pick: Option<usize>, // codon index picked in the editor
     info: Option<String>,    // Tools completion messages, shown in the info bar
+    // Cloning menu (CloningCommands in SeqBuilder Pro)
+    clip_insert: Option<cloning::Insert>, // Copy/Paste Restriction Insert
+    gib_open: bool,                       // Gibson / In-Fusion dialog
+    gib_min: usize,                       // minimum overlap in bp
+    gib_frags: Vec<(String, Vec<u8>)>,    // fragments loaded in the dialog
 }
 
 impl App {
@@ -906,6 +912,145 @@ impl App {
         }
     }
 
+    // ---- Cloning menu (CloningCommands in SeqBuilder Pro) ----
+
+    /// Enzymes whose top-strand cut lands exactly on `pos`, among the sites
+    /// shown for the current document. Reverse-oriented hits cut at
+    /// p + len - bot_cut; circular cuts wrap modulo the length, so a cut at
+    /// `len` matches boundary 0 (and a selection endpoint of `len` is
+    /// normalized to 0), while cuts outside a linear sequence do not exist
+    /// as boundaries at all.
+    fn enzymes_cutting_at(&self, pos: usize) -> Vec<usize> {
+        let Some(d) = &self.doc else { return vec![] };
+        let potential = self.potential;
+        let pos = if d.circular { pos % d.seq.len().max(1) } else { pos };
+        let mut out = vec![];
+        for s in &self.sites {
+            let e = &self.enz[s.enz];
+            let cut = cloning::hit_top_cut(&d.seq, s.pos, e.site.as_bytes(), e.top_cut, e.bot_cut, d.circular, |pat, b| iupac(pat, b, potential));
+            if cut == Some(pos) { out.push(s.enz); }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Cloning ▸ Copy Restriction Insert: the selection [a, b) with the
+    /// enzymes that cut at its ends, overhangs and all.
+    fn clone_copy_insert(&mut self) {
+        let (Some(d), Some((a, b))) = (&self.doc, self.sel) else {
+            self.error = Some("Select the fragment to copy first.".into());
+            return;
+        };
+        let (left, right) = (self.enzymes_cutting_at(a), self.enzymes_cutting_at(b));
+        let (Some(&le), Some(&re)) = (left.first(), right.first()) else {
+            self.error = Some("Shown enzymes must cut at both ends of the selection.".into());
+            return;
+        };
+        let (le, re) = (&self.enz[le], &self.enz[re]);
+        let name = format!("{} fragment", d.name);
+        let ins = match cloning::copy_insert(&d.seq, a, b, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut, &le.name, &re.name, &name) {
+            Ok(i) => i,
+            Err(e) => { self.error = Some(e); return; }
+        };
+        self.info = Some(format!("Copied {} bp restriction insert ({} × {})", ins.len(), le.name, re.name));
+        self.clip_insert = Some(ins);
+    }
+
+    /// Cloning ▸ Paste Restriction Insert: ligate the copied insert into the
+    /// selection of the open document, checking the end overhangs.
+    fn clone_paste_insert(&mut self) {
+        let Some(ins) = self.clip_insert.clone() else {
+            self.error = Some("No restriction insert copied yet (Cloning ▸ Copy Restriction Insert).".into());
+            return;
+        };
+        let Some((x, y)) = self.sel else {
+            self.error = Some("Select where to paste the insert.".into());
+            return;
+        };
+        let (left, right) = (self.enzymes_cutting_at(x), self.enzymes_cutting_at(y));
+        let (Some(&le), Some(&re)) = (left.first(), right.first()) else {
+            self.error = Some("Shown enzymes must cut at both ends of the target selection.".into());
+            return;
+        };
+        let (le, re) = (&self.enz[le], &self.enz[re]);
+        let check = self.doc.as_ref().map(|d| cloning::compatible(&ins, &d.seq, x, y, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut));
+        let names = (le.name.clone(), re.name.clone());
+        match check {
+            Some(Err(e)) => { self.error = Some(e); return; }
+            None => { self.error = Some("No document open.".into()); return; }
+            _ => {}
+        }
+        let (n, from) = (ins.len(), (ins.left_enz.clone(), ins.right_enz.clone()));
+        self.edit_seq(x, y, &ins.top);
+        self.info = Some(format!("Ligated the {} bp insert ({} × {} into {} × {})", n, from.0, from.1, names.0, names.1));
+    }
+
+    /// Cloning ▸ Clone Selected Fragment: a fresh document from the selection,
+    /// carrying the features that lie inside it. Cloning a whole circular
+    /// document keeps its topology and every feature; a partial selection
+    /// becomes linear, with feature locations offset (join() structures in
+    /// range texts preserved).
+    fn clone_fragment_doc(&mut self) {
+        let (Some(d), Some((a, b))) = (&self.doc, self.sel) else {
+            self.error = Some("Select the fragment to clone first.".into());
+            return;
+        };
+        let seq = cloning::clone_fragment(&d.seq, a, b);
+        if seq.is_empty() { self.error = Some("The selection is empty.".into()); return; }
+        let n = d.seq.len();
+        let full_circle = d.circular && a == 0 && b == n;
+        let feats: Vec<Feat> = d.feats.iter().filter(|f| {
+            if full_circle { return true; }
+            // a plain span fits when [lo, hi) lies inside [a, b); an
+            // origin-spanning feature cannot fit in a linear selection
+            let (lo, hi) = if f.start < f.end { (f.start, f.end) } else { (f.start, f.end + n) };
+            lo >= a && hi <= b
+        }).map(|f| {
+            let mut f = f.clone();
+            if !full_circle {
+                f.start -= a;
+                f.end -= a;
+                f.range = cloning::offset_range(&f.range, -(a as i64));
+            }
+            // keep the remapped location text: marking these dirty would make
+            // GenBank export collapse join() locations to a single span
+            f
+        }).collect();
+        let mut doc = Doc {
+            name: format!("{}_fragment", d.name), definition: String::new(), accession: String::new(), comment: String::new(),
+            seq, circular: full_circle, feats, lanes: 0, hits: vec![], path: "Untitled".into(),
+            sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false,
+        };
+        doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
+        self.doc = Some(doc);
+        (self.view, self.sel, self.sel_feat, self.caret, self.error) = (View::Sequence, None, None, Some(0), None);
+        (self.undo, self.redo) = (vec![], vec![]);
+        self.compute_hits();
+        self.info = Some("Fragment cloned into a new document.".into());
+    }
+
+    /// Cloning ▸ Gibson, In-Fusion: assemble the loaded fragments and save the
+    /// product as a GenBank file (circular only when the fragments close a circle).
+    fn gibson_assemble_and_save(&mut self) {
+        if self.gib_frags.len() < 2 { self.error = Some("Load at least two fragments.".into()); return; }
+        let frags: Vec<Vec<u8>> = self.gib_frags.iter().map(|(_, s)| s.clone()).collect();
+        let (assembled, circular) = match cloning::gibson_assemble(&frags, self.gib_min) {
+            Ok(s) => s,
+            Err(e) => { self.error = Some(e); return; }
+        };
+        let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name("assembly.gb").save_file() else { return };
+        let doc = Doc {
+            name: "assembly".into(), definition: String::new(), accession: String::new(), comment: String::new(),
+            seq: assembled, circular, feats: vec![], lanes: 0, hits: vec![], path: "Untitled".into(),
+            sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false,
+        };
+        match std::fs::write(&out, export_genbank(&doc)) {
+            Ok(_) => self.info = Some(format!("Assembly written to {} ({})", out.display(), if circular { "circular" } else { "linear" })),
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
     /// Enzymes passing selector `id` on the current sequence.
     fn selector_result(&self, id: u32) -> Vec<usize> {
         let Some(d) = &self.doc else { return vec![] };
@@ -993,6 +1138,13 @@ impl App {
                     }
                 });
                 if ui.button("Edit Genetic Code…").clicked() { self.gen_open = true; }
+            });
+            ui.menu_button("Cloning", |ui| {
+                if ui.button("Copy Restriction Insert").clicked() { self.clone_copy_insert(); }
+                if ui.add_enabled(self.clip_insert.is_some(), egui::Button::new("Paste Restriction Insert…")).clicked() { self.clone_paste_insert(); }
+                ui.separator();
+                if ui.button("Clone Selected Fragment").clicked() { self.clone_fragment_doc(); }
+                if ui.button("Gibson, In-Fusion Cloning…").clicked() { self.gib_open = true; }
             });
             ui.menu_button("Format", |ui| {
                 ui.label("Residue Grouping");
@@ -2100,6 +2252,55 @@ impl eframe::App for App {
             });
             self.gen_open &= open;
             if recompute { self.compute_hits(); }
+        }
+        if self.gib_open {
+            let mut open = true;
+            egui::Window::new("Gibson / In-Fusion Cloning").open(&mut open).default_size([420.0, 340.0]).show(ctx, |ui| {
+                ui.label("Fragments sharing terminal homology are joined in order; the last can close a circle with the first.");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Add fragments…").clicked() {
+                        if let Some(files) = Self::pick_sequences() {
+                            let mut failed = vec![];
+                            for p in files {
+                                match load(&p) {
+                                    Ok(d) => self.gib_frags.push((d.name, d.seq)),
+                                    Err(e) => failed.push(format!("{}: {e}", p.display())),
+                                }
+                            }
+                            if !failed.is_empty() {
+                                self.error = Some(format!("Could not load {}", failed.join("; ")));
+                            }
+                        }
+                    }
+                    if ui.button("Clear").clicked() { self.gib_frags.clear(); }
+                });
+                ui.add_space(4.0);
+                egui::Grid::new("gib_frags").num_columns(2).striped(true).show(ui, |ui| {
+                    ui.strong("Fragment"); ui.strong("Length"); ui.end_row();
+                    for (name, seq) in &self.gib_frags {
+                        ui.label(name); ui.label(format!("{} bp", seq.len())); ui.end_row();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Minimum overlap");
+                    ui.add(egui::DragValue::new(&mut self.gib_min).range(4..=60));
+                    ui.label("bp");
+                });
+                // live preview of the pairwise overlaps
+                if self.gib_frags.len() >= 2 {
+                    let frags: Vec<&Vec<u8>> = self.gib_frags.iter().map(|(_, s)| s).collect();
+                    for w in frags.windows(2) {
+                        let ov = cloning::overlap(w[0], w[1]).unwrap_or(0);
+                        let mark = if ov >= self.gib_min { "✓" } else { "✗" };
+                        ui.monospace(format!("{mark} {} bp overlap", ov));
+                    }
+                }
+                ui.add_space(4.0);
+                if ui.button("Assemble and Save…").clicked() { self.gibson_assemble_and_save(); }
+            });
+            self.gib_open &= open;
         }
     }
 }
