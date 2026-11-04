@@ -1,5 +1,6 @@
 // SeqBuilder-like DNA viewer laid out like SeqBuilder Pro: tool strip, map page with view tabs,
 // feature table with tabs, Style/Enzymes and Settings/Details side panels.
+mod blast;
 mod cloning;
 mod enzymes;
 mod gel;
@@ -7,6 +8,7 @@ mod genbank;
 mod genetic;
 mod orf;
 mod primers;
+mod print;
 mod sbd;
 mod tools;
 
@@ -433,7 +435,7 @@ fn tick_step(len: f32) -> usize {
 
 
 #[derive(Default, PartialEq, Clone, Copy)]
-enum View { #[default] Circular, Linear, Sequence, PrimerDesign, Gel }
+enum View { #[default] Circular, Linear, Sequence, PrimerDesign, Gel, Curtain, Fragment }
 
 #[derive(Default, PartialEq, Clone, Copy)]
 enum Tab { #[default] Features, Primers, Comment, Minimap, SiteSummary, History }
@@ -503,6 +505,19 @@ struct App {
     gel_lanes: usize,                     // chosen well count of the gel box
     gel_enzs: Vec<usize>,                 // enzymes digested into the sample lanes
     gel_show_ladder: bool,                // run the molecular ruler in lane 1
+    // BLAST online search (BlastEntrezCommands in SeqBuilder Pro)
+    blast_open: bool,                     // Search for Sequences… dialog
+    blast_db: String,                     // target database
+    blast_hits: Option<blast::BlastResult>,
+    blast_pick: Option<usize>,            // hit selected for the HSP detail
+    blast_rx: Option<std::sync::mpsc::Receiver<BlastMsg>>,
+}
+
+/// Messages from the background BLAST thread.
+enum BlastMsg {
+    Running(String),               // RID assigned, polling
+    Done(blast::BlastResult),
+    Failed(String),
 }
 
 impl App {
@@ -1060,6 +1075,318 @@ impl App {
         }
     }
 
+    // ---- Print (PrintCommands / PageForm in SeqBuilder Pro) ----
+
+    /// File ▸ Print… / Print Selection…: lay the document out as a PDF
+    /// (numbered 60-base rows, feature table) and save it — the portable
+    /// equivalent of the print panel's "Save as PDF" path.
+    fn print_doc(&mut self, selection: bool) {
+        let Some(d) = &self.doc else { self.error = Some("No document open.".into()); return; };
+        let (seq, first) = if selection {
+            match self.sel {
+                Some((a, b)) if a < b => (d.seq[a..b].to_vec(), a),
+                _ => { self.error = Some("Select the range to print first.".into()); return; }
+            }
+        } else { (d.seq.clone(), 0) };
+        if seq.is_empty() { self.error = Some("Nothing to print.".into()); return; }
+        let feats: Vec<(String, u32, u32, i32)> = d.feats.iter()
+            .filter(|f| f.start >= first && f.end <= first + seq.len())
+            .map(|f| (f.name.clone(), (f.start - first) as u32, (f.end - first) as u32, f.strand as i32))
+            .collect();
+        let (name, topology) = (d.name.clone(), if d.circular { "circular" } else { "linear" });
+        let pd = print::PrintDoc { name: &name, topology, seq: &seq, features: &feats, first_base: first };
+        let mut pdf = print::Pdf::new();
+        let pages = print::layout(&mut pdf, &pd);
+        let Some(out) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{}.pdf", name)).save_file() else { return };
+        match std::fs::write(&out, pdf.finish()) {
+            Ok(_) => self.info = Some(format!("Printout written to {} ({} page{})", out.display(), pages, if pages == 1 { "" } else { "s" })),
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    // ---- Online search (BlastEntrezCommands in SeqBuilder Pro) ----
+
+    /// Search ▸ Search for Sequences…: submit the open document to NCBI
+    /// BLAST (blastn) and list the hits with their best HSP.
+    fn blast_dialog(&mut self, ui: &mut egui::Ui) {
+        let mut close = false;
+        egui::Window::new("Search for Sequences (BLAST)").open(&mut self.blast_open).default_width(560.0).show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Database");
+                let dbs = ["core_nt", "nr", "refseq_rna", "16S_ribosomal_RNA", "env_nt"];
+                let sel = if self.blast_db.is_empty() { "core_nt".to_string() } else { self.blast_db.clone() };
+                egui::ComboBox::from_id_salt("blast_db").selected_text(sel).show_ui(ui, |ui| {
+                    for db in dbs { ui.selectable_value(&mut self.blast_db, db.to_string(), db); }
+                });
+                if ui.add_enabled(self.doc.is_some() && self.blast_rx.is_none(), egui::Button::new("Submit")).clicked() {
+                    let Some(d) = &self.doc else { return };
+                    let (seq, db) = (d.seq.clone(), if self.blast_db.is_empty() { "core_nt".to_string() } else { self.blast_db.clone() });
+                    self.blast_hits = None;
+                    self.blast_pick = None;
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.blast_rx = Some(rx);
+                    std::thread::spawn(move || {
+                        match blast::submit(&seq, &db, "blastn", 50) {
+                            Ok(rid) => {
+                                let _ = tx.send(BlastMsg::Running(rid.clone()));
+                                for _ in 0..40 { // poll up to ~10 minutes
+                                    match blast::poll(&rid) {
+                                        Ok(Some(res)) => { let _ = tx.send(BlastMsg::Done(res)); return; }
+                                        Ok(None) => std::thread::sleep(std::time::Duration::from_secs(15)),
+                                        Err(e) => { let _ = tx.send(BlastMsg::Failed(e)); return; }
+                                    }
+                                }
+                                let _ = tx.send(BlastMsg::Failed("BLAST did not finish in 10 minutes".into()));
+                            }
+                            Err(e) => { let _ = tx.send(BlastMsg::Failed(e)); }
+                        }
+                    });
+                }
+                if self.blast_rx.is_some() { ui.spinner(); }
+            });
+            ui.separator();
+            match (&self.blast_hits, &self.blast_rx) {
+                (Some(res), _) => {
+                    ui.label(format!("{} hits — {} vs {} (RID {})", res.hits.len(), res.program, res.db, res.rid));
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(240.0).show_rows(ui, 18.0, res.hits.len(), |ui, range| {
+                        for i in range {
+                            let h = &res.hits[i];
+                            let picked = self.blast_pick == Some(i);
+                            if ui.selectable_label(picked, format!("{:<12} {:>5.1}%  {:>5} bp  {:>7}  e={:<9} {}",
+                                h.accession, h.identity * 100.0 / h.length.max(1) as f32, h.length, h.bits, h.evalue,
+                                if h.definition.len() > 60 { format!("{}…", &h.definition[..57]) } else { h.definition.clone() })).clicked() {
+                                self.blast_pick = Some(i);
+                            }
+                        }
+                    });
+                    if let (Some(i), Some(res)) = (self.blast_pick, &self.blast_hits) {
+                        let h = &res.hits[i];
+                        ui.separator();
+                        ui.monospace(format!("{} {}..{} vs {}..{}", h.accession, h.query_from, h.query_to, h.hit_from, h.hit_to));
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            ui.style_mut().override_font_id = Some(egui::FontId::monospace(11.0));
+                            ui.label(format!("Query  {}", h.qseq));
+                            ui.label(format!("        {}", h.midline));
+                            ui.label(format!("Sbjct  {}", h.hseq));
+                        });
+                    }
+                }
+                (None, Some(_)) => { ui.label("Searching NCBI BLAST…"); }
+                (None, None) => { ui.weak("Submit the open sequence to run a blastn search."); }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Close").clicked() { close = true; }
+            });
+        });
+        if close {
+            self.blast_open = false;
+            self.blast_rx = None;
+            self.blast_hits = None;
+            self.blast_pick = None;
+        }
+    }
+
+    /// Drain the background BLAST thread's messages.
+    fn blast_poll(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.blast_rx else { return };
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                BlastMsg::Running(_) => ctx.request_repaint(),
+                BlastMsg::Done(res) => {
+                    self.info = Some(format!("BLAST finished: {} hits", res.hits.len()));
+                    self.blast_hits = Some(res);
+                    self.blast_rx = None;
+                    ctx.request_repaint();
+                    return;
+                }
+                BlastMsg::Failed(e) => {
+                    self.error = Some(format!("BLAST failed: {e}"));
+                    self.blast_rx = None;
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    // ---- Curtain view (CurtainView in SeqBuilder Pro) ----
+
+    /// View::Curtain: the presentation view — linear rulers top and bottom,
+    /// feature curtains stacked in lanes, and the sequence itself large in a
+    /// central band that follows the cursor. Clicking a curtain selects the
+    /// feature.
+    fn curtain_view(&mut self, ui: &mut egui::Ui) {
+        let Some(d) = &self.doc else { return; };
+        let n = d.seq.len().max(1);
+        // owned snapshot: the interaction below needs &mut self
+        let (circular, lanes) = (d.circular, d.lanes);
+        let seq = d.seq.clone();
+        let feats: Vec<(usize, usize, usize, String, egui::Color32, egui::Color32)> = d.feats.iter()
+            .filter(|f| f.show)
+            .map(|f| {
+                let st = look(f);
+                let line = st.line.map(|c| egui::Color32::from_rgb(c[0], c[1], c[2])).unwrap_or(egui::Color32::WHITE);
+                let fill = st.fill.map(|c| egui::Color32::from_rgb(c[0], c[1], c[2])).unwrap_or(egui::Color32::GRAY);
+                (f.start, f.end, f.lane, f.label.clone(), line, fill)
+            })
+            .collect();
+        let n_lanes = (lanes + 1).max(1);
+
+        let avail = ui.available_size();
+        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        let p = ui.painter_at(rect);
+        let x = |bp: usize| rect.left() + (bp as f32 / n as f32) * rect.width();
+
+        // top + bottom rulers with ten tick labels
+        let ruler_y = [rect.top() + 18.0, rect.bottom() - 8.0];
+        for &ry in &ruler_y {
+            p.line_segment([egui::pos2(rect.left(), ry), egui::pos2(rect.right(), ry)], egui::Stroke::new(1.0, egui::Color32::from_gray(120)));
+            for k in 0..=10 {
+                let bp = k * n / 10;
+                let tx = x(bp);
+                p.line_segment([egui::pos2(tx, ry - 4.0), egui::pos2(tx, ry + 4.0)], egui::Stroke::new(1.0, egui::Color32::from_gray(120)));
+                p.text(egui::pos2(tx, ry + 6.0), egui::Align2::CENTER_TOP, format!("{bp}"), egui::FontId::monospace(9.0), egui::Color32::from_gray(140));
+            }
+        }
+
+        // feature curtains, one band per lane
+        let band_top = rect.top() + 30.0;
+        let band_h = 22.0;
+        let center_top = band_top + n_lanes as f32 * (band_h + 2.0) + 8.0;
+        let center_h = 64.0;
+        let mut hit: Option<usize> = None; // index into feats under the cursor
+        if let Some(mp) = resp.hover_pos() {
+            for (i, (s, e, lane, _, _, _)) in feats.iter().enumerate() {
+                let (lo, hi) = if s < e { (*s, *e) } else { (*s, *e + n) };
+                let y0 = band_top + *lane as f32 * (band_h + 2.0);
+                if mp.y >= y0 && mp.y <= y0 + band_h && mp.x >= x(lo) && mp.x <= x(hi.min(n)) { hit = Some(i); }
+            }
+        }
+        for (i, (s, e, lane, label, line, fill)) in feats.iter().enumerate() {
+            let (lo, hi) = if s < e { (*s, *e) } else { (*s, *e + n) };
+            let y0 = band_top + *lane as f32 * (band_h + 2.0);
+            let (fx0, fx1) = (x(lo), x(hi.min(n)).max(x(lo) + 2.0));
+            let col = if hit == Some(i) { egui::Color32::WHITE } else { *line };
+            p.rect_filled(egui::Rect::from_min_max(egui::pos2(fx0, y0), egui::pos2(fx1, y0 + band_h)), 3.0, *fill);
+            p.rect_stroke(egui::Rect::from_min_max(egui::pos2(fx0, y0), egui::pos2(fx1, y0 + band_h)), 3.0, egui::Stroke::new(1.0, col), egui::StrokeKind::Middle);
+            p.text(egui::pos2(fx0 + 4.0, y0 + band_h / 2.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(10.0), egui::Color32::BLACK);
+        }
+
+        // the sequence band: 48 bases centred on the cursor position (the
+        // middle of the view when the pointer is elsewhere)
+        {
+            let mp = resp.hover_pos().unwrap_or_else(|| resp.interact_rect.center());
+            let center_bp = (((mp.x - rect.left()) / rect.width() * n as f32) as usize).min(n - 1);
+            let start = center_bp.saturating_sub(24);
+            let mut window: String = seq[start..(start + 48).min(n)].iter().map(|&b| b as char).collect();
+            if circular && start + 48 > n {
+                let tail: String = seq[..(start + 48 - n).min(start)].iter().map(|&b| b as char).collect();
+                window += &tail;
+            }
+            let mut xpos = rect.left() + 8.0;
+            for (k, ch) in window.chars().enumerate() {
+                let col = if start + k == center_bp { egui::Color32::WHITE } else { egui::Color32::from_rgb(30, 140, 255) };
+                p.text(egui::pos2(xpos, center_top + center_h / 2.0), egui::Align2::LEFT_CENTER, ch.to_string(), egui::FontId::monospace(28.0), col);
+                xpos += 17.0;
+            }
+            // position marker under the band
+            p.text(egui::pos2(rect.left() + 8.0, center_top + center_h + 4.0), egui::Align2::LEFT_TOP, format!("base {}", start + 1), egui::FontId::monospace(10.0), egui::Color32::from_gray(140));
+        }
+
+        if resp.clicked() {
+            if let Some(i) = hit {
+                self.sel_feat = Some(i);
+                self.side_top = SideTop::Style;
+                self.info = Some("Feature selected in the curtain view.".into());
+            }
+        }
+    }
+
+    // ---- Fragment view (FragmentView in SeqBuilder Pro) ----
+
+    /// View::Fragment: the sequence cut by the shown enzymes into fragments,
+    /// each drawn as a block with its boundary enzymes, the features inside
+    /// it and its length. Clicking a fragment selects its range.
+    fn fragment_view(&mut self, ui: &mut egui::Ui) {
+        let Some(d) = &self.doc else { return; };
+        let n = d.seq.len();
+        let potential = self.potential;
+        // owned snapshot of the fragment layout
+        let mut cuts: Vec<usize> = self.sites.iter()
+            .filter_map(|s| {
+                let e = &self.enz[s.enz];
+                cloning::hit_top_cut(&d.seq, s.pos, e.site.as_bytes(), e.top_cut, e.bot_cut, d.circular, |pat, b| iupac(pat, b, potential))
+            })
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let frag_ranges: Vec<(usize, usize)> = if cuts.is_empty() {
+            vec![(0, n)]
+        } else if d.circular {
+            let mut v: Vec<(usize, usize)> = cuts.windows(2).map(|w| (w[0], w[1])).collect();
+            v.push((cuts[cuts.len() - 1], cuts[0]));
+            v
+        } else {
+            let mut v: Vec<(usize, usize)> = vec![(0, cuts[0])];
+            v.extend(cuts.windows(2).map(|w| (w[0], w[1])));
+            v.push((cuts[cuts.len() - 1], n));
+            v
+        };
+        // enzyme names cutting at each boundary
+        let cut_enzymes: std::collections::HashMap<usize, Vec<String>> = {
+            let mut m: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
+            for s in &self.sites {
+                let e = &self.enz[s.enz];
+                if let Some(c) = cloning::hit_top_cut(&d.seq, s.pos, e.site.as_bytes(), e.top_cut, e.bot_cut, d.circular, |pat, b| iupac(pat, b, potential)) {
+                    m.entry(c).or_default().push(e.name.clone());
+                }
+            }
+            m
+        };
+        let feats: Vec<(usize, usize, String, egui::Color32)> = d.feats.iter().filter(|f| f.show).map(|f| {
+            let st = look(f);
+            (f.start, f.end, f.label.clone(), st.fill.map(|c| egui::Color32::from_rgb(c[0], c[1], c[2])).unwrap_or(egui::Color32::GRAY))
+        }).collect();
+
+        let row_h = 46.0;
+        egui::ScrollArea::vertical().show_rows(ui, row_h, frag_ranges.len().max(1), |ui, range| {
+            let base = range.start;
+            for (ri, (s, e)) in frag_ranges[range].iter().enumerate() {
+                let idx = base + ri;
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h - 6.0), egui::Sense::click());
+                let p = ui.painter_at(rect);
+                let len = if e > s { e - s } else { n - s + e };
+                let left = cut_enzymes.get(s).map(|v| v.join("+")).unwrap_or_default();
+                let right = cut_enzymes.get(e).map(|v| v.join("+")).unwrap_or_default();
+                let x = |bp: usize| rect.left() + ((bp - s) as f32 / len.max(1) as f32) * rect.width();
+                // the fragment body
+                p.rect_filled(rect, 4.0, egui::Color32::from_gray(30));
+                p.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, if resp.hovered() { egui::Color32::WHITE } else { egui::Color32::from_gray(90) }), egui::StrokeKind::Middle);
+                // features inside
+                for (fs, fe, label, col) in &feats {
+                    let (lo, hi) = if fs < fe { (*fs, *fe) } else { (*fs, *fe + n) };
+                    let (a, b) = (lo.max(*s), hi.min(*s + len));
+                    if b > a {
+                        let fr = egui::Rect::from_min_max(egui::pos2(x(a), rect.top() + 8.0), egui::pos2(x(b), rect.top() + 20.0));
+                        p.rect_filled(fr, 2.0, *col);
+                        p.text(fr.left_top(), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(9.0), egui::Color32::BLACK);
+                    }
+                }
+                // boundary enzymes and length
+                p.text(rect.left_top() + egui::vec2(6.0, 22.0), egui::Align2::LEFT_TOP, format!("{left} ▸"), egui::FontId::proportional(11.0), egui::Color32::from_rgb(120, 200, 255));
+                p.text(rect.right_top() + egui::vec2(-6.0, 22.0), egui::Align2::RIGHT_TOP, format!("◂ {right}"), egui::FontId::proportional(11.0), egui::Color32::from_rgb(120, 200, 255));
+                p.text(rect.center_bottom() + egui::vec2(0.0, -4.0), egui::Align2::RIGHT_BOTTOM, format!("{len} bp"), egui::FontId::monospace(11.0), egui::Color32::from_gray(170));
+                if resp.clicked() {
+                    self.sel = Some((*s, if e > s { *e } else { n }));
+                    self.info = Some(format!("Fragment {} selected: {} bp", idx + 1, len));
+                }
+            }
+        });
+    }
+
     // ---- Agarose gel (GelView in SeqBuilder Pro; File ▸ New Agarose Gel) ----
 
     /// View::Gel: agarose gel simulation of restriction digests — a molecular
@@ -1307,6 +1634,8 @@ impl App {
                 }
                 if ui.button("Save  ⌘S").clicked() { self.save(None); }
                 if ui.button("Save As…").clicked() { self.save_as(); }
+                if ui.add_enabled(self.doc.is_some(), egui::Button::new("Print…  ⌘P")).clicked() { self.print_doc(false); }
+                if ui.add_enabled(self.doc.is_some(), egui::Button::new("Print Selection…")).clicked() { self.print_doc(true); }
                 if ui.add_enabled(self.doc.is_some(), egui::Button::new("Export GenBank…")).clicked() { self.export(); }
                 if ui.button("Open Enzyme Files…").clicked() {
                     let ezd = rfd::FileDialog::new().add_filter("Enzyme file", &["ezd"]).pick_file();
@@ -1314,6 +1643,11 @@ impl App {
                     if let (Some(e), Some(s)) = (ezd, sel) {
                         if let (Ok(b), Ok(t)) = (std::fs::read(e), std::fs::read_to_string(s)) { self.load_enzymes(&b, &t); }
                     }
+                }
+            });
+            ui.menu_button("Search", |ui| {
+                if ui.add_enabled(self.doc.is_some(), egui::Button::new("Search for Sequences…")).clicked() {
+                    self.blast_open = true;
                 }
             });
             ui.menu_button("Edit", |ui| {
@@ -1385,6 +1719,7 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) { self.save(None); }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) { self.print_doc(false); }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) { self.new_feature(); }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) { self.new_dna(); }
         if !ctx.egui_wants_keyboard_input() {
@@ -2329,7 +2664,7 @@ impl eframe::App for App {
         if self.frames < 4 { ctx.request_repaint(); }
         if self.frames == 1 {
             if let Ok(v) = std::env::var("SEQBUILDER_VIEW") {
-                self.view = match v.as_str() { "linear" => View::Linear, "sequence" => View::Sequence, "primers" => View::PrimerDesign, "gel" => View::Gel, _ => self.view };
+                self.view = match v.as_str() { "linear" => View::Linear, "sequence" => View::Sequence, "primers" => View::PrimerDesign, "gel" => View::Gel, "curtain" => View::Curtain, "fragment" => View::Fragment, _ => self.view };
                 if self.view == View::Gel {
                     self.gel_show_ladder = true;
                     // SEQBUILDER_GEL="EcoRI,BamHI" digests with those enzymes
@@ -2367,23 +2702,32 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.view, View::Sequence, "Sequence");
                     ui.selectable_value(&mut self.view, View::PrimerDesign, "Primer Design");
                     ui.selectable_value(&mut self.view, View::Gel, "Agarose Gel");
+                    ui.selectable_value(&mut self.view, View::Curtain, "Curtain");
+                    ui.selectable_value(&mut self.view, View::Fragment, "Fragments");
                 });
             });
             // the gel view also runs without a document (ruler only)
-            if self.view == View::Gel {
-                self.gel_view(ui);
+            if matches!(self.view, View::Gel | View::Curtain | View::Fragment) {
+                match self.view {
+                    View::Gel => self.gel_view(ui),
+                    View::Curtain => self.curtain_view(ui),
+                    View::Fragment => self.fragment_view(ui),
+                    _ => unreachable!(),
+                }
             } else if let Some(d) = &self.doc {
                 match self.view {
                     View::Circular => self.page(ui, |p, r, ui| self.circular_map(p, r, ui, d)),
                     View::Linear => self.page(ui, |p, r, ui| self.linear_map(p, r, ui, d)),
                     View::Sequence => self.sequence_view(ui),
                     View::PrimerDesign => self.primer_design(ui),
-                    View::Gel => unreachable!(),
+                    View::Gel | View::Curtain | View::Fragment => unreachable!(),
                 }
             } else {
                 ui.centered_and_justified(|ui| ui.label("File ▸ Open… or drop a GenBank / FASTA file here"));
             }
         });
+        self.blast_poll(ctx);
+        if self.blast_open { self.blast_dialog(ui); }
         self.selector_manager(ctx);
         if self.edit_open && self.sel_feat.is_some() {
             let mut open = true;
