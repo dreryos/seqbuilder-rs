@@ -1099,9 +1099,17 @@ impl App {
         // ---- toolbar ----
         ui.horizontal(|ui| {
             ui.label("Ladder");
-            egui::ComboBox::from_id_salt("gel_ladder").selected_text(ladders[self.gel_ladder].name.clone()).show_ui(ui, |ui| {
+            // brand + product + name: products like Thermo Fisher's
+            // GeneRuler / O'RangeRuler / TrackIt share a brand and display
+            // name but carry different band sizes
+            let ladder_label = |l: &gel::Ladder| if l.product.is_empty() {
+                format!("{} — {}", l.brand, l.name)
+            } else {
+                format!("{} {} — {}", l.brand, l.product, l.name)
+            };
+            egui::ComboBox::from_id_salt("gel_ladder").selected_text(ladder_label(&ladders[self.gel_ladder])).show_ui(ui, |ui| {
                 for (i, l) in ladders.iter().enumerate() {
-                    ui.selectable_value(&mut self.gel_ladder, i, format!("{} — {}", l.brand, l.name));
+                    ui.selectable_value(&mut self.gel_ladder, i, ladder_label(l));
                 }
             });
             ui.separator();
@@ -1199,7 +1207,9 @@ impl App {
                 p.rect_filled(egui::Rect::from_min_size(egui::pos2(x0 + 3.0, y), egui::vec2(lane_w - 6.0, 3.0)), 1.0, egui::Color32::from_rgba_unmultiplied(255, 190, 90, 210));
                 bands.push((x0, x1, y, bp, 1.0));
                 if i % every == 0 {
-                    p.text(egui::pos2(x1 + 2.0, y - 6.0), egui::Align2::LEFT_TOP, format!("{bp}"), egui::FontId::monospace(10.0), egui::Color32::from_gray(150));
+                    // bp labels go into the empty well lane left of the ruler,
+                    // away from the digest lane's bands
+                    p.text(egui::pos2(x0 - 4.0, y - 6.0), egui::Align2::RIGHT_TOP, format!("{bp}"), egui::FontId::monospace(10.0), egui::Color32::from_gray(150));
                 }
             }
         }
@@ -1221,10 +1231,13 @@ impl App {
         }
         p.rect_stroke(medium, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Middle);
 
-        // hover: show the band's size next to the cursor
+        // hover: show the size of the band closest to the cursor
         if let Some(mp) = resp.hover_pos() {
             if medium.contains(mp) {
-                if let Some((_, _, _, bp, _)) = bands.iter().find(|(x0, x1, y, _, _)| mp.x >= *x0 && mp.x <= *x1 && (mp.y - *y).abs() < 5.0) {
+                let best = bands.iter()
+                    .filter(|(x0, x1, y, _, _)| mp.x >= *x0 && mp.x <= *x1 && (mp.y - *y).abs() < 5.0)
+                    .min_by(|a, b| (mp.y - a.2).abs().partial_cmp(&(mp.y - b.2).abs()).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some((_, _, _, bp, _)) = best {
                     let tpos = egui::pos2(mp.x + 12.0, mp.y - 18.0);
                     p.text(tpos, egui::Align2::LEFT_TOP, format!("{} bp", bp), egui::FontId::proportional(12.0), egui::Color32::WHITE);
                 }
@@ -2337,16 +2350,19 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.view, View::Gel, "Agarose Gel");
                 });
             });
-            let Some(d) = &self.doc else {
+            // the gel view also runs without a document (ruler only)
+            if self.view == View::Gel {
+                self.gel_view(ui);
+            } else if let Some(d) = &self.doc {
+                match self.view {
+                    View::Circular => self.page(ui, |p, r, ui| self.circular_map(p, r, ui, d)),
+                    View::Linear => self.page(ui, |p, r, ui| self.linear_map(p, r, ui, d)),
+                    View::Sequence => self.sequence_view(ui),
+                    View::PrimerDesign => self.primer_design(ui),
+                    View::Gel => unreachable!(),
+                }
+            } else {
                 ui.centered_and_justified(|ui| ui.label("File ▸ Open… or drop a GenBank / FASTA file here"));
-                return;
-            };
-            match self.view {
-                View::Circular => self.page(ui, |p, r, ui| self.circular_map(p, r, ui, d)),
-                View::Linear => self.page(ui, |p, r, ui| self.linear_map(p, r, ui, d)),
-                View::Sequence => self.sequence_view(ui),
-                View::PrimerDesign => self.primer_design(ui),
-                View::Gel => self.gel_view(ui),
             }
         });
         self.selector_manager(ctx);
