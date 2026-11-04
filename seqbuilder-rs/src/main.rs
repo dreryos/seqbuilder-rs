@@ -1096,8 +1096,9 @@ impl App {
             gel::digest_fragments(d.seq.len(), d.circular, &cuts)
         }).unwrap_or_default();
 
-        // ---- toolbar ----
-        ui.horizontal(|ui| {
+        // ---- toolbar (wrapped: two long selectors plus the digest controls
+        // must stay reachable at narrow window widths) ----
+        ui.horizontal_wrapped(|ui| {
             ui.label("Ladder");
             // brand + product + name: products like Thermo Fisher's
             // GeneRuler / O'RangeRuler / TrackIt share a brand and display
@@ -1128,9 +1129,11 @@ impl App {
             });
             ui.separator();
             ui.menu_button("Digest enzymes", |ui| {
-                // only enzymes with at least one resolvable cut on this
-                // molecule (recognition hits whose cuts exist in bounds —
-                // e.g. BsaI on a short linear fragment may match but not cut)
+                // enzymes with at least one resolvable cut on this molecule
+                // (recognition hits whose cuts exist in bounds — e.g. BsaI on
+                // a short linear fragment may match but not cut), plus any
+                // already-selected enzyme so it can be deselected even after
+                // the document changed and it no longer cuts
                 let cutting: Vec<usize> = self.doc.as_ref().map(|d| {
                     let potential = self.potential;
                     let mut v = vec![];
@@ -1138,7 +1141,11 @@ impl App {
                         if hits.is_empty() { continue; }
                         let e = &self.enz[i];
                         let resolvable = hits.iter().any(|&p| cloning::hit_top_cut(&d.seq, p, e.site.as_bytes(), e.top_cut, e.bot_cut, d.circular, |pat, b| iupac(pat, b, potential)).is_some());
-                        if resolvable { v.push(i); }
+                        if resolvable || self.gel_enzs.contains(&i) { v.push(i); }
+                    }
+                    // selections that no longer even match stay listed too
+                    for &sel in &self.gel_enzs {
+                        if !v.contains(&sel) { v.push(sel); }
                     }
                     v.sort_by_key(|&i| self.enz[i].name.clone());
                     v
@@ -1193,8 +1200,8 @@ impl App {
         let run_bottom = medium.max.y - 6.0;
 
         let lane_w = medium.width() / self.gel_lanes as f32;
-        // bands: (x0, x1, y, bp, brightness) for hover lookup
-        let mut bands: Vec<(f32, f32, f32, u32, f32)> = vec![];
+        // bands: (x0, x1, y, hover label, brightness) for hover lookup
+        let mut bands: Vec<(f32, f32, f32, String, f32)> = vec![];
 
         let band_y = |bp: u32| run_top + gel::migration_fraction(bp, min_bp, max_bp) * (run_bottom - run_top);
 
@@ -1205,7 +1212,7 @@ impl App {
             for (i, &bp) in ladder.sizes.iter().enumerate() {
                 let y = band_y(bp);
                 p.rect_filled(egui::Rect::from_min_size(egui::pos2(x0 + 3.0, y), egui::vec2(lane_w - 6.0, 3.0)), 1.0, egui::Color32::from_rgba_unmultiplied(255, 190, 90, 210));
-                bands.push((x0, x1, y, bp, 1.0));
+                bands.push((x0, x1, y, format!("{bp} bp"), 1.0));
                 if i % every == 0 {
                     // bp labels go into the empty well lane left of the ruler,
                     // away from the digest lane's bands
@@ -1219,14 +1226,24 @@ impl App {
             let (x0, x1) = (medium.min.x + offset * lane_w, medium.min.x + (offset + 1.0) * lane_w);
             let short: String = if sample_label.len() > 14 { sample_label.chars().take(13).collect::<String>() + "…" } else { sample_label.clone() };
             p.text(egui::pos2(x0 + 2.0, medium.min.y - 16.0), egui::Align2::LEFT_TOP, short, egui::FontId::proportional(11.0), egui::Color32::from_gray(170));
-            let total: u32 = frags.iter().sum();
-            for &f in &frags {
-                let y = band_y(f);
-                // equimolar digest: a band's mass share is its length
-                let bright = 0.25 + 0.75 * f as f32 / total.max(1) as f32;
+            // group equal-size fragments: each length is drawn once, with the
+            // summed mass of all fragments of that size (drawing them
+            // separately would stack alpha and over-brighten the band)
+            let total_mass: f32 = frags.iter().map(|&f| f as f32).sum();
+            let mut sorted = frags.clone();
+            sorted.sort_unstable();
+            let mut grouped: Vec<(u32, u32)> = vec![]; // (bp, count)
+            for f in sorted {
+                if let Some(last) = grouped.last_mut() { if last.0 == f { last.1 += 1; continue; } }
+                grouped.push((f, 1));
+            }
+            for (bp, count) in grouped {
+                let y = band_y(bp);
+                // equimolar digest: a band's mass share is its combined length
+                let bright = 0.25 + 0.75 * bp as f32 * count as f32 / total_mass.max(1.0);
                 let alpha = (255.0 * bright).min(230.0) as u8;
                 p.rect_filled(egui::Rect::from_min_size(egui::pos2(x0 + 3.0, y), egui::vec2(lane_w - 6.0, 3.5)), 1.0, egui::Color32::from_rgba_unmultiplied(255, 200, 110, alpha));
-                bands.push((x0, x1, y, f, bright));
+                bands.push((x0, x1, y, if count > 1 { format!("{} × {} bp", count, bp) } else { format!("{} bp", bp) }, bright));
             }
         }
         p.rect_stroke(medium, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Middle);
@@ -1237,9 +1254,9 @@ impl App {
                 let best = bands.iter()
                     .filter(|(x0, x1, y, _, _)| mp.x >= *x0 && mp.x <= *x1 && (mp.y - *y).abs() < 5.0)
                     .min_by(|a, b| (mp.y - a.2).abs().partial_cmp(&(mp.y - b.2).abs()).unwrap_or(std::cmp::Ordering::Equal));
-                if let Some((_, _, _, bp, _)) = best {
+                if let Some((_, _, _, label, _)) = best {
                     let tpos = egui::pos2(mp.x + 12.0, mp.y - 18.0);
-                    p.text(tpos, egui::Align2::LEFT_TOP, format!("{} bp", bp), egui::FontId::proportional(12.0), egui::Color32::WHITE);
+                    p.text(tpos, egui::Align2::LEFT_TOP, label.clone(), egui::FontId::proportional(12.0), egui::Color32::WHITE);
                 }
             }
         }
