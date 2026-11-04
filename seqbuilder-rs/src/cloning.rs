@@ -117,10 +117,9 @@ pub fn gibson_assemble(fragments: &[Vec<u8>], min_overlap: usize) -> Result<(Vec
 }
 
 /// Longest overlap where `a` ends with what `b` starts with (case-insensitive,
-/// up to 60 bases, shorter than half of either fragment — the maximum Gibson
-/// homology the assembler looks for).
+/// up to 60 bases — the maximum Gibson homology the assembler looks for).
 pub fn overlap(a: &[u8], b: &[u8]) -> Option<usize> {
-    let max = 60.min(a.len() / 2).min(b.len() / 2);
+    let max = 60.min(a.len()).min(b.len());
     (1..=max).rev().find(|&k| a.ends_with_ci(&b[..k]))
 }
 
@@ -154,19 +153,24 @@ pub fn offset_range(range: &str, delta: i64) -> String {
 }
 
 /// The top-strand cut position of a recognition-site hit starting at `p`.
-/// A forward-oriented site cuts at `p + top_cut`; a reverse-complement hit
-/// (the site matches the bottom strand) cuts at `p + len - bot_cut`. On a
-/// circular sequence cuts wrap modulo the length; on a linear one, cuts
-/// falling outside [0, n] do not exist. `matches` is the IUPAC pattern match
-/// (pattern byte, sequence byte) -> bool.
+/// A forward-oriented site cuts at `p + top_cut` (bottom at `p + bot_cut`);
+/// a reverse-complement hit cuts at `p + len - bot_cut` (bottom at
+/// `p + len - top_cut`). On a circular sequence cuts wrap modulo the length;
+/// on a linear one both strand cuts must lie within [0, n] for the boundary
+/// to exist. `matches` is the IUPAC pattern match (pattern byte, sequence
+/// byte) -> bool.
 pub fn hit_top_cut(seq: &[u8], p: usize, site: &[u8], top_cut: i32, bot_cut: i32, circular: bool, matches: impl Fn(u8, u8) -> bool) -> Option<usize> {
     let (n, l) = (seq.len(), site.len());
-    if l == 0 { return None; }
+    if l == 0 || n == 0 { return None; }
     if p + l > n && !circular { return None; }
     let forward = (0..l).all(|k| matches(site[k], seq[(p + k) % n]));
-    let cut = if forward { p as i64 + top_cut as i64 } else { p as i64 + l as i64 - bot_cut as i64 };
-    if circular { Some(cut.rem_euclid(n as i64) as usize) }
-    else if (0..=n as i64).contains(&cut) { Some(cut as usize) }
+    let (top, bot) = if forward {
+        (p as i64 + top_cut as i64, p as i64 + bot_cut as i64)
+    } else {
+        (p as i64 + l as i64 - bot_cut as i64, p as i64 + l as i64 - top_cut as i64)
+    };
+    if circular { Some(top.rem_euclid(n as i64) as usize) }
+    else if (0..=n as i64).contains(&top) && (0..=n as i64).contains(&bot) { Some(top as usize) }
     else { None }
 }
 
@@ -326,6 +330,28 @@ mod tests {
         assert_eq!(hit_top_cut(late, 9, b"GGTCTC", 7, 11, true, eq), Some(16 % 15));
         // linear: the same cut does not exist
         assert_eq!(hit_top_cut(late, 9, b"GGTCTC", 7, 11, false, eq), None);
+    }
+
+    #[test]
+    fn hit_top_cut_linear_requires_both_strand_cuts() {
+        let eq = |a: u8, b: u8| a == b;
+        // forward BsaI at 4 in a 14 bp molecule: top cut 11 is inside, but the
+        // bottom cut 15 is past the end — the restriction end does not exist
+        let seq = b"AAAAGGTCTCAAAA";
+        assert_eq!(seq.len(), 14);
+        assert_eq!(hit_top_cut(seq, 4, b"GGTCTC", 7, 11, false, eq), None);
+        // with two more bases both cuts exist and the top cut is 11
+        let seq = b"AAAAGGTCTCAAAAAA";
+        assert_eq!(hit_top_cut(seq, 4, b"GGTCTC", 7, 11, false, eq), Some(11));
+    }
+
+    #[test]
+    fn gibson_finds_homology_longer_than_half_a_fragment() {
+        // 16 bp of terminal homology in a 20 bp fragment
+        let a = b"ACGTAAAAAAAAAAAAAAAA".to_vec();
+        let b = b"AAAAAAAAAAAAAAAAGGG".to_vec();
+        let (out, _) = gibson_assemble(&[a, b], 12).unwrap();
+        assert_eq!(out, b"ACGTAAAAAAAAAAAAAAAAGGG");
     }
 
     #[test]

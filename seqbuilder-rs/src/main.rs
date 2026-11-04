@@ -917,11 +917,13 @@ impl App {
     /// Enzymes whose top-strand cut lands exactly on `pos`, among the sites
     /// shown for the current document. Reverse-oriented hits cut at
     /// p + len - bot_cut; circular cuts wrap modulo the length, so a cut at
-    /// `len` matches boundary 0, while cuts outside a linear sequence do not
-    /// exist as boundaries at all.
+    /// `len` matches boundary 0 (and a selection endpoint of `len` is
+    /// normalized to 0), while cuts outside a linear sequence do not exist
+    /// as boundaries at all.
     fn enzymes_cutting_at(&self, pos: usize) -> Vec<usize> {
         let Some(d) = &self.doc else { return vec![] };
         let potential = self.potential;
+        let pos = if d.circular { pos % d.seq.len().max(1) } else { pos };
         let mut out = vec![];
         for s in &self.sites {
             let e = &self.enz[s.enz];
@@ -979,9 +981,9 @@ impl App {
             None => { self.error = Some("No document open.".into()); return; }
             _ => {}
         }
-        let n = ins.len();
+        let (n, from) = (ins.len(), (ins.left_enz.clone(), ins.right_enz.clone()));
         self.edit_seq(x, y, &ins.top);
-        self.info = Some(format!("Ligated the {} bp insert ({} × {})", n, names.0, names.1));
+        self.info = Some(format!("Ligated the {} bp insert ({} × {} into {} × {})", n, from.0, from.1, names.0, names.1));
     }
 
     /// Cloning ▸ Clone Selected Fragment: a fresh document from the selection,
