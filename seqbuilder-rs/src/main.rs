@@ -1183,7 +1183,9 @@ impl App {
             min_bp = min_bp.min(f.max(1));
             max_bp = max_bp.max(f);
         }
-        let height = ui.available_height().min(440.0).max(220.0);
+        // never claim more height than the panel offers: bands at the bottom
+        // would be clipped out of view in narrow layouts
+        let height = ui.available_height().min(440.0);
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
         let p = ui.painter_at(rect);
         // UV transilluminator background
