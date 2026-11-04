@@ -201,13 +201,20 @@ fn short(label: &str) -> String {
     if label.chars().count() > 28 { label.chars().take(27).collect::<String>() + "…" } else { label.to_string() }
 }
 
-fn load(path: &Path) -> Result<Doc, String> {
+/// Read a sequence document; the count says how many records the file held
+/// (multi-record files open their first record).
+fn load(path: &Path) -> Result<(Doc, usize), String> {
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let text = std::fs::read(path).map_err(|e| e.to_string())?;
-    let mut doc = if text.first() == Some(&b'>') {
-        let seq: Vec<u8> = text.split(|&b| b == b'\n').filter(|l| !l.starts_with(b">"))
-            .flatten().copied().filter(u8::is_ascii_alphabetic).collect();
-        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false }
+    let (mut doc, records) = if text.first() == Some(&b'>') {
+        // FASTA: only the first record opens; later ones are counted, not merged
+        let mut seq: Vec<u8> = vec![];
+        let mut records = 0usize;
+        for line in text.split(|&b| b == b'\n') {
+            if line.starts_with(b">") { records += 1; }
+            else if records <= 1 { seq.extend(line.iter().copied().filter(u8::is_ascii_alphabetic)); }
+        }
+        (Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false }, records.max(1))
     } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sbd")) {
         let s = sbd::read(&text)?;
         let feats = s.feats.iter().map(|f| {
@@ -224,15 +231,20 @@ fn load(path: &Path) -> Result<Doc, String> {
             }
         }).collect();
         let locus = s.header_field("LOCUS", " ");
-        Doc {
-            name: locus.split_whitespace().next().map_or(name, str::to_owned),
-            definition: s.header_field("DEFINITION", " "), accession: s.header_field("ACCESSION", " "),
-            comment: s.header_field("COMMENT", "\n"),
-            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), header: s.header.clone(), sbd: Some(s), deleted: vec![], seq_dirty: false, topology_dirty: false,
-        }
+        (
+            Doc {
+                name: locus.split_whitespace().next().map_or(name, str::to_owned),
+                definition: s.header_field("DEFINITION", " "), accession: s.header_field("ACCESSION", " "),
+                comment: s.header_field("COMMENT", "\n"),
+                seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), header: s.header.clone(), sbd: Some(s), deleted: vec![], seq_dirty: false, topology_dirty: false,
+            },
+            1,
+        )
     } else {
-        let rec = gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())?
-            .into_iter().next().ok_or("no sequence in file")?;
+        let recs: Vec<_> = gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())?
+            .into_iter().collect();
+        let count = recs.len();
+        let rec = recs.into_iter().next().ok_or("no sequence in file")?;
         let len = rec.seq.len();
         let feats = rec.features.iter().filter_map(|f| {
             let (s, e) = f.location.find_bounds().ok()?;
@@ -259,16 +271,19 @@ fn load(path: &Path) -> Result<Doc, String> {
             })
         }).collect();
         let circular = rec.is_circular();
-        Doc {
-            name: rec.name.clone().unwrap_or(name), definition: rec.definition.clone().unwrap_or_default(),
-            accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
-            seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false,
-            header: text.iter().map(|&b| b as char).collect::<String>().split("\nFEATURES").next().unwrap_or_default().to_string() + "\n",
-            topology_dirty: false,
-        }
+        (
+            Doc {
+                name: rec.name.clone().unwrap_or(name), definition: rec.definition.clone().unwrap_or_default(),
+                accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
+                seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false,
+                header: text.iter().map(|&b| b as char).collect::<String>().split("\nFEATURES").next().unwrap_or_default().to_string() + "\n",
+                topology_dirty: false,
+            },
+            count,
+        )
     };
     doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
-    Ok(doc)
+    Ok((doc, records))
 }
 
 /// Style for documents that carry none (GenBank, FASTA).
@@ -499,7 +514,7 @@ struct App {
     clip_insert: Option<cloning::Insert>, // Copy/Paste Restriction Insert
     gib_open: bool,                       // Gibson / In-Fusion dialog
     gib_min: usize,                       // minimum overlap in bp
-    gib_frags: Vec<(String, Vec<u8>)>,    // fragments loaded in the dialog
+    gib_frags: Vec<(String, Vec<u8>, Vec<Feat>)>,  // fragments loaded in the dialog, with their features
     gel_ladder: usize,                    // index into the bundled Markers.tdl ladders
     gel_box: usize,                       // index into the bundled Gelbox.tdl boxes
     gel_lanes: usize,                     // chosen well count of the gel box
@@ -523,7 +538,10 @@ enum BlastMsg {
 impl App {
     fn open(&mut self, path: &Path) {
         match load(path) {
-            Ok(d) => {
+            Ok((d, records)) => {
+                if records > 1 {
+                    self.info = Some(format!("{} holds {} sequences — the first one ({} bp) is open", path.display(), records, d.seq.len()));
+                }
                 self.view = if d.circular { View::Circular } else { View::Sequence };
                 // GenBank CDS /transl_table qualifiers select the document's
                 // genetic code, as SeqBuilder Pro picks up (e.g. 11 for bacteria).
@@ -865,7 +883,7 @@ impl App {
         let Some(files) = Self::pick_sequences() else { return };
         let mut saved = 0;
         for p in files {
-            let Ok(d) = load(&p) else { continue };
+            let Ok((d, _)) = load(&p) else { continue };
             let out = p.with_extension("rc.gb");
             if std::fs::write(&out, export_genbank(&tools::reverse_complement(&d))).is_ok() { saved += 1; }
         }
@@ -879,7 +897,7 @@ impl App {
         let code = self.gen_code.clone();
         let mut saved = 0;
         for p in files {
-            let Ok(d) = load(&p) else { continue };
+            let Ok((d, _)) = load(&p) else { continue };
             let prot = tools::translate_protein(&d, &code);
             let mut out = format!(">{}_protein\n", d.name);
             for chunk in prot.as_bytes().chunks(60) {
@@ -895,7 +913,7 @@ impl App {
     /// offset to their new positions, saved as one GenBank file.
     fn tool_concatenate(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
-        let docs: Vec<Doc> = files.iter().filter_map(|p| load(p).ok()).collect();
+        let docs: Vec<Doc> = files.iter().filter_map(|p| load(p).ok().map(|(d, _)| d)).collect();
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
         let cat = tools::concatenate(&docs);
         let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name(format!("{}_concatenated.gb", cat.name)).save_file() else { return };
@@ -931,7 +949,7 @@ impl App {
     /// multi-FASTA file.
     fn tool_export_single(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
-        let docs: Vec<Doc> = files.iter().filter_map(|p| load(p).ok()).collect();
+        let docs: Vec<Doc> = files.iter().filter_map(|p| load(p).ok().map(|(d, _)| d)).collect();
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
         let n = docs.len();
         let Some(out) = rfd::FileDialog::new().add_filter("FASTA", &["fas"]).set_file_name("sequences.fas").save_file() else { return };
@@ -1063,19 +1081,39 @@ impl App {
     /// product as a GenBank file (circular only when the fragments close a circle).
     fn gibson_assemble_and_save(&mut self) {
         if self.gib_frags.len() < 2 { self.error = Some("Load at least two fragments.".into()); return; }
-        let frags: Vec<Vec<u8>> = self.gib_frags.iter().map(|(_, s)| s.clone()).collect();
-        let (assembled, circular) = match cloning::gibson_assemble(&frags, self.gib_min) {
+        let frags: Vec<Vec<u8>> = self.gib_frags.iter().map(|(_, s, _)| s.clone()).collect();
+        let (assembled, circular, spans) = match cloning::gibson_assemble(&frags, self.gib_min) {
             Ok(s) => s,
             Err(e) => { self.error = Some(e); return; }
         };
+        // carry the fragments' features into the product: a feature at
+        // [s..e) of fragment i lands at [out_start + s - in_start ..) of the
+        // assembly; wrap features and spans past the product are clamped
+        let mut feats: Vec<Feat> = vec![];
+        for ((_, _, ffeats), (out_start, in_start)) in self.gib_frags.iter().zip(spans.iter()) {
+            let delta = *out_start as i64 - *in_start as i64;
+            for f in ffeats {
+                if f.end <= f.start { continue; } // a wrap feature cannot shift into a linear product
+                let mut g = f.clone();
+                let (ns, ne) = (f.start as i64 + delta, f.end as i64 + delta);
+                if ns >= assembled.len() as i64 { continue; }
+                g.start = ns.max(0) as usize;
+                g.end = (ne.min(assembled.len() as i64)).max(g.start as i64 + 1) as usize;
+                if g.start >= assembled.len() { continue; }
+                g.range = cloning::offset_range(&f.range, delta);
+                g.lane = 0;
+                feats.push(g);
+            }
+        }
         let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name("assembly.gb").save_file() else { return };
-        let doc = Doc {
+        let mut doc = Doc {
             name: "assembly".into(), definition: String::new(), accession: String::new(), comment: String::new(),
-            seq: assembled, circular, feats: vec![], lanes: 0, hits: vec![], path: "Untitled".into(),
+            seq: assembled, circular, feats, lanes: 0, hits: vec![], path: "Untitled".into(),
             sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false,
         };
+        doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
         match std::fs::write(&out, export_genbank(&doc)) {
-            Ok(_) => self.info = Some(format!("Assembly written to {} ({})", out.display(), if circular { "circular" } else { "linear" })),
+            Ok(_) => self.info = Some(format!("Assembly written to {} ({} features, {})", out.display(), doc.feats.len(), if circular { "circular" } else { "linear" })),
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -2910,7 +2948,7 @@ impl eframe::App for App {
                             let mut failed = vec![];
                             for p in files {
                                 match load(&p) {
-                                    Ok(d) => self.gib_frags.push((d.name, d.seq)),
+                                    Ok((d, _)) => self.gib_frags.push((d.name, d.seq, d.feats)),
                                     Err(e) => failed.push(format!("{}: {e}", p.display())),
                                 }
                             }
@@ -2924,7 +2962,7 @@ impl eframe::App for App {
                 ui.add_space(4.0);
                 egui::Grid::new("gib_frags").num_columns(2).striped(true).show(ui, |ui| {
                     ui.strong("Fragment"); ui.strong("Length"); ui.end_row();
-                    for (name, seq) in &self.gib_frags {
+                    for (name, seq, _) in &self.gib_frags {
                         ui.label(name); ui.label(format!("{} bp", seq.len())); ui.end_row();
                     }
                 });
@@ -2936,7 +2974,7 @@ impl eframe::App for App {
                 });
                 // live preview of the pairwise overlaps
                 if self.gib_frags.len() >= 2 {
-                    let frags: Vec<&Vec<u8>> = self.gib_frags.iter().map(|(_, s)| s).collect();
+                    let frags: Vec<&Vec<u8>> = self.gib_frags.iter().map(|(_, s, _)| s).collect();
                     for w in frags.windows(2) {
                         let ov = cloning::overlap(w[0], w[1]).unwrap_or(0);
                         let mark = if ov >= self.gib_min { "✓" } else { "✗" };
@@ -2990,7 +3028,7 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     if let [_, flag, input, output] = &args[..] {
         if flag == "--export-genbank" {
-            let written = load(Path::new(input)).and_then(|d| std::fs::write(output, export_genbank(&d)).map_err(|e| e.to_string()));
+            let written = load(Path::new(input)).and_then(|(d, _)| std::fs::write(output, export_genbank(&d)).map_err(|e| e.to_string()));
             if let Err(e) = written { eprintln!("{input}: {e}"); std::process::exit(1); }
             return Ok(());
         }
@@ -3014,7 +3052,7 @@ mod tests {
 
     #[test]
     fn loads_genbank_features() {
-        let d = load(Path::new("testdata/pBR322.gb")).unwrap();
+        let d = load(Path::new("testdata/pBR322.gb")).unwrap().0;
         assert_eq!(d.seq.len(), 4361);
         assert!(d.circular);
         let bla = d.feats.iter().find(|f| f.label == "bla").expect("bla gene");
@@ -3042,13 +3080,13 @@ mod tests {
 
     #[test]
     fn sbd_matches_genbank() {
-        let (s, g) = (load(Path::new("testdata/pBR322.sbd")).unwrap(), load(Path::new("testdata/pBR322.gb")).unwrap());
+        let (s, g) = (load(Path::new("testdata/pBR322.sbd")).unwrap().0, load(Path::new("testdata/pBR322.gb")).unwrap().0);
         assert_eq!(s.seq.to_ascii_uppercase(), g.seq.to_ascii_uppercase());
         assert_eq!((s.name.as_str(), s.circular, s.feats.len()), ("SYNPBR322", true, g.feats.len()));
         for (a, b) in s.feats.iter().zip(&g.feats) {
             assert_eq!((&a.kind, a.start, a.end, a.strand), (&b.kind, b.start, b.end, b.strand), "{}", b.range);
         }
-        let red = load(Path::new("testdata/pBR322_blaRED.sbd")).unwrap();
+        let red = load(Path::new("testdata/pBR322_blaRED.sbd")).unwrap().0;
         assert_eq!(red.feats[38].style.unwrap().fill, Some([255, 0, 0]));
     }
 
@@ -3177,7 +3215,7 @@ mod tests {
     #[test]
     fn genbank_export_matches_seqbuilder() {
         let want = std::fs::read_to_string("testdata/pBR322_add.gbk").unwrap();
-        let out = export_genbank(&load(Path::new("testdata/pBR322_add.sbd")).unwrap());
+        let out = export_genbank(&load(Path::new("testdata/pBR322_add.sbd")).unwrap().0);
         if out != want {
             let line = out.lines().zip(want.lines()).position(|(a, b)| a != b);
             panic!("differs at line {line:?}: {:?}", line.map(|i| (out.lines().nth(i), want.lines().nth(i))));
@@ -3189,7 +3227,7 @@ mod tests {
     fn genbank_export_keeps_ncbi_content() {
         let ncbi = gb_io::reader::parse_file("testdata/pBR322.gb").unwrap().remove(0);
         for f in ["testdata/pBR322.gb", "testdata/pBR322.sbd"] {
-            let back = gb_io::reader::parse_slice(export_genbank(&load(Path::new(f)).unwrap()).as_bytes()).unwrap().remove(0);
+            let back = gb_io::reader::parse_slice(export_genbank(&load(Path::new(f)).unwrap().0).as_bytes()).unwrap().remove(0);
             assert!(back.seq == ncbi.seq && back.is_circular() && back.definition == ncbi.definition, "{f}");
             assert_eq!(back.features.len(), ncbi.features.len());
             let key = |f: &gb_io::seq::Feature| (f.location.find_bounds().unwrap(), f.kind.to_string());
@@ -3197,7 +3235,7 @@ mod tests {
             (a.sort(), b.sort());
             assert_eq!(a, b, "{f}");
         }
-        let out = export_genbank(&load(Path::new("testdata/ALDH2.sbd")).unwrap());
+        let out = export_genbank(&load(Path::new("testdata/ALDH2.sbd")).unwrap().0);
         let back = gb_io::reader::parse_slice(out.as_bytes()).unwrap().remove(0);
         assert_eq!((back.seq.len(), back.features.len(), back.is_circular()), (114842, 2, false));
         assert_eq!(back.features[1].location.to_gb_format(), "complement(5087..5124)");
@@ -3257,7 +3295,7 @@ mod tests {
     /// (its 1240..1276 is 1253..1289 of the saved ALDH2.sbd).
     #[test]
     fn base_statistics_match_seqbuilder() {
-        let d = load(Path::new("testdata/ALDH2.sbd")).unwrap();
+        let d = load(Path::new("testdata/ALDH2.sbd")).unwrap().0;
         let rows: std::collections::HashMap<String, String> = base_stats(&d.seq[1252..1289]).into_iter().collect();
         for (k, v) in [("% A", "21.62 [8]"), ("% A+T", "56.76 [21]"), ("% Ambiguous", "0.00 [0]"), ("% C", "32.43 [12]"),
             ("% G", "10.81 [4]"), ("% G+C", "43.24 [16]"), ("% T", "35.14 [13]"), ("% diCG", "0.00 [0]"),
@@ -3269,14 +3307,14 @@ mod tests {
 
     #[test]
     fn primers_tab_values() {
-        let d = load(Path::new("testdata/ALDH2.sbd")).unwrap();
+        let d = load(Path::new("testdata/ALDH2.sbd")).unwrap().0;
         let p = primer_sequence(&d.feats[0], &d.seq);
         assert_eq!(String::from_utf8_lossy(&p).to_uppercase(), "AGGCTGAGGCAGGAGAATGGCATGAACCCGGGAGGCGG");
         assert_eq!(format!("{:.1}", primers::tm(&p)), "77.7"); // SeqBuilder's Primers tab
         let r = primer_sequence(&d.feats[1], &d.seq);
         assert_eq!((r.len(), format!("{:.1}", primers::tm(&r))), (38, "77.7".to_string()));
         // Tm and dG SeqBuilder showed for the primers in pBR322_primers.sbd
-        let d = load(Path::new("testdata/pBR322_primers.sbd")).unwrap();
+        let d = load(Path::new("testdata/pBR322_primers.sbd")).unwrap().0;
         let shown: Vec<(String, String)> = d.feats.iter().filter(|f| f.kind == "PCR_primer").map(|f| {
             let p = primer_sequence(f, &d.seq);
             (format!("{:.1}", primers::tm(&p)), format!("{:.1}", primers::dg(&p)))

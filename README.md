@@ -42,6 +42,8 @@ codes — so a single binary runs with no installation or setup.
 | Fragments | The sequence cut by the shown enzymes, block per fragment with boundary enzymes |
 | Agarose Gel | Digest simulation — molecular ruler lanes, log-linear migration, band brightness by mass share |
 
+![Fragments view](seqbuilder-rs/screenshots/v0.7-fragments.png)
+
 ![Gel simulation](seqbuilder-rs/screenshots/v0.7-gel.png)
 
 **Online search**
@@ -50,19 +52,24 @@ codes — so a single binary runs with no installation or setup.
   query/midline/subject alignment of the selected hit
 
 **Output**
-- File ▸ Print… / Print Selection… (⌘P) writes the printed layout — numbered
-  60-base rows grouped in tens and the feature table — as a PDF
+- File ▸ Print… (⌘P) writes the printed layout of the whole document —
+  numbered 60-base rows grouped in tens and the feature table — as a PDF;
+  Print Selection… (menu only) prints the selected range instead
 
 ![Curtain view](seqbuilder-rs/screenshots/v0.7-curtain.png)
 
 ## Build from source
 
+The Rust crate lives in `seqbuilder-rs/`:
+
 ```bash
+cd seqbuilder-rs
 cargo build --release
 ```
 
-Requires a stable Rust toolchain. The binary is `target/release/seqbuilder-rs`;
-pass a file to open it, or use File ▸ Open… / drop a file onto the window.
+Requires a stable Rust toolchain. The binary is
+`seqbuilder-rs/target/release/seqbuilder-rs`; pass a file to open it, or use
+File ▸ Open… / drop a file onto the window.
 
 For screenshot-driven testing, the harness writes a PPM of the Nth frame when
 `SEQBUILDER_SHOT=path.ppm` is set; `SEQBUILDER_VIEW` selects the initial view
@@ -73,9 +80,10 @@ For screenshot-driven testing, the harness writes a PPM of the Nth frame when
 
 The repository's GitHub Actions workflow builds a portable Windows binary
 (runnable from any folder, no installer) on every dispatch. Download the
-`seqbuilder-rs-windows-portable` artifact from the
-[Actions page](../../actions/workflows/build-windows.yml) — trigger a run with
-*"Run workflow"* if the latest one predates a change you need.
+`seqbuilder-rs-windows-portable` artifact from the workflow's
+[Actions page](https://github.com/dreryos/seqbuilder-rs/actions/workflows/build-windows.yml) —
+trigger a run with *"Run workflow"* if the latest one predates a change you
+need.
 
 ## Project layout
 

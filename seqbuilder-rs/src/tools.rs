@@ -99,7 +99,7 @@ mod tests {
     use crate::genetic::GeneticCode;
 
     fn pbr322() -> Doc {
-        crate::load(std::path::Path::new("testdata/pBR322.gb")).unwrap()
+        crate::load(std::path::Path::new("testdata/pBR322.gb")).unwrap().0
     }
 
     #[test]
