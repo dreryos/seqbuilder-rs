@@ -153,6 +153,23 @@ pub fn offset_range(range: &str, delta: i64) -> String {
     out
 }
 
+/// The top-strand cut position of a recognition-site hit starting at `p`.
+/// A forward-oriented site cuts at `p + top_cut`; a reverse-complement hit
+/// (the site matches the bottom strand) cuts at `p + len - bot_cut`. On a
+/// circular sequence cuts wrap modulo the length; on a linear one, cuts
+/// falling outside [0, n] do not exist. `matches` is the IUPAC pattern match
+/// (pattern byte, sequence byte) -> bool.
+pub fn hit_top_cut(seq: &[u8], p: usize, site: &[u8], top_cut: i32, bot_cut: i32, circular: bool, matches: impl Fn(u8, u8) -> bool) -> Option<usize> {
+    let (n, l) = (seq.len(), site.len());
+    if l == 0 { return None; }
+    if p + l > n && !circular { return None; }
+    let forward = (0..l).all(|k| matches(site[k], seq[(p + k) % n]));
+    let cut = if forward { p as i64 + top_cut as i64 } else { p as i64 + l as i64 - bot_cut as i64 };
+    if circular { Some(cut.rem_euclid(n as i64) as usize) }
+    else if (0..=n as i64).contains(&cut) { Some(cut as usize) }
+    else { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +299,33 @@ mod tests {
         assert_eq!(offset_range("101..110", -100), "1..10");
         assert_eq!(offset_range("complement(3..50)", -2), "complement(1..48)");
         assert_eq!(offset_range("join(101..110,201..210)", -100), "join(1..10,101..110)");
+    }
+
+    #[test]
+    fn hit_top_cut_forward_and_reverse() {
+        // BsaI GGTCTC(1/5): top_cut 7, bot_cut 11
+        let eq = |a: u8, b: u8| a == b;
+        // forward site GGTCTC at 4 cuts the top strand at 4 + 7 = 11
+        let fwd = b"AAAAGGTCTCAAAAAAAAAA";
+        assert_eq!(hit_top_cut(fwd, 4, b"GGTCTC", 7, 11, false, eq), Some(11));
+        // reverse hit: revcomp(GGTCTC) = GAGACC at 5 cuts at 5 + 6 - 11 = 0
+        let rev = b"AAAAAGAGACCAAAAAAAA";
+        assert_eq!(hit_top_cut(rev, 5, b"GGTCTC", 7, 11, false, eq), Some(0));
+    }
+
+    #[test]
+    fn hit_top_cut_circular_wraps_and_linear_rejects() {
+        let eq = |a: u8, b: u8| a == b;
+        // circular: a cut landing on len is boundary 0
+        let seq = b"TTGAATTC";
+        // EcoRI GAATTC at 2: forward, top cut 3; on the 8-base circle a site at
+        // the end whose cut runs past len wraps
+        assert_eq!(hit_top_cut(seq, 2, b"GAATTC", 1, 5, true, eq), Some(3));
+        // a BsaI site late in a circular sequence cuts before the origin
+        let late = b"AAAAAAAAAGGTCTC";
+        assert_eq!(hit_top_cut(late, 9, b"GGTCTC", 7, 11, true, eq), Some(16 % 15));
+        // linear: the same cut does not exist
+        assert_eq!(hit_top_cut(late, 9, b"GGTCTC", 7, 11, false, eq), None);
     }
 
     #[test]

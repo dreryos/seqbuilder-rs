@@ -915,15 +915,18 @@ impl App {
     // ---- Cloning menu (CloningCommands in SeqBuilder Pro) ----
 
     /// Enzymes whose top-strand cut lands exactly on `pos`, among the sites
-    /// shown for the current document. Cuts are taken modulo the sequence
-    /// length so a cut at `len` on a circular document is the origin boundary 0.
+    /// shown for the current document. Reverse-oriented hits cut at
+    /// p + len - bot_cut; circular cuts wrap modulo the length, so a cut at
+    /// `len` matches boundary 0, while cuts outside a linear sequence do not
+    /// exist as boundaries at all.
     fn enzymes_cutting_at(&self, pos: usize) -> Vec<usize> {
-        let n = self.doc.as_ref().map_or(1, |d| d.seq.len()).max(1) as i64;
+        let Some(d) = &self.doc else { return vec![] };
+        let potential = self.potential;
         let mut out = vec![];
         for s in &self.sites {
             let e = &self.enz[s.enz];
-            let cut = (s.pos as i64 + e.top_cut as i64).rem_euclid(n);
-            if cut == pos as i64 % n { out.push(s.enz); }
+            let cut = cloning::hit_top_cut(&d.seq, s.pos, e.site.as_bytes(), e.top_cut, e.bot_cut, d.circular, |pat, b| iupac(pat, b, potential));
+            if cut == Some(pos) { out.push(s.enz); }
         }
         out.sort_unstable();
         out.dedup();
@@ -1008,7 +1011,8 @@ impl App {
                 f.end -= a;
                 f.range = cloning::offset_range(&f.range, -(a as i64));
             }
-            f.dirty = true;
+            // keep the remapped location text: marking these dirty would make
+            // GenBank export collapse join() locations to a single span
             f
         }).collect();
         let mut doc = Doc {
@@ -2255,8 +2259,15 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     if ui.button("Add fragments…").clicked() {
                         if let Some(files) = Self::pick_sequences() {
+                            let mut failed = vec![];
                             for p in files {
-                                if let Ok(d) = load(&p) { self.gib_frags.push((d.name, d.seq)); }
+                                match load(&p) {
+                                    Ok(d) => self.gib_frags.push((d.name, d.seq)),
+                                    Err(e) => failed.push(format!("{}: {e}", p.display())),
+                                }
+                            }
+                            if !failed.is_empty() {
+                                self.error = Some(format!("Could not load {}", failed.join("; ")));
                             }
                         }
                     }
