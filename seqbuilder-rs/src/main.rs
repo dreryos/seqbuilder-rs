@@ -6,6 +6,7 @@ mod genetic;
 mod orf;
 mod primers;
 mod sbd;
+mod tools;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use enzymes::{Enzyme, Selector};
@@ -489,6 +490,7 @@ struct App {
     gen_code: GeneticCode,
     gen_open: bool,          // Genetic Code editor dialog
     gen_pick: Option<usize>, // codon index picked in the editor
+    info: Option<String>,    // Tools completion messages, shown in the info bar
 }
 
 impl App {
@@ -815,6 +817,95 @@ impl App {
         self.refresh_sites();
     }
 
+    // ---- Tools menu (Tools*Panel in SeqBuilder Pro) ----
+
+    fn pick_sequences() -> Option<Vec<PathBuf>> {
+        rfd::FileDialog::new().add_filter("Sequence", &["sbd", "gb", "gbk", "genbank", "fasta", "fa", "fas", "seq"]).pick_files()
+    }
+
+    /// Tools ▸ Batch Reverse Complement: every picked sequence is written next
+    /// to itself as <stem>.rc.gb with the reverse-complemented sequence and
+    /// remapped features.
+    fn tool_batch_rc(&mut self) {
+        let Some(files) = Self::pick_sequences() else { return };
+        let mut saved = 0;
+        for p in files {
+            let Ok(d) = load(&p) else { continue };
+            let out = p.with_extension("rc.gb");
+            if std::fs::write(&out, export_genbank(&tools::reverse_complement(&d))).is_ok() { saved += 1; }
+        }
+        self.info = Some(format!("{saved} sequence(s) reverse-complemented"));
+    }
+
+    /// Tools ▸ Batch Translate: the frame-1 protein of every picked sequence,
+    /// written next to it as <stem>.prot.fas under the selected genetic code.
+    fn tool_batch_translate(&mut self) {
+        let Some(files) = Self::pick_sequences() else { return };
+        let code = self.gen_code.clone();
+        let mut saved = 0;
+        for p in files {
+            let Ok(d) = load(&p) else { continue };
+            let prot = tools::translate_protein(&d, &code);
+            let mut out = format!(">{}_protein\n", d.name);
+            for chunk in prot.as_bytes().chunks(60) {
+                out.push_str(&String::from_utf8_lossy(chunk));
+                out.push('\n');
+            }
+            if std::fs::write(p.with_extension("prot.fas"), out).is_ok() { saved += 1; }
+        }
+        self.info = Some(format!("{saved} sequence(s) translated"));
+    }
+
+    /// Tools ▸ Concatenate: the picked sequences joined end to end, features
+    /// offset to their new positions, saved as one GenBank file.
+    fn tool_concatenate(&mut self) {
+        let Some(files) = Self::pick_sequences() else { return };
+        let docs: Vec<Doc> = files.iter().filter_map(|p| load(p).ok()).collect();
+        if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
+        let cat = tools::concatenate(&docs);
+        let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name(format!("{}_concatenated.gb", cat.name)).save_file() else { return };
+        match std::fs::write(&out, export_genbank(&cat)) {
+            Ok(_) => self.info = Some(format!("Concatenated {} sequences to {}", docs.len(), out.display())),
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Tools ▸ Extract Features as Sequences: every feature of the open
+    /// document as a FASTA record, minus-strand features complemented.
+    fn tool_extract_features(&mut self) {
+        let Some(d) = &self.doc else { self.error = Some("No document open.".into()); return };
+        let feats = tools::extract_features(d);
+        if feats.is_empty() { self.error = Some("The document has no features.".into()); return; }
+        let name = d.name.clone();
+        let Some(out) = rfd::FileDialog::new().add_filter("FASTA", &["fas"]).set_file_name(format!("{name}_features.fas")).save_file() else { return };
+        let mut text = String::new();
+        for (label, bases) in feats {
+            text.push_str(&format!(">{label}\n"));
+            for chunk in bases.chunks(60) {
+                text.push_str(&String::from_utf8_lossy(chunk));
+                text.push('\n');
+            }
+        }
+        match std::fs::write(&out, text) {
+            Ok(_) => self.info = Some(format!("Features written to {}", out.display())),
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Tools ▸ Export Sequences into Single File: the picked sequences as one
+    /// multi-FASTA file.
+    fn tool_export_single(&mut self) {
+        let Some(files) = Self::pick_sequences() else { return };
+        let docs: Vec<Doc> = files.iter().filter_map(|p| load(p).ok()).collect();
+        if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
+        let n = docs.len();
+        let Some(out) = rfd::FileDialog::new().add_filter("FASTA", &["fas"]).set_file_name("sequences.fas").save_file() else { return };
+        match std::fs::write(&out, tools::to_fasta(&docs)) {
+            Ok(_) => self.info = Some(format!("{n} sequences exported to {}", out.display())),
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
     /// Enzymes passing selector `id` on the current sequence.
     fn selector_result(&self, id: u32) -> Vec<usize> {
         let Some(d) = &self.doc else { return vec![] };
@@ -912,6 +1003,13 @@ impl App {
             ui.menu_button("View", |ui| {
                 if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Clear History")).clicked() { (self.undo, self.redo) = (vec![], vec![]); }
             });
+            ui.menu_button("Tools", |ui| {
+                if ui.button("Batch Reverse Complement…").clicked() { self.tool_batch_rc(); }
+                if ui.button("Batch Translate…").clicked() { self.tool_batch_translate(); }
+                if ui.button("Concatenate…").clicked() { self.tool_concatenate(); }
+                if ui.button("Extract Features as Sequences…").clicked() { self.tool_extract_features(); }
+                if ui.button("Export Sequences into Single File…").clicked() { self.tool_export_single(); }
+            });
         });
     }
 
@@ -991,6 +1089,7 @@ impl App {
                 None => { ui.small(format!("Size: {:.1}x    Position: 1", self.zoom)); }
             }
             if let Some(e) = &self.error { ui.colored_label(Color32::RED, e); }
+            if let Some(i) = &self.info { ui.colored_label(Color32::GREEN, i); }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(d) = &self.doc { ui.small(size_label(d.seq.len())); }
             });
