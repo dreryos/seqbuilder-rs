@@ -915,12 +915,15 @@ impl App {
     // ---- Cloning menu (CloningCommands in SeqBuilder Pro) ----
 
     /// Enzymes whose top-strand cut lands exactly on `pos`, among the sites
-    /// shown for the current document.
+    /// shown for the current document. Cuts are taken modulo the sequence
+    /// length so a cut at `len` on a circular document is the origin boundary 0.
     fn enzymes_cutting_at(&self, pos: usize) -> Vec<usize> {
+        let n = self.doc.as_ref().map_or(1, |d| d.seq.len()).max(1) as i64;
         let mut out = vec![];
         for s in &self.sites {
             let e = &self.enz[s.enz];
-            if (s.pos as i64 + e.top_cut as i64) == pos as i64 { out.push(s.enz); }
+            let cut = (s.pos as i64 + e.top_cut as i64).rem_euclid(n);
+            if cut == pos as i64 % n { out.push(s.enz); }
         }
         out.sort_unstable();
         out.dedup();
@@ -979,7 +982,10 @@ impl App {
     }
 
     /// Cloning ▸ Clone Selected Fragment: a fresh document from the selection,
-    /// carrying the features that lie inside it.
+    /// carrying the features that lie inside it. Cloning a whole circular
+    /// document keeps its topology and every feature; a partial selection
+    /// becomes linear, with feature locations offset (join() structures in
+    /// range texts preserved).
     fn clone_fragment_doc(&mut self) {
         let (Some(d), Some((a, b))) = (&self.doc, self.sel) else {
             self.error = Some("Select the fragment to clone first.".into());
@@ -987,23 +993,31 @@ impl App {
         };
         let seq = cloning::clone_fragment(&d.seq, a, b);
         if seq.is_empty() { self.error = Some("The selection is empty.".into()); return; }
-        // features fully inside [a, b), offset to the new coordinates
+        let n = d.seq.len();
+        let full_circle = d.circular && a == 0 && b == n;
         let feats: Vec<Feat> = d.feats.iter().filter(|f| {
-            let (lo, hi) = if f.start < f.end { (f.start, f.end) } else { (f.start, f.end + d.seq.len()) };
+            if full_circle { return true; }
+            // a plain span fits when [lo, hi) lies inside [a, b); an
+            // origin-spanning feature cannot fit in a linear selection
+            let (lo, hi) = if f.start < f.end { (f.start, f.end) } else { (f.start, f.end + n) };
             lo >= a && hi <= b
         }).map(|f| {
             let mut f = f.clone();
-            f.start -= a;
-            f.end -= a;
-            f.range = if f.strand < 0 { format!("complement({}..{})", f.start + 1, f.end) } else { format!("{}..{}", f.start + 1, f.end) };
+            if !full_circle {
+                f.start -= a;
+                f.end -= a;
+                f.range = cloning::offset_range(&f.range, -(a as i64));
+            }
             f.dirty = true;
             f
         }).collect();
-        self.doc = Some(Doc {
+        let mut doc = Doc {
             name: format!("{}_fragment", d.name), definition: String::new(), accession: String::new(), comment: String::new(),
-            seq, circular: false, feats, lanes: 0, hits: vec![], path: "Untitled".into(),
+            seq, circular: full_circle, feats, lanes: 0, hits: vec![], path: "Untitled".into(),
             sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false,
-        });
+        };
+        doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
+        self.doc = Some(doc);
         (self.view, self.sel, self.sel_feat, self.caret, self.error) = (View::Sequence, None, None, Some(0), None);
         (self.undo, self.redo) = (vec![], vec![]);
         self.compute_hits();
@@ -1011,22 +1025,22 @@ impl App {
     }
 
     /// Cloning ▸ Gibson, In-Fusion: assemble the loaded fragments and save the
-    /// product as a GenBank file.
+    /// product as a GenBank file (circular only when the fragments close a circle).
     fn gibson_assemble_and_save(&mut self) {
         if self.gib_frags.len() < 2 { self.error = Some("Load at least two fragments.".into()); return; }
         let frags: Vec<Vec<u8>> = self.gib_frags.iter().map(|(_, s)| s.clone()).collect();
-        let assembled = match cloning::gibson_assemble(&frags, self.gib_min) {
+        let (assembled, circular) = match cloning::gibson_assemble(&frags, self.gib_min) {
             Ok(s) => s,
             Err(e) => { self.error = Some(e); return; }
         };
         let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name("assembly.gb").save_file() else { return };
         let doc = Doc {
             name: "assembly".into(), definition: String::new(), accession: String::new(), comment: String::new(),
-            seq: assembled, circular: true, feats: vec![], lanes: 0, hits: vec![], path: "Untitled".into(),
+            seq: assembled, circular, feats: vec![], lanes: 0, hits: vec![], path: "Untitled".into(),
             sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false,
         };
         match std::fs::write(&out, export_genbank(&doc)) {
-            Ok(_) => self.info = Some(format!("Assembly written to {}", out.display())),
+            Ok(_) => self.info = Some(format!("Assembly written to {} ({})", out.display(), if circular { "circular" } else { "linear" })),
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -2258,7 +2272,7 @@ impl eframe::App for App {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("Minimum overlap");
-                    ui.add(egui::DragValue::new(&mut self.gib_min).range(4..=120));
+                    ui.add(egui::DragValue::new(&mut self.gib_min).range(4..=60));
                     ui.label("bp");
                 });
                 // live preview of the pairwise overlaps
