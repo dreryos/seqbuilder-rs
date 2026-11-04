@@ -45,14 +45,19 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// Submit a BLAST job; returns the RID used to poll for results.
+/// Submit a BLAST job; returns the RID used to poll for results. The query
+/// goes in a POST body — long sequences would exceed any GET URL limit.
 pub fn submit(seq: &[u8], db: &str, program: &str, hitlist: usize) -> Result<String, String> {
     let seq = std::str::from_utf8(seq).map_err(|_| "the sequence is not ASCII text".to_string())?
         .bytes().filter(|b| !b" \r\n\t".contains(b)).map(|b| b as char).collect::<String>();
     if seq.is_empty() { return Err("the sequence is empty".into()); }
-    let url = format!("{BLAST_URL}?CMD=Put&PROGRAM={}&DATABASE={}&HITLIST_SIZE={}&QUERY={}",
+    let body = format!("CMD=Put&PROGRAM={}&DATABASE={}&HITLIST_SIZE={}&QUERY={}",
         urlencode(program), urlencode(db), hitlist, urlencode(&seq));
-    let body = http_get(&url)?;
+    let resp = ureq::post(BLAST_URL)
+        .timeout(std::time::Duration::from_secs(120))
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&body).map_err(|e| e.to_string())?;
+    let body = resp.into_string().map_err(|e| e.to_string())?;
     for line in body.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("RID = ") {
@@ -64,15 +69,22 @@ pub fn submit(seq: &[u8], db: &str, program: &str, hitlist: usize) -> Result<Str
 }
 
 /// Poll a submitted job: Ok(None) while it is still running, Ok(Some) with
-/// the parsed result once it finishes.
+/// the parsed result once it finishes. UNKNOWN (expired RID) and FAILED are
+/// terminal errors.
 pub fn poll(rid: &str) -> Result<Option<BlastResult>, String> {
     let url = format!("{BLAST_URL}?CMD=Get&FORMAT_TYPE=XML&RID={}", urlencode(rid));
     let body = http_get(&url)?;
     if body.contains("<BlastOutput") {
         return Ok(Some(parse_xml(&body, rid)?));
     }
-    if body.contains("Status=WAITING") || body.contains("Status=UNKNOWN") || body.contains("Status=FAILED") && body.contains("No results") {
+    if body.contains("Status=WAITING") {
         return Ok(None);
+    }
+    if body.contains("Status=UNKNOWN") {
+        return Err(format!("NCBI does not know RID {rid} (it may have expired)"));
+    }
+    if body.contains("Status=FAILED") {
+        return Err("NCBI reported the BLAST job as failed".into());
     }
     Err(format!("unexpected BLAST response for RID {rid}"))
 }

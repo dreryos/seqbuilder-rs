@@ -17,7 +17,25 @@ impl Default for Pdf {
 }
 
 fn escape(text: &str) -> String {
-    text.replace('\\', r"\\").replace('(', r"\(").replace(')', r"\)")
+    // PDF text strings are single-byte for the base-14 fonts: keep the
+    // escapes, transliterate the few punctuation marks we emit, and replace
+    // anything else non-ASCII with '?'
+    let mut out = String::new();
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str(r"\\"),
+            '(' => out.push_str(r"\("),
+            ')' => out.push_str(r"\)"),
+            '\t' => out.push(' '),
+            '\r' | '\n' => out.push(' '),
+            '—' => out.push('-'),
+            '–' => out.push('-'),
+            '…' => out.push_str("..."),
+            c if (c as u32) < 128 => out.push(c),
+            _ => out.push('?'),
+        }
+    }
+    out
 }
 
 impl Pdf {
@@ -56,45 +74,41 @@ impl Pdf {
     pub fn finish(mut self) -> Vec<u8> {
         if !self.ops.is_empty() { self.flush(); }
         let n_pages = self.pages.len();
-        let mut objs: Vec<String> = vec![]; // object bodies, 1-indexed
+        // ids: 1 catalog, 2 pages tree, then per page (content stream, page),
+        // finally the three base-14 fonts — all sequential, so every xref
+        // entry has a real offset
+        let f1 = 3 + 2 * n_pages;
+        let (f2, f3) = (f1 + 1, f1 + 2);
+        let max_id = f3 + 1;
 
-        // 1: catalog, 2: pages tree; then per page: content stream + page obj
-        let mut page_ids = vec![];
-        let mut next_id = 3;
-        for content in &self.pages {
-            let stream_id = next_id;
-            objs.push(format!("<< /Length {} >>\nstream\n{}\nendstream", content.iter().map(|s| s.len() + 1).sum::<usize>(), content.join("\n")));
-            let page_id = next_id + 1;
-            objs.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1000 0 R /F2 1001 0 R /F3 1002 0 R >> >> /Contents {stream_id} 0 R >>"));
-            page_ids.push(page_id);
-            next_id += 2;
-        }
-        let kids: Vec<String> = page_ids.iter().map(|id| format!("{id} 0 R")).collect();
-        let pages_obj = format!("<< /Type /Pages /Kids [{}] /Count {n_pages} >>", kids.join(" "));
-
-        let mut out = format!("%PDF-1.4\n").into_bytes();
-        let mut offsets = vec![0usize]; // byte offset of object i (1-indexed)
-        let mut write_obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str| {
-            offsets.push(out.len());
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = vec![0usize; max_id]; // offsets[id], objects are 1-based
+        let mut write = |out: &mut Vec<u8>, offsets: &mut [usize], id: usize, body: String| {
+            offsets[id] = out.len();
             out.extend_from_slice(format!("{id} 0 obj\n{body}\nendobj\n").as_bytes());
         };
-        write_obj(&mut out, &mut offsets, 1, "<< /Type /Catalog /Pages 2 0 R >>");
-        write_obj(&mut out, &mut offsets, 2, &pages_obj);
-        for (i, body) in objs.iter().enumerate() {
-            write_obj(&mut out, &mut offsets, 3 + i, body);
+        write(&mut out, &mut offsets, 1, "<< /Type /Catalog /Pages 2 0 R >>".into());
+        let mut kids: Vec<String> = vec![];
+        for (i, content) in self.pages.iter().enumerate() {
+            let stream_id = 3 + 2 * i;
+            let stream: String = content.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("\n");
+            write(&mut out, &mut offsets, stream_id, format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len() + 1));
+            let page_id = stream_id + 1;
+            write(&mut out, &mut offsets, page_id, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 {f1} 0 R /F2 {f2} 0 R /F3 {f3} 0 R >> >> /Contents {stream_id} 0 R >>"));
+            kids.push(format!("{page_id} 0 R"));
         }
-        // base-14 fonts at fixed ids 1000-1002
-        write_obj(&mut out, &mut offsets, 1000, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
-        write_obj(&mut out, &mut offsets, 1001, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>");
-        write_obj(&mut out, &mut offsets, 1002, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>");
+        write(&mut out, &mut offsets, 2, format!("<< /Type /Pages /Kids [{}] /Count {n_pages} >>", kids.join(" ")));
+        write(&mut out, &mut offsets, f1, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into());
+        write(&mut out, &mut offsets, f2, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>".into());
+        write(&mut out, &mut offsets, f3, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".into());
 
         let xref_pos = out.len();
-        let max_id = 1003;
         out.extend_from_slice(format!("xref\n0 {max_id}\n").as_bytes());
         out.extend_from_slice(b"0000000000 65535 f \n");
         for id in 1..max_id {
-            let off = offsets.get(id).copied().unwrap_or(0);
-            if off > 0 && (id <= 2 + objs.len() || id >= 1000) {
+            let off = offsets[id];
+            if off > 0 {
                 out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
             } else {
                 out.extend_from_slice(b"0000000000 65535 f \n");
@@ -178,14 +192,33 @@ mod tests {
         let mut pdf = Pdf::new();
         pdf.page();
         pdf.text(40.0, 800.0, 12.0, Font::Courier, "ACGT");
+        pdf.text(40.0, 780.0, 12.0, Font::Courier, "pUC — x…y"); // non-ASCII must not corrupt the string
         pdf.line(40.0, 790.0, 500.0, 790.0);
         let bytes = pdf.finish();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.starts_with("%PDF-1.4"));
         assert!(s.contains("/Type /Catalog"));
         assert!(s.contains("(ACGT) Tj"));
+        assert!(s.contains("(pUC - x...y) Tj"));
         assert!(s.ends_with("%%EOF"));
         assert!(s.contains("startxref"));
+        // every in-use xref entry must resolve to that exact object header
+        let sx = s.rfind("startxref").unwrap();
+        let xref_pos: usize = s[sx + 10..].trim().lines().next().unwrap().parse().unwrap();
+        assert!(s[xref_pos..].starts_with("xref"));
+        let xref = &s[xref_pos..xref_pos + s[xref_pos..].find("trailer").unwrap()];
+        let mut entries = xref.lines();
+        assert_eq!(entries.next().unwrap(), "xref");
+        let count: usize = entries.next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        let lines: Vec<&str> = entries.collect();
+        assert_eq!(lines.len(), count);
+        assert!(lines[0].trim().ends_with('f'));
+        for (id, line) in lines.iter().enumerate().skip(1) {
+            if line.trim().ends_with('n') {
+                let off: usize = line[..10].parse().unwrap();
+                assert!(s[off..].starts_with(&format!("{id} 0 obj")), "xref entry for object {id} points at offset {off}: {}", &s[off..off + 24]);
+            }
+        }
     }
 
     #[test]
@@ -198,7 +231,7 @@ mod tests {
         assert!(pages >= 2, "70 rows do not fit one page: {pages}");
         let bytes = pdf.finish();
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("pBR322 — circular — 4200 bp"));
+        assert!(s.contains("pBR322 - circular - 4200 bp"));
         assert!(s.contains("Features"));
         assert!(s.contains("101..900"));
     }

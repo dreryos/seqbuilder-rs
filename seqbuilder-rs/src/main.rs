@@ -515,8 +515,8 @@ struct App {
 
 /// Messages from the background BLAST thread.
 enum BlastMsg {
-    Running(String),               // RID assigned, polling
-    Done(blast::BlastResult),
+    Running(String),                       // RID assigned, polling
+    Done(String, Box<blast::BlastResult>),  // document the result belongs to
     Failed(String),
 }
 
@@ -537,6 +537,11 @@ impl App {
                 self.sel = None;
                 self.sel_feat = None;
                 self.orf_sel = None;
+                // a running BLAST search belongs to the previous document:
+                // dropping the receiver stops its worker, stale results go
+                self.blast_rx = None;
+                self.blast_hits = None;
+                self.blast_pick = None;
                 self.compute_hits();
                 // SeqBuilder opens a sequence showing its default selector's enzymes.
                 if let Some(id) = self.sels.iter().find(|s| s.name.contains("Unique Six+")).map(|s| s.id) { self.apply_selector(id); }
@@ -1079,7 +1084,9 @@ impl App {
 
     /// File ▸ Print… / Print Selection…: lay the document out as a PDF
     /// (numbered 60-base rows, feature table) and save it — the portable
-    /// equivalent of the print panel's "Save as PDF" path.
+    /// equivalent of the print panel's "Save as PDF" path. Feature ranges
+    /// are printed in absolute document coordinates; an origin-spanning
+    /// feature prints as its two segments.
     fn print_doc(&mut self, selection: bool) {
         let Some(d) = &self.doc else { self.error = Some("No document open.".into()); return; };
         let (seq, first) = if selection {
@@ -1089,16 +1096,31 @@ impl App {
             }
         } else { (d.seq.clone(), 0) };
         if seq.is_empty() { self.error = Some("Nothing to print.".into()); return; }
-        let feats: Vec<(String, u32, u32, i32)> = d.feats.iter()
-            .filter(|f| f.start >= first && f.end <= first + seq.len())
-            .map(|f| (f.name.clone(), (f.start - first) as u32, (f.end - first) as u32, f.strand as i32))
-            .collect();
+        let last = first + seq.len();
+        let mut feats: Vec<(String, u32, u32, i32)> = vec![];
+        for f in d.feats.iter().filter(|f| f.show) {
+            if f.end >= f.start {
+                // ordinary feature: keep if it lies inside the printed range
+                if f.start >= first && f.end <= last {
+                    feats.push((f.name.clone(), f.start as u32, f.end as u32, f.strand as i32));
+                }
+            } else if first == 0 {
+                // origin-spanning feature on a whole-document printout: two rows
+                feats.push((f.name.clone(), f.start as u32, d.seq.len() as u32, f.strand as i32));
+                if f.end > 0 { feats.push((f.name.clone(), 0, f.end as u32, f.strand as i32)); }
+            }
+            // a wrapping feature cannot lie fully inside a linear selection
+        }
         let (name, topology) = (d.name.clone(), if d.circular { "circular" } else { "linear" });
         let pd = print::PrintDoc { name: &name, topology, seq: &seq, features: &feats, first_base: first };
         let mut pdf = print::Pdf::new();
         let pages = print::layout(&mut pdf, &pd);
+        let bytes = pdf.finish();
         let Some(out) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{}.pdf", name)).save_file() else { return };
-        match std::fs::write(&out, pdf.finish()) {
+        // write to a sibling temp file and rename, so a failed write cannot
+        // destroy an existing printout
+        let tmp = out.with_extension("part");
+        match std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &out)) {
             Ok(_) => self.info = Some(format!("Printout written to {} ({} page{})", out.display(), pages, if pages == 1 { "" } else { "s" })),
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -1113,7 +1135,7 @@ impl App {
         egui::Window::new("Search for Sequences (BLAST)").open(&mut self.blast_open).default_width(560.0).show(ui.ctx(), |ui| {
             ui.horizontal(|ui| {
                 ui.label("Database");
-                let dbs = ["core_nt", "nr", "refseq_rna", "16S_ribosomal_RNA", "env_nt"];
+                let dbs = ["core_nt", "refseq_rna", "refseq_genomics", "16S_ribosomal_RNA", "env_nt"];
                 let sel = if self.blast_db.is_empty() { "core_nt".to_string() } else { self.blast_db.clone() };
                 egui::ComboBox::from_id_salt("blast_db").selected_text(sel).show_ui(ui, |ui| {
                     for db in dbs { ui.selectable_value(&mut self.blast_db, db.to_string(), db); }
@@ -1121,22 +1143,26 @@ impl App {
                 if ui.add_enabled(self.doc.is_some() && self.blast_rx.is_none(), egui::Button::new("Submit")).clicked() {
                     let Some(d) = &self.doc else { return };
                     let (seq, db) = (d.seq.clone(), if self.blast_db.is_empty() { "core_nt".to_string() } else { self.blast_db.clone() });
+                    let doc_name = d.name.clone();
                     self.blast_hits = None;
                     self.blast_pick = None;
                     let (tx, rx) = std::sync::mpsc::channel();
                     self.blast_rx = Some(rx);
                     std::thread::spawn(move || {
+                        // hard deadline for the whole search, and stop as soon
+                        // as the dialog closes and drops the receiver
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
                         match blast::submit(&seq, &db, "blastn", 50) {
                             Ok(rid) => {
-                                let _ = tx.send(BlastMsg::Running(rid.clone()));
-                                for _ in 0..40 { // poll up to ~10 minutes
+                                if tx.send(BlastMsg::Running(rid.clone())).is_err() { return; }
+                                while std::time::Instant::now() < deadline {
                                     match blast::poll(&rid) {
-                                        Ok(Some(res)) => { let _ = tx.send(BlastMsg::Done(res)); return; }
+                                        Ok(Some(res)) => { let _ = tx.send(BlastMsg::Done(doc_name, Box::new(res))); return; }
                                         Ok(None) => std::thread::sleep(std::time::Duration::from_secs(15)),
                                         Err(e) => { let _ = tx.send(BlastMsg::Failed(e)); return; }
                                     }
                                 }
-                                let _ = tx.send(BlastMsg::Failed("BLAST did not finish in 10 minutes".into()));
+                                let _ = tx.send(BlastMsg::Failed("BLAST did not finish within 10 minutes".into()));
                             }
                             Err(e) => { let _ = tx.send(BlastMsg::Failed(e)); }
                         }
@@ -1155,7 +1181,7 @@ impl App {
                             let picked = self.blast_pick == Some(i);
                             if ui.selectable_label(picked, format!("{:<12} {:>5.1}%  {:>5} bp  {:>7}  e={:<9} {}",
                                 h.accession, h.identity * 100.0 / h.length.max(1) as f32, h.length, h.bits, h.evalue,
-                                if h.definition.len() > 60 { format!("{}…", &h.definition[..57]) } else { h.definition.clone() })).clicked() {
+                                if h.definition.chars().count() > 60 { let t: String = h.definition.chars().take(57).collect(); format!("{t}…") } else { h.definition.clone() })).clicked() {
                                 self.blast_pick = Some(i);
                             }
                         }
@@ -1188,15 +1214,21 @@ impl App {
         }
     }
 
-    /// Drain the background BLAST thread's messages.
+    /// Drain the background BLAST thread's messages. Results from a document
+    /// other than the one now open are discarded.
     fn blast_poll(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.blast_rx else { return };
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 BlastMsg::Running(_) => ctx.request_repaint(),
-                BlastMsg::Done(res) => {
-                    self.info = Some(format!("BLAST finished: {} hits", res.hits.len()));
-                    self.blast_hits = Some(res);
+                BlastMsg::Done(name, res) => {
+                    let hits = res.hits.len();
+                    if self.doc.as_ref().map(|d| d.name.as_str()) == Some(name.as_str()) {
+                        self.info = Some(format!("BLAST finished: {hits} hits"));
+                        self.blast_hits = Some(*res);
+                    } else {
+                        self.info = Some("BLAST finished, but the document changed — results discarded.".into());
+                    }
                     self.blast_rx = None;
                     ctx.request_repaint();
                     return;
@@ -1217,23 +1249,23 @@ impl App {
     /// View::Curtain: the presentation view — linear rulers top and bottom,
     /// feature curtains stacked in lanes, and the sequence itself large in a
     /// central band that follows the cursor. Clicking a curtain selects the
-    /// feature.
+    /// feature. An origin-spanning feature draws both of its segments.
     fn curtain_view(&mut self, ui: &mut egui::Ui) {
         let Some(d) = &self.doc else { return; };
         let n = d.seq.len().max(1);
-        // owned snapshot: the interaction below needs &mut self
+        // owned snapshot: the interaction below needs &mut self. Entries
+        // carry the original d.feats index for selection.
         let (circular, lanes) = (d.circular, d.lanes);
         let seq = d.seq.clone();
-        let feats: Vec<(usize, usize, usize, String, egui::Color32, egui::Color32)> = d.feats.iter()
-            .filter(|f| f.show)
-            .map(|f| {
+        let feats: Vec<(usize, usize, usize, usize, String, egui::Color32, egui::Color32)> = d.feats.iter().enumerate()
+            .filter(|(_, f)| f.show)
+            .map(|(idx, f)| {
                 let st = look(f);
                 let line = st.line.map(|c| egui::Color32::from_rgb(c[0], c[1], c[2])).unwrap_or(egui::Color32::WHITE);
                 let fill = st.fill.map(|c| egui::Color32::from_rgb(c[0], c[1], c[2])).unwrap_or(egui::Color32::GRAY);
-                (f.start, f.end, f.lane, f.label.clone(), line, fill)
+                (idx, f.start, f.end, f.lane, f.label.clone(), line, fill)
             })
             .collect();
-        let n_lanes = (lanes + 1).max(1);
 
         let avail = ui.available_size();
         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
@@ -1252,48 +1284,69 @@ impl App {
             }
         }
 
-        // feature curtains, one band per lane
+        // feature curtains, one band per lane; the band height shrinks so the
+        // central sequence band always fits the viewport
+        const CENTER_H: f32 = 64.0;
         let band_top = rect.top() + 30.0;
-        let band_h = 22.0;
+        let n_lanes = (lanes + 1).max(1);
+        let usable = (rect.height() - 30.0 - 16.0 - CENTER_H - 30.0).max(40.0);
+        let band_h = ((usable / n_lanes as f32) - 2.0).clamp(5.0, 22.0);
         let center_top = band_top + n_lanes as f32 * (band_h + 2.0) + 8.0;
-        let center_h = 64.0;
-        let mut hit: Option<usize> = None; // index into feats under the cursor
+
+        // visible spans of a feature: [s..e), or [s..n) + [0..e) when it wraps
+        let spans = |s: usize, e: usize| -> Vec<(usize, usize)> {
+            if e > s { vec![(s, e)] } else if e == 0 { vec![(s, n)] } else { vec![(s, n), (0, e)] }
+        };
+        let mut hit: Option<usize> = None; // original d.feats index under the cursor
         if let Some(mp) = resp.hover_pos() {
-            for (i, (s, e, lane, _, _, _)) in feats.iter().enumerate() {
-                let (lo, hi) = if s < e { (*s, *e) } else { (*s, *e + n) };
+            'outer: for (idx, s, e, lane, _, _, _) in feats.iter() {
                 let y0 = band_top + *lane as f32 * (band_h + 2.0);
-                if mp.y >= y0 && mp.y <= y0 + band_h && mp.x >= x(lo) && mp.x <= x(hi.min(n)) { hit = Some(i); }
+                if mp.y < y0 || mp.y > y0 + band_h { continue; }
+                for (lo, hi) in spans(*s, *e) {
+                    if mp.x >= x(lo) && mp.x <= x(hi) { hit = Some(*idx); break 'outer; }
+                }
             }
         }
-        for (i, (s, e, lane, label, line, fill)) in feats.iter().enumerate() {
-            let (lo, hi) = if s < e { (*s, *e) } else { (*s, *e + n) };
+        for (idx, s, e, lane, label, line, fill) in feats.iter() {
             let y0 = band_top + *lane as f32 * (band_h + 2.0);
-            let (fx0, fx1) = (x(lo), x(hi.min(n)).max(x(lo) + 2.0));
-            let col = if hit == Some(i) { egui::Color32::WHITE } else { *line };
-            p.rect_filled(egui::Rect::from_min_max(egui::pos2(fx0, y0), egui::pos2(fx1, y0 + band_h)), 3.0, *fill);
-            p.rect_stroke(egui::Rect::from_min_max(egui::pos2(fx0, y0), egui::pos2(fx1, y0 + band_h)), 3.0, egui::Stroke::new(1.0, col), egui::StrokeKind::Middle);
-            p.text(egui::pos2(fx0 + 4.0, y0 + band_h / 2.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(10.0), egui::Color32::BLACK);
+            let hovered = hit == Some(*idx);
+            for (lo, hi) in spans(*s, *e) {
+                let (fx0, fx1) = (x(lo), x(hi).max(x(lo) + 2.0));
+                let col = if hovered { egui::Color32::WHITE } else { *line };
+                p.rect_filled(egui::Rect::from_min_max(egui::pos2(fx0, y0), egui::pos2(fx1, y0 + band_h)), 3.0, *fill);
+                p.rect_stroke(egui::Rect::from_min_max(egui::pos2(fx0, y0), egui::pos2(fx1, y0 + band_h)), 3.0, egui::Stroke::new(1.0, col), egui::StrokeKind::Middle);
+                if band_h >= 10.0 {
+                    p.text(egui::pos2(fx0 + 4.0, y0 + band_h / 2.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(10.0), egui::Color32::BLACK);
+                }
+            }
         }
 
         // the sequence band: 48 bases centred on the cursor position (the
-        // middle of the view when the pointer is elsewhere)
+        // middle of the view when the pointer is elsewhere), wrapping the
+        // origin on both sides of a circular document
         {
             let mp = resp.hover_pos().unwrap_or_else(|| resp.interact_rect.center());
             let center_bp = (((mp.x - rect.left()) / rect.width() * n as f32) as usize).min(n - 1);
-            let start = center_bp.saturating_sub(24);
-            let mut window: String = seq[start..(start + 48).min(n)].iter().map(|&b| b as char).collect();
-            if circular && start + 48 > n {
-                let tail: String = seq[..(start + 48 - n).min(start)].iter().map(|&b| b as char).collect();
-                window += &tail;
+            let mut window = String::new();
+            if circular {
+                let start = (center_bp + n - 24) % n;
+                for k in 0..48 { window.push(seq[(start + k) % n] as char); }
+            } else {
+                let start = center_bp.saturating_sub(24);
+                for k in 0..48 {
+                    if start + k >= n { break; }
+                    window.push(seq[start + k] as char);
+                }
             }
             let mut xpos = rect.left() + 8.0;
+            let start_bp = if circular { (center_bp + n - 24) % n } else { center_bp.saturating_sub(24) };
             for (k, ch) in window.chars().enumerate() {
-                let col = if start + k == center_bp { egui::Color32::WHITE } else { egui::Color32::from_rgb(30, 140, 255) };
-                p.text(egui::pos2(xpos, center_top + center_h / 2.0), egui::Align2::LEFT_CENTER, ch.to_string(), egui::FontId::monospace(28.0), col);
+                let col = if (start_bp + k) % n.max(1) == center_bp { egui::Color32::WHITE } else { egui::Color32::from_rgb(30, 140, 255) };
+                p.text(egui::pos2(xpos, center_top + CENTER_H / 2.0), egui::Align2::LEFT_CENTER, ch.to_string(), egui::FontId::monospace(28.0), col);
                 xpos += 17.0;
             }
             // position marker under the band
-            p.text(egui::pos2(rect.left() + 8.0, center_top + center_h + 4.0), egui::Align2::LEFT_TOP, format!("base {}", start + 1), egui::FontId::monospace(10.0), egui::Color32::from_gray(140));
+            p.text(egui::pos2(rect.left() + 8.0, center_top + CENTER_H + 4.0), egui::Align2::LEFT_TOP, format!("base {}", center_bp + 1), egui::FontId::monospace(10.0), egui::Color32::from_gray(140));
         }
 
         if resp.clicked() {
@@ -1323,7 +1376,7 @@ impl App {
             .collect();
         cuts.sort_unstable();
         cuts.dedup();
-        let frag_ranges: Vec<(usize, usize)> = if cuts.is_empty() {
+        let mut frag_ranges: Vec<(usize, usize)> = if cuts.is_empty() {
             vec![(0, n)]
         } else if d.circular {
             let mut v: Vec<(usize, usize)> = cuts.windows(2).map(|w| (w[0], w[1])).collect();
@@ -1335,6 +1388,10 @@ impl App {
             v.push((cuts[cuts.len() - 1], n));
             v
         };
+        if !d.circular {
+            // cuts at a linear molecule's own ends produce empty ranges
+            frag_ranges.retain(|&(s, e)| e > s);
+        }
         // enzyme names cutting at each boundary
         let cut_enzymes: std::collections::HashMap<usize, Vec<String>> = {
             let mut m: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
@@ -1365,14 +1422,19 @@ impl App {
                 // the fragment body
                 p.rect_filled(rect, 4.0, egui::Color32::from_gray(30));
                 p.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, if resp.hovered() { egui::Color32::WHITE } else { egui::Color32::from_gray(90) }), egui::StrokeKind::Middle);
-                // features inside
+                // features inside, in the fragment's extended coordinates:
+                // each feature is tried at its own span and one turn later,
+                // so features in the wrapped tail of an origin-crossing
+                // fragment are found too
                 for (fs, fe, label, col) in &feats {
-                    let (lo, hi) = if fs < fe { (*fs, *fe) } else { (*fs, *fe + n) };
-                    let (a, b) = (lo.max(*s), hi.min(*s + len));
-                    if b > a {
-                        let fr = egui::Rect::from_min_max(egui::pos2(x(a), rect.top() + 8.0), egui::pos2(x(b), rect.top() + 20.0));
-                        p.rect_filled(fr, 2.0, *col);
-                        p.text(fr.left_top(), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(9.0), egui::Color32::BLACK);
+                    let base_span = if fs < fe { (*fs, *fe) } else { (*fs, *fe + n) };
+                    for (lo, hi) in [base_span, (base_span.0 + n, base_span.1 + n)] {
+                        let (a, b) = (lo.max(*s), hi.min(*s + len));
+                        if b > a {
+                            let fr = egui::Rect::from_min_max(egui::pos2(x(a), rect.top() + 8.0), egui::pos2(x(b), rect.top() + 20.0));
+                            p.rect_filled(fr, 2.0, *col);
+                            p.text(fr.left_top(), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(9.0), egui::Color32::BLACK);
+                        }
                     }
                 }
                 // boundary enzymes and length
@@ -1380,8 +1442,16 @@ impl App {
                 p.text(rect.right_top() + egui::vec2(-6.0, 22.0), egui::Align2::RIGHT_TOP, format!("◂ {right}"), egui::FontId::proportional(11.0), egui::Color32::from_rgb(120, 200, 255));
                 p.text(rect.center_bottom() + egui::vec2(0.0, -4.0), egui::Align2::RIGHT_BOTTOM, format!("{len} bp"), egui::FontId::monospace(11.0), egui::Color32::from_gray(170));
                 if resp.clicked() {
-                    self.sel = Some((*s, if e > s { *e } else { n }));
-                    self.info = Some(format!("Fragment {} selected: {} bp", idx + 1, len));
+                    if *e > *s {
+                        self.sel = Some((*s, *e));
+                        self.info = Some(format!("Fragment {} selected: {} bp", idx + 1, len));
+                    } else {
+                        // origin-crossing fragment: a linear selection cannot
+                        // represent both of its segments, so it selects its
+                        // [s..n) part and says so
+                        self.sel = Some((*s, n));
+                        self.info = Some(format!("Fragment {} selected: {} bp — it crosses the origin, so the linear selection covers bases {}..{} of it (bases 1..{} continue past the origin)", idx + 1, len, s + 1, n, e));
+                    }
                 }
             }
         });
