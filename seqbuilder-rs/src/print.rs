@@ -83,7 +83,7 @@ impl Pdf {
 
         let mut out = b"%PDF-1.4\n".to_vec();
         let mut offsets = vec![0usize; max_id]; // offsets[id], objects are 1-based
-        let mut write = |out: &mut Vec<u8>, offsets: &mut [usize], id: usize, body: String| {
+        let write = |out: &mut Vec<u8>, offsets: &mut [usize], id: usize, body: String| {
             offsets[id] = out.len();
             out.extend_from_slice(format!("{id} 0 obj\n{body}\nendobj\n").as_bytes());
         };
@@ -136,7 +136,6 @@ pub fn layout(pdf: &mut Pdf, doc: &PrintDoc) -> usize {
     const TOP: f32 = 800.0;
     const BOTTOM: f32 = 60.0;
     const ROW_H: f32 = 12.0;
-    const COL_W: f32 = 7.2; // Courier advance at 12pt is 7.2
     pdf.page();
     let mut y = TOP;
     let header = format!("{} — {} — {} bp", doc.name, doc.topology, doc.seq.len());
@@ -166,11 +165,12 @@ pub fn layout(pdf: &mut Pdf, doc: &PrintDoc) -> usize {
         }
     }
 
-    // feature table
+    // feature table, its header on a light band
     y -= ROW_H;
     if y < BOTTOM { pdf.page(); y = TOP; }
     pdf.text(40.0, y, 12.0, Font::HelveticaBold, "Features");
     y -= ROW_H;
+    pdf.rect(40.0, y - 3.0, W - 80.0, 12.0, (232, 236, 242));
     pdf.text(40.0, y, 9.0, Font::Helvetica, "Name                                   Range         Strand");
     y -= ROW_H;
     for (name, start, end, strand) in doc.features {
@@ -245,5 +245,7 @@ mod tests {
         let bytes = pdf.finish();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("    51  ACGTACGTAC"), "row starts at 51: {}", s.lines().take(8).collect::<Vec<_>>().join(" | "));
+        // the feature table's header band is filled
+        assert!(s.contains("rg 40"), "header fill drawn before the table: {}", &s[s.find("Features").map(|i| i.saturating_sub(80)).unwrap_or(0)..s.find("Features").map(|i| i + 40).unwrap_or(120)].replace('\n', " | "));
     }
 }

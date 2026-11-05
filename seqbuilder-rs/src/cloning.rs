@@ -71,7 +71,8 @@ pub fn copy_insert(seq: &[u8], a: usize, b: usize, left_d: i32, right_d: i32, le
 
 impl Insert {
     /// The 5' overhang sequences the fragment carries: (left top-strand,
-    /// right bottom-strand), both 5'→3'.
+    /// right bottom-strand), both 5'→3'. Exercised by the cloning tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn overhangs(&self) -> (Vec<u8>, Vec<u8>) {
         let left = if self.left_d > 0 { self.top[..self.left_d as usize].to_vec() } else { vec![] };
         (left, self.right_over.clone())
@@ -139,6 +140,9 @@ pub fn compatible(insert: &Insert, target: &[u8], x: usize, y: usize, dl: i32, d
 }
 
 /// The ligated product: the target with [x, y) replaced by the insert.
+/// The application pastes through edit_seq (which tracks undo), so the
+/// pure computation is exercised by the cloning tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn paste_insert(target: &[u8], insert: &Insert, x: usize, y: usize) -> Vec<u8> {
     let mut out = target[..x].to_vec();
     out.extend_from_slice(&insert.top);
@@ -253,7 +257,7 @@ pub fn parse_location(loc: &str) -> Vec<(i64, i64, Option<char>, Option<char>)> 
             while j < c.len() && c[j].is_ascii_digit() { j += 1; }
             let a: i64 = c[ds..j].iter().collect::<String>().parse().unwrap_or(0);
             if j + 1 < c.len() && c[j] == '.' && c[j + 1] == '.' {
-                let mut k = j + 2;
+                let k = j + 2;
                 let fuzzy_e = if k < c.len() && (c[k] == '<' || c[k] == '>') { Some(c[k]) } else { None };
                 let de = k + usize::from(fuzzy_e.is_some());
                 if de < c.len() && c[de].is_ascii_digit() {

@@ -320,6 +320,14 @@ fn comment_lines(comments: &[String]) -> String {
     out
 }
 
+/// The menu shortcut modifier as written on this platform: ⌘ on macOS,
+/// Ctrl+ on Windows and Linux (egui's KeyboardShortcut likewise binds
+/// Command, which is the platform's primary modifier).
+fn cmd_key() -> &'static str { if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" } }
+
+/// The shifted shortcut modifier as menus write it (Redo, Shift-select).
+fn shift_cmd_key() -> &'static str { if cfg!(target_os = "macos") { "⇧⌘" } else { "Shift+Ctrl+" } }
+
 /// Write a file through a sibling temporary, replacing the destination only
 /// after the write succeeds, so a failure cannot destroy previous content.
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
@@ -589,6 +597,7 @@ struct App {
     blast_open: bool,                     // Search for Sequences… dialog
     blast_db: String,                     // target database
     blast_hits: Option<blast::BlastResult>,
+    blast_rid: Option<String>,                 // the running search's request id
     blast_pick: Option<usize>,            // hit selected for the HSP detail
     blast_rx: Option<std::sync::mpsc::Receiver<BlastMsg>>,
 }
@@ -623,6 +632,7 @@ impl App {
                 // a running BLAST search belongs to the previous document:
                 // dropping the receiver stops its worker, stale results go
                 self.blast_rx = None;
+                self.blast_rid = None;
                 self.blast_hits = None;
                 self.blast_pick = None;
                 self.compute_hits();
@@ -1142,8 +1152,9 @@ impl App {
             _ => {}
         }
         let (n, from) = (ins.len(), (ins.left_enz.clone(), ins.right_enz.clone()));
+        let name = ins.name.clone();
         self.edit_seq(x, y, &ins.top);
-        self.info = Some(format!("Ligated the {} bp insert ({} × {} into {} × {})", n, from.0, from.1, names.0, names.1));
+        self.info = Some(format!("Ligated {name}, the {n} bp insert ({} × {} into {} × {})", from.0, from.1, names.0, names.1));
     }
 
     /// Cloning ▸ Clone Selected Fragment: a fresh document from the selection,
@@ -1400,7 +1411,7 @@ impl App {
                         });
                     }
                 }
-                (None, Some(_)) => { ui.label("Searching NCBI BLAST…"); }
+                (None, Some(_)) => { ui.label(format!("Searching NCBI BLAST… ({})", self.blast_rid.as_deref().unwrap_or("submitting"))); }
                 (None, None) => { ui.weak("Submit the open sequence to run a blastn search."); }
             }
             ui.separator();
@@ -1411,6 +1422,7 @@ impl App {
         if close {
             self.blast_open = false;
             self.blast_rx = None;
+            self.blast_rid = None;
             self.blast_hits = None;
             self.blast_pick = None;
         }
@@ -1422,7 +1434,7 @@ impl App {
         let Some(rx) = &self.blast_rx else { return };
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                BlastMsg::Running(_) => ctx.request_repaint(),
+                BlastMsg::Running(rid) => { self.blast_rid = Some(rid); ctx.request_repaint(); }
                 BlastMsg::Done(name, res) => {
                     let hits = res.hits.len();
                     if self.doc.as_ref().map(|d| d.name.as_str()) == Some(name.as_str()) {
@@ -1432,12 +1444,14 @@ impl App {
                         self.info = Some("BLAST finished, but the document changed — results discarded.".into());
                     }
                     self.blast_rx = None;
+                    self.blast_rid = None;
                     ctx.request_repaint();
                     return;
                 }
                 BlastMsg::Failed(e) => {
                     self.error = Some(format!("BLAST failed: {e}"));
                     self.blast_rx = None;
+                    self.blast_rid = None;
                     ctx.request_repaint();
                     return;
                 }
@@ -1893,20 +1907,20 @@ impl App {
     fn menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("New DNA  ⌘N").clicked() { self.new_dna(); }
+                if ui.button(format!("New DNA  {}N", cmd_key())).clicked() { self.new_dna(); }
                 if ui.button("New Agarose Gel").clicked() {
                     self.view = View::Gel;
                     self.gel_show_ladder = true;
                     self.gel_enzs.clear();
                 }
-                if ui.button("Open…  ⌘O").clicked() {
+                if ui.button(format!("Open…  {}O", cmd_key())).clicked() {
                     if let Some(p) = rfd::FileDialog::new().add_filter("Sequence", &["sbd", "gb", "gbk", "genbank", "fasta", "fa", "fas", "seq"]).pick_file() {
                         self.open(&p);
                     }
                 }
-                if ui.button("Save  ⌘S").clicked() { self.save(None); }
+                if ui.button(format!("Save  {}S", cmd_key())).clicked() { self.save(None); }
                 if ui.button("Save As…").clicked() { self.save_as(); }
-                if ui.add_enabled(self.doc.is_some(), egui::Button::new("Print…  ⌘P")).clicked() { self.print_doc(false); }
+                if ui.add_enabled(self.doc.is_some(), egui::Button::new(format!("Print…  {}P", cmd_key()))).clicked() { self.print_doc(false); }
                 if ui.add_enabled(self.doc.is_some(), egui::Button::new("Print Selection…")).clicked() { self.print_doc(true); }
                 if ui.add_enabled(self.doc.is_some(), egui::Button::new("Export GenBank…")).clicked() { self.export(); }
                 if ui.button("Open Enzyme Files…").clicked() {
@@ -1923,19 +1937,19 @@ impl App {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo  ⌘Z")).clicked() { self.undo_redo(false); }
-                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo  ⇧⌘Z")).clicked() { self.undo_redo(true); }
+                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new(format!("Undo  {}Z", cmd_key()))).clicked() { self.undo_redo(false); }
+                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new(format!("Redo  {}Z", shift_cmd_key()))).clicked() { self.undo_redo(true); }
                 ui.separator();
-                if ui.button("Copy  ⌘C").clicked() {
+                if ui.button(format!("Copy  {}C", cmd_key())).clicked() {
                     if let Some(s) = self.selected() { ui.ctx().copy_text(String::from_utf8_lossy(s).into_owned()); }
                 }
-                if ui.button("Select All  ⌘A").clicked() {
+                if ui.button(format!("Select All  {}A", cmd_key())).clicked() {
                     if let Some(d) = &self.doc { self.sel = Some((0, d.seq.len())); }
                 }
-                if ui.button("Go to Position…  ⌘J").clicked() { self.goto_open = true; }
+                if ui.button(format!("Go to Position…  {}J", cmd_key())).clicked() { self.goto_open = true; }
             });
             ui.menu_button("Features", |ui| {
-                if ui.add_enabled(self.sel.is_some(), egui::Button::new("New Feature  ⌘K")).clicked() { self.new_feature(); }
+                if ui.add_enabled(self.sel.is_some(), egui::Button::new(format!("New Feature  {}K", cmd_key()))).clicked() { self.new_feature(); }
                 if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Edit Feature…")).clicked() { self.edit_open = true; }
                 if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Delete Feature")).clicked() { self.delete_feature(); }
             });

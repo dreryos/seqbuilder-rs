@@ -60,12 +60,6 @@ impl GeneticCode {
         codon_index(codon).is_some_and(|i| self.starts[i])
     }
 
-    /// Codon indexes flagged as stops.
-    pub fn stop_indices(&self) -> Vec<usize> { (0..64).filter(|&i| self.aas[i] == b'*').collect() }
-
-    /// Codon indexes flagged as initiation codons.
-    pub fn start_indices(&self) -> Vec<usize> { (0..64).filter(|&i| self.starts[i]).collect() }
-
     /// The one-letter amino acid of a codon index.
     pub fn aa_at(&self, i: usize) -> char { self.aas[i] as char }
 
