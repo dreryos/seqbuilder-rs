@@ -251,6 +251,9 @@ fn load_all(path: &Path) -> Result<Vec<Doc>, String> {
         let mut first = true;
         for rec in gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())? {
             let len = rec.seq.len();
+            // a zero-length record cannot carry feature coordinates; skip it
+            // rather than dividing by zero when folding wrapped joins
+            if len == 0 { continue; }
             let feats = rec.features.iter().filter_map(|f| {
                 let (s, e) = f.location.find_bounds().ok()?;
                 let q = |k: &str| f.qualifier_values(k).next().map(str::to_owned);
@@ -283,10 +286,11 @@ fn load_all(path: &Path) -> Result<Vec<Doc>, String> {
             let header = if first {
                 text.iter().map(|&b| b as char).collect::<String>().split("\nFEATURES").next().unwrap_or_default().to_string() + "\n"
             } else {
-                format!("LOCUS       {}\nDEFINITION  {}\nACCESSION   {}\n",
+                format!("LOCUS       {}\nDEFINITION  {}\nACCESSION   {}\n{}",
                     rec.name.clone().unwrap_or_else(|| stem.clone()),
                     rec.definition.clone().unwrap_or_default(),
-                    rec.accession.clone().unwrap_or_default())
+                    rec.accession.clone().unwrap_or_default(),
+                    comment_lines(&rec.comments))
             };
             first = false;
             docs.push(Doc {
@@ -300,6 +304,42 @@ fn load_all(path: &Path) -> Result<Vec<Doc>, String> {
     }
     for doc in &mut docs { doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len()); }
     Ok(docs)
+}
+
+/// A GenBank COMMENT block for a record's comments, or nothing.
+fn comment_lines(comments: &[String]) -> String {
+    if comments.is_empty() { return String::new(); }
+    let mut out = String::from("COMMENT     ");
+    let mut first = true;
+    for c in comments {
+        if !first { out.push_str("\n            "); }
+        first = false;
+        out.push_str(c);
+    }
+    out.push('\n');
+    out
+}
+
+/// Write a file through a sibling temporary, replacing the destination only
+/// after the write succeeds, so a failure cannot destroy previous content.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    let tmp = path.with_extension("part");
+    std::fs::write(&tmp, contents).and_then(|_| std::fs::rename(&tmp, path))
+}
+
+/// A derived output path that does not collide with one already handed out:
+/// same stem and extension, numbered -2, -3 … for repeats, so sample.fa and
+/// sample.gb both keep their results.
+fn unique_path(path: std::path::PathBuf, used: &mut std::collections::HashSet<String>) -> std::path::PathBuf {
+    let key = path.to_string_lossy().into_owned();
+    if used.insert(key) { return path; }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    for k in 2.. {
+        let candidate = path.with_file_name(if ext.is_empty() { format!("{stem}-{k}") } else { format!("{stem}-{k}.{ext}") });
+        if used.insert(candidate.to_string_lossy().into_owned()) { return candidate; }
+    }
+    unreachable!()
 }
 
 /// Read a sequence document; the count says how many records the file held
@@ -907,14 +947,15 @@ impl App {
     fn tool_batch_rc(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
         let (mut saved, mut failed) = (0, vec![]);
+        let mut used: std::collections::HashSet<String> = Default::default();
         for p in files {
             match load_all(&p) {
                 Ok(docs) if docs.is_empty() => failed.push(format!("{}: no sequence in file", p.display())),
                 Ok(docs) => {
-                    let out = p.with_extension("rc.gb");
+                    let out = unique_path(p.with_extension("rc.gb"), &mut used);
                     let mut text = String::new();
                     for d in docs { text += &export_genbank(&tools::reverse_complement(&d)); }
-                    match std::fs::write(&out, text) {
+                    match write_atomic(&out, text.as_bytes()) {
                         Ok(_) => saved += 1,
                         Err(e) => failed.push(format!("{}: {e}", out.display())),
                     }
@@ -931,6 +972,7 @@ impl App {
         let Some(files) = Self::pick_sequences() else { return };
         let code = self.gen_code.clone();
         let (mut saved, mut failed) = (0, vec![]);
+        let mut used: std::collections::HashSet<String> = Default::default();
         for p in files {
             match load_all(&p) {
                 Ok(docs) if docs.is_empty() => failed.push(format!("{}: no sequence in file", p.display())),
@@ -944,8 +986,8 @@ impl App {
                             out.push('\n');
                         }
                     }
-                    let out_path = p.with_extension("prot.fas");
-                    match std::fs::write(&out_path, out) {
+                    let out_path = unique_path(p.with_extension("prot.fas"), &mut used);
+                    match write_atomic(&out_path, out.as_bytes()) {
                         Ok(_) => saved += 1,
                         Err(e) => failed.push(format!("{}: {e}", out_path.display())),
                     }
@@ -957,11 +999,14 @@ impl App {
     }
 
     /// Report a batch tool's outcome: the saved count and, if any files were
-    /// skipped, exactly which ones and why.
+    /// skipped, exactly which ones and why. The opposite status field is
+    /// cleared so a recovered run does not sit beside its earlier error.
     fn report_batch(&mut self, saved: usize, failed: Vec<String>, what: &str) {
         if failed.is_empty() {
+            self.error = None;
             self.info = Some(format!("{saved} sequence file(s) {what}"));
         } else {
+            self.info = None;
             self.error = Some(format!("{saved} sequence file(s) {what}; {} not processed: {}", failed.len(), failed.join("; ")));
         }
     }
@@ -970,12 +1015,18 @@ impl App {
     /// offset to their new positions, saved as one GenBank file.
     fn tool_concatenate(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
-        let docs: Vec<Doc> = files.iter().filter_map(|p| load_all(p).ok()).flatten().collect();
+        let (mut docs, mut failed) = (vec![], vec![]);
+        for p in files {
+            match load_all(&p) {
+                Ok(ds) => docs.extend(ds),
+                Err(e) => failed.push(format!("{}: {e}", p.display())),
+            }
+        }
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
         let cat = tools::concatenate(&docs);
         let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name(format!("{}_concatenated.gb", cat.name)).save_file() else { return };
         match std::fs::write(&out, export_genbank(&cat)) {
-            Ok(_) => self.info = Some(format!("Concatenated {} sequences to {}", docs.len(), out.display())),
+            Ok(_) => self.report_batch(docs.len(), failed, &format!("concatenated (to {})", out.display())),
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -1006,12 +1057,18 @@ impl App {
     /// multi-FASTA file.
     fn tool_export_single(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
-        let docs: Vec<Doc> = files.iter().filter_map(|p| load_all(p).ok()).flatten().collect();
+        let (mut docs, mut failed) = (vec![], vec![]);
+        for p in files {
+            match load_all(&p) {
+                Ok(ds) => docs.extend(ds),
+                Err(e) => failed.push(format!("{}: {e}", p.display())),
+            }
+        }
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
         let n = docs.len();
         let Some(out) = rfd::FileDialog::new().add_filter("FASTA", &["fas"]).set_file_name("sequences.fas").save_file() else { return };
         match std::fs::write(&out, tools::to_fasta(&docs)) {
-            Ok(_) => self.info = Some(format!("{n} sequences exported to {}", out.display())),
+            Ok(_) => self.report_batch(n, failed, &format!("exported (to {})", out.display())),
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -1180,9 +1237,11 @@ impl App {
                         if ne <= alen {
                             outsegs.push((base, ne, fs, fe));
                         } else {
-                            // crosses the product's origin
-                            outsegs.push((base, alen, fs, fe));
-                            outsegs.push((0, ne - alen, false, false));
+                            // crosses the product's origin: the feature's own
+                            // fuzzy end belongs to the segment that carries
+                            // its end, the split boundary itself is exact
+                            outsegs.push((base, alen, fs, false));
+                            outsegs.push((0, ne - alen, false, fe));
                         }
                     } else {
                         let (ns, ne) = (ns.min(alen), ne.min(alen));
@@ -1255,10 +1314,8 @@ impl App {
         let pages = print::layout(&mut pdf, &pd);
         let bytes = pdf.finish();
         let Some(out) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{}.pdf", name)).save_file() else { return };
-        // write to a sibling temp file and rename, so a failed write cannot
-        // destroy an existing printout
-        let tmp = out.with_extension("part");
-        match std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &out)) {
+        // a failed write cannot destroy an existing printout
+        match write_atomic(&out, &bytes) {
             Ok(_) => self.info = Some(format!("Printout written to {} ({} page{})", out.display(), pages, if pages == 1 { "" } else { "s" })),
             Err(e) => self.error = Some(e.to_string()),
         }
