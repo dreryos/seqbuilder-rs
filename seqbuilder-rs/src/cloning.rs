@@ -38,11 +38,19 @@ fn take(seq: &[u8], start: usize, k: usize) -> Vec<u8> {
     (0..k).map(|i| seq[(start + i) % n]).collect()
 }
 
+/// One end of a cut fragment: the enzyme that made it and its bot_cut - top_cut.
+#[derive(Clone, Copy)]
+pub struct Cut<'a> {
+    pub d: i32,
+    pub enzyme: &'a str,
+}
+
 /// Cut an insert between top-strand cut positions [a, b) using the enzymes
 /// that made the cuts; `d` values are each enzyme's bot_cut - top_cut. On a
 /// circular source a left 3' overhang reaching before position zero wraps
 /// around the origin.
-pub fn copy_insert(seq: &[u8], a: usize, b: usize, left_d: i32, right_d: i32, left_enz: &str, right_enz: &str, name: &str, circular: bool) -> Result<Insert, String> {
+pub fn copy_insert(seq: &[u8], a: usize, b: usize, left: Cut, right: Cut, name: &str, circular: bool) -> Result<Insert, String> {
+    let (left_d, right_d, left_enz, right_enz) = (left.d, right.d, left.enzyme, right.enzyme);
     let (a, b) = if a <= b { (a, b) } else { (b, a) };
     if b > seq.len() { return Err("selection past the end of the sequence".into()); }
     // every overhang carried inside the cut range must fit in it: the 5'
@@ -153,13 +161,23 @@ pub fn paste_insert(target: &[u8], insert: &Insert, x: usize, y: usize) -> Vec<u
 /// Gibson / In-Fusion assembly: join fragments sharing terminal homology of
 /// at least `min_overlap` bases (the longest overlap up to 60 bases is used);
 /// when the last fragment also overlaps the first, the circle is closed.
+/// (See `Assembly` for what comes back.)
 /// Returns the assembled sequence, whether the product is circular, and for
 /// every fragment its (out_start, in_start) — where its contributed bases
 /// begin in the product and in the fragment — so callers can remap feature
 /// locations.
-pub fn gibson_assemble(fragments: &[Vec<u8>], min_overlap: usize) -> Result<(Vec<u8>, bool, Vec<(usize, usize)>), String> {
+pub struct Assembly {
+    pub seq: Vec<u8>,
+    /// the last fragment overlapped the first, so the product closed into a circle
+    pub circular: bool,
+    /// per fragment, where its contributed bases begin in the product and in the
+    /// fragment, so callers can remap feature locations
+    pub spans: Vec<(usize, usize)>,
+}
+
+pub fn gibson_assemble(fragments: &[Vec<u8>], min_overlap: usize) -> Result<Assembly, String> {
     if fragments.is_empty() { return Err("no fragments".into()); }
-    if fragments.len() == 1 { return Ok((fragments[0].clone(), false, vec![(0, 0)])); }
+    if fragments.len() == 1 { return Ok(Assembly { seq: fragments[0].clone(), circular: false, spans: vec![(0, 0)] }); }
     let mut out = fragments[0].clone();
     let mut spans = vec![(0usize, 0usize)];
     for w in fragments.windows(2) {
@@ -173,9 +191,9 @@ pub fn gibson_assemble(fragments: &[Vec<u8>], min_overlap: usize) -> Result<(Vec
     if let Some(close) = overlap(last, first).filter(|k| *k >= min_overlap) {
         let n = out.len();
         out.truncate(n - close);
-        return Ok((out, true, spans));
+        return Ok(Assembly { seq: out, circular: true, spans });
     }
-    Ok((out, false, spans))
+    Ok(Assembly { seq: out, circular: false, spans })
 }
 
 /// Longest overlap where `a` ends with what `b` starts with (case-insensitive,
@@ -306,7 +324,7 @@ mod tests {
 
     #[test]
     fn ecori_geometry() {
-        let ins = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "fragment", false).unwrap();
+        let ins = copy_insert(VECTOR, 5, 22, Cut { d: 4, enzyme: "EcoRI" }, Cut { d: 4, enzyme: "EcoRI" }, "fragment", false).unwrap();
         assert_eq!(ins.top, VECTOR[5..22]);
         let (l, r) = ins.overhangs();
         assert_eq!(l, b"AATT"); // top bases right after the left cut
@@ -315,7 +333,7 @@ mod tests {
 
     #[test]
     fn paste_into_same_enzyme_cuts() {
-        let ins = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "insert", false).unwrap();
+        let ins = copy_insert(VECTOR, 5, 22, Cut { d: 4, enzyme: "EcoRI" }, Cut { d: 4, enzyme: "EcoRI" }, "insert", false).unwrap();
         // a target opened with EcoRI on both sides: TTGAATTC...GAATTCCT
         let target = b"TTTTGAATTCAAAAAAAAGAATTCCTTTT";
         // top cuts at 5 and 19
@@ -333,7 +351,7 @@ mod tests {
         // an EcoRI-left / BamHI-right insert (overhang AATT ... GATC on the
         // bottom strand) does not ligate into an EcoRI / EcoRI target
         let src = b"AAAAGAATTCCGGGGGGGGGGGGATCCTT";
-        let ins = copy_insert(src, 5, 22, 4, 4, "EcoRI", "BamHI", "mixed", false).unwrap();
+        let ins = copy_insert(src, 5, 22, Cut { d: 4, enzyme: "EcoRI" }, Cut { d: 4, enzyme: "BamHI" }, "mixed", false).unwrap();
         let (_, r) = ins.overhangs();
         assert_eq!(r, b"GATC"); // revcomp of GGATCC's tail past the cut
         let target = b"TTTTGAATTCAAAAAAAAGAATTCCTTTT";
@@ -353,7 +371,7 @@ mod tests {
     #[test]
     fn selection_shorter_than_overhang_rejected() {
         // MspI C^CGG (d=2) and SmaI CCC^GGG (d=0) bound a 1-base top strand
-        assert!(copy_insert(b"CCCGGG", 2, 3, 2, 0, "MspI", "SmaI", "t", false).is_err());
+        assert!(copy_insert(b"CCCGGG", 2, 3, Cut { d: 2, enzyme: "MspI" }, Cut { d: 0, enzyme: "SmaI" }, "t", false).is_err());
     }
 
     #[test]
@@ -361,7 +379,7 @@ mod tests {
         let blunt = Insert { name: "b".into(), top: b"ACGTACGTAC".to_vec(), left_d: 0, right_d: 0, left_enz: "SmaI".into(), right_enz: "SmaI".into(), left_under: vec![], right_over: vec![] };
         compatible(&blunt, b"AAAAAAAAAA", 3, 7, 0, 0, false).unwrap();
         // an AATT insert does not ligate into a blunt target
-        let sticky = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "s", false).unwrap();
+        let sticky = copy_insert(VECTOR, 5, 22, Cut { d: 4, enzyme: "EcoRI" }, Cut { d: 4, enzyme: "EcoRI" }, "s", false).unwrap();
         assert!(compatible(&sticky, b"AAAAAAAAAAA", 3, 7, 0, 0, false).is_err());
         // and not into a target whose overhang bases differ
         let t = b"TTTTGACTAGAAAAAAAAGACTAGCTTTT";
@@ -371,7 +389,7 @@ mod tests {
     #[test]
     fn circular_target_wraps() {
         // cut at the origin: target[y..] then [x..y) spans the wrap
-        let ins = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "i", false).unwrap();
+        let ins = copy_insert(VECTOR, 5, 22, Cut { d: 4, enzyme: "EcoRI" }, Cut { d: 4, enzyme: "EcoRI" }, "i", false).unwrap();
         let target = b"GAATTCAAAAAAAGAATTCGG";
         // left cut EcoRI at 1, right cut EcoRI at 14: target[..1] ++ ins ++ target[14..]
         compatible(&ins, target, 1, 14, 4, 4, false).unwrap();
@@ -383,7 +401,7 @@ mod tests {
     fn gibson_two_fragments() {
         let a = b"ACGTACGTACGGGGGGGGGGTTTTTTTTTT".to_vec();
         let b = b"TTTTTTTTTTCCCCCCCCCC".to_vec();
-        let (out, circular, _) = gibson_assemble(&[a, b], 10).unwrap();
+        let Assembly { seq: out, circular, .. } = gibson_assemble(&[a, b], 10).unwrap();
         assert_eq!(out, b"ACGTACGTACGGGGGGGGGGTTTTTTTTTTCCCCCCCCCC");
         assert!(!circular, "no last-to-first overlap: the product is linear");
     }
@@ -392,7 +410,7 @@ mod tests {
     fn gibson_overlap_is_case_insensitive() {
         let a = b"ACGTACGTACGGGGGGGGGGtttttttttt".to_vec(); // GenBank-style lowercase
         let b = b"TTTTTTTTTTCCCCCCCCCC".to_vec();
-        let (out, _, _) = gibson_assemble(&[a, b], 10).unwrap();
+        let out = gibson_assemble(&[a, b], 10).unwrap().seq;
         assert_eq!(out, b"ACGTACGTACGGGGGGGGGGttttttttttCCCCCCCCCC");
     }
 
@@ -401,7 +419,7 @@ mod tests {
         let a = b"AAAAAAAAAAGGGGGG".to_vec();
         let b = b"GGGGGGCCCCCC".to_vec();
         let c = b"CCCCCCTTTTTTAAAA".to_vec();
-        let (out, circular, _) = gibson_assemble(&[a, b, c], 4).unwrap();
+        let Assembly { seq: out, circular, .. } = gibson_assemble(&[a, b, c], 4).unwrap();
         // the last fragment's AAAA tail overlaps the first fragment's head
         assert_eq!(out, b"AAAAAAAAAAGGGGGGCCCCCCTTTTTT");
         assert!(circular);
@@ -454,7 +472,7 @@ mod tests {
 
     #[test]
     fn gibson_spans_report_fragment_positions() {
-        let (out, circular, spans) = gibson_assemble(&[b"AAAACCCC".to_vec(), b"CCCCGGGG".to_vec()], 4).unwrap();
+        let Assembly { seq: out, circular, spans } = gibson_assemble(&[b"AAAACCCC".to_vec(), b"CCCCGGGG".to_vec()], 4).unwrap();
         assert_eq!(out, b"AAAACCCCGGGG");
         assert!(!circular);
         // fragment 0 contributes all of itself from product position 0;
@@ -463,7 +481,7 @@ mod tests {
         assert_eq!(spans, vec![(0, 0), (8, 4)]);
 
         // a closed circle: the second fragment's tail is the product's start
-        let (out, circular, spans) = gibson_assemble(&[b"TTTTAAAA".to_vec(), b"AAAATTTT".to_vec()], 4).unwrap();
+        let Assembly { seq: out, circular, spans } = gibson_assemble(&[b"TTTTAAAA".to_vec(), b"AAAATTTT".to_vec()], 4).unwrap();
         assert_eq!(out, b"TTTTAAAA");
         assert!(circular);
         assert_eq!(spans, vec![(0, 0), (8, 4)]);
@@ -514,7 +532,7 @@ mod tests {
         // 16 bp of terminal homology in a 20 bp fragment
         let a = b"ACGTAAAAAAAAAAAAAAAA".to_vec();
         let b = b"AAAAAAAAAAAAAAAAGGG".to_vec();
-        let (out, _, _) = gibson_assemble(&[a, b], 12).unwrap();
+        let out = gibson_assemble(&[a, b], 12).unwrap().seq;
         assert_eq!(out, b"ACGTAAAAAAAAAAAAAAAAGGG");
     }
 
@@ -522,7 +540,7 @@ mod tests {
     fn three_prime_overhangs_clone() {
         // KpnI-like left end (d = -4): the fragment's bottom strand starts
         // four bases before the top cut, so it carries a left 3' overhang
-        let ins = copy_insert(VECTOR, 7, 20, -4, 0, "KpnI", "SmaI", "x", false).unwrap();
+        let ins = copy_insert(VECTOR, 7, 20, Cut { d: -4, enzyme: "KpnI" }, Cut { d: 0, enzyme: "SmaI" }, "x", false).unwrap();
         assert_eq!(ins.top, VECTOR[7..20]);
         assert_eq!(ins.left_under, VECTOR[3..7]);
         // matching target: same bases before its left cut
@@ -535,12 +553,12 @@ mod tests {
 
         // PstI-like right end (d = -4): the fragment's top tail pairs with
         // the target's bases before its right cut
-        let ins = copy_insert(VECTOR, 5, 20, 0, -4, "SmaI", "PstI", "y", false).unwrap();
+        let ins = copy_insert(VECTOR, 5, 20, Cut { d: 0, enzyme: "SmaI" }, Cut { d: -4, enzyme: "PstI" }, "y", false).unwrap();
         assert!(compatible(&ins, VECTOR, 5, 20, 0, -4, false).is_ok());
         let mismatched = [VECTOR[..16].to_vec(), b"TTTT".to_vec(), VECTOR[20..].to_vec()].concat();
         assert!(compatible(&ins, &mismatched, 5, 20, 0, -4, false).is_err());
 
         // a left 3' overhang reaching before the sequence start is refused
-        assert!(copy_insert(VECTOR, 2, 10, -4, 0, "KpnI", "SmaI", "z", false).is_err());
+        assert!(copy_insert(VECTOR, 2, 10, Cut { d: -4, enzyme: "KpnI" }, Cut { d: 0, enzyme: "SmaI" }, "z", false).is_err());
     }
 }

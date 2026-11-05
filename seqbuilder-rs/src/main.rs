@@ -623,9 +623,8 @@ impl App {
                 // genetic code, as SeqBuilder Pro picks up (e.g. 11 for bacteria).
                 if let Some(t) = d.feats.iter().find_map(|f| {
                     f.quals.iter().find_map(|q| q.strip_prefix("transl_table=")).and_then(|v| v.trim().parse::<u8>().ok())
-                }) {
-                    if let Some(c) = GeneticCode::from_ncbi(t) { self.gen_code = c; }
-                }
+                })
+                    && let Some(c) = GeneticCode::from_ncbi(t) { self.gen_code = c; }
                 self.doc = Some(d);
                 self.error = None;
                 self.sel = None;
@@ -679,7 +678,12 @@ impl App {
             ui.heading(format!("ORF {}", oi + 1));
             ui.separator();
             let span = orf::span_len(o, d.seq.len());
-            let range = if o.start <= o.end { format!("{}..{}", o.start + 1, o.end) } else { format!("{}..{}", o.start + 1, o.end) };
+            // an ORF reading through the origin is two spans, as GenBank writes it
+            let range = if o.start <= o.end {
+                format!("{}..{}", o.start + 1, o.end)
+            } else {
+                format!("join({}..{},1..{})", o.start + 1, d.seq.len(), o.end)
+            };
             egui::Grid::new("orf_info").num_columns(2).show(ui, |ui| {
                 for (k, v) in [
                     ("Strand:", if o.strand < 0 { "Reverse" } else { "Forward" }.to_string()),
@@ -934,9 +938,8 @@ impl App {
     fn export(&mut self) {
         let Some(d) = &self.doc else { return };
         let name = d.path.file_stem().map(|n| n.to_string_lossy().into_owned() + ".gb").unwrap_or_default();
-        if let Some(p) = rfd::FileDialog::new().add_filter("GenBank", &["gb", "gbk"]).set_file_name(name).save_file() {
-            if let Err(e) = write_atomic(&p, export_genbank(d).as_bytes()) { self.error = Some(format!("{}: {e}", p.display())); }
-        }
+        if let Some(p) = rfd::FileDialog::new().add_filter("GenBank", &["gb", "gbk"]).set_file_name(name).save_file()
+            && let Err(e) = write_atomic(&p, export_genbank(d).as_bytes()) { self.error = Some(format!("{}: {e}", p.display())); }
     }
 
     fn save_as(&mut self) {
@@ -1050,7 +1053,7 @@ impl App {
         let Some(files) = Self::pick_sequences() else { return };
         let (mut docs, mut failed) = (vec![], vec![]);
         for p in &files {
-            match load_all(&p) {
+            match load_all(p) {
                 Ok(ds) => docs.extend(ds),
                 Err(e) => failed.push(format!("{}: {e}", p.display())),
             }
@@ -1092,7 +1095,7 @@ impl App {
         let Some(files) = Self::pick_sequences() else { return };
         let (mut docs, mut failed) = (vec![], vec![]);
         for p in &files {
-            match load_all(&p) {
+            match load_all(p) {
                 Ok(ds) => docs.extend(ds),
                 Err(e) => failed.push(format!("{}: {e}", p.display())),
             }
@@ -1142,7 +1145,8 @@ impl App {
         };
         let (le, re) = (&self.enz[le], &self.enz[re]);
         let name = format!("{} fragment", d.name);
-        let ins = match cloning::copy_insert(&d.seq, a, b, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut, &le.name, &re.name, &name, d.circular) {
+        let (lc, rc) = (cloning::Cut { d: le.bot_cut - le.top_cut, enzyme: &le.name }, cloning::Cut { d: re.bot_cut - re.top_cut, enzyme: &re.name });
+        let ins = match cloning::copy_insert(&d.seq, a, b, lc, rc, &name, d.circular) {
             Ok(i) => i,
             Err(e) => { self.error = Some(e); return; }
         };
@@ -1233,7 +1237,7 @@ impl App {
     fn gibson_assemble_and_save(&mut self) {
         if self.gib_frags.len() < 2 { self.error = Some("Load at least two fragments.".into()); return; }
         let frags: Vec<Vec<u8>> = self.gib_frags.iter().map(|(_, s, _)| s.clone()).collect();
-        let (assembled, circular, spans) = match cloning::gibson_assemble(&frags, self.gib_min) {
+        let cloning::Assembly { seq: assembled, circular, spans } = match cloning::gibson_assemble(&frags, self.gib_min) {
             Ok(s) => s,
             Err(e) => { self.error = Some(e); return; }
         };
@@ -1622,12 +1626,12 @@ impl App {
             p.text(egui::pos2(rect.left() + 8.0, center_top + CENTER_H + 4.0), egui::Align2::LEFT_TOP, format!("base {}", center_bp + 1), egui::FontId::monospace(10.0), egui::Color32::from_gray(140));
         }
 
-        if resp.clicked() {
-            if let Some(i) = hit {
-                self.sel_feat = Some(i);
-                self.side_top = SideTop::Style;
-                self.info = Some("Feature selected in the curtain view.".into());
-            }
+        if resp.clicked()
+            && let Some(i) = hit
+        {
+            self.sel_feat = Some(i);
+            self.side_top = SideTop::Style;
+            self.info = Some("Feature selected in the curtain view.".into());
         }
     }
 
@@ -1906,7 +1910,7 @@ impl App {
             sorted.sort_unstable();
             let mut grouped: Vec<(u32, u32)> = vec![]; // (bp, count)
             for f in sorted {
-                if let Some(last) = grouped.last_mut() { if last.0 == f { last.1 += 1; continue; } }
+                if let Some(last) = grouped.last_mut() && last.0 == f { last.1 += 1; continue; }
                 grouped.push((f, 1));
             }
             for (bp, count) in grouped {
@@ -1921,15 +1925,15 @@ impl App {
         p.rect_stroke(medium, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Middle);
 
         // hover: show the size of the band closest to the cursor
-        if let Some(mp) = resp.hover_pos() {
-            if medium.contains(mp) {
-                let best = bands.iter()
-                    .filter(|(x0, x1, y, _, _)| mp.x >= *x0 && mp.x <= *x1 && (mp.y - *y).abs() < 5.0)
-                    .min_by(|a, b| (mp.y - a.2).abs().partial_cmp(&(mp.y - b.2).abs()).unwrap_or(std::cmp::Ordering::Equal));
-                if let Some((_, _, _, label, _)) = best {
-                    let tpos = egui::pos2(mp.x + 12.0, mp.y - 18.0);
-                    p.text(tpos, egui::Align2::LEFT_TOP, label.clone(), egui::FontId::proportional(12.0), egui::Color32::WHITE);
-                }
+        if let Some(mp) = resp.hover_pos()
+            && medium.contains(mp)
+        {
+            let best = bands.iter()
+                .filter(|(x0, x1, y, _, _)| mp.x >= *x0 && mp.x <= *x1 && (mp.y - *y).abs() < 5.0)
+                .min_by(|a, b| (mp.y - a.2).abs().partial_cmp(&(mp.y - b.2).abs()).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some((_, _, _, label, _)) = best {
+                let tpos = egui::pos2(mp.x + 12.0, mp.y - 18.0);
+                p.text(tpos, egui::Align2::LEFT_TOP, label.clone(), egui::FontId::proportional(12.0), egui::Color32::WHITE);
             }
         }
     }
@@ -1970,10 +1974,10 @@ impl App {
                     self.gel_show_ladder = true;
                     self.gel_enzs.clear();
                 }
-                if ui.button(format!("Open…  {}O", cmd_key())).clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("Sequence", &["sbd", "gb", "gbk", "genbank", "fasta", "fa", "fas", "seq"]).pick_file() {
-                        self.open(&p);
-                    }
+                if ui.button(format!("Open…  {}O", cmd_key())).clicked()
+                    && let Some(p) = rfd::FileDialog::new().add_filter("Sequence", &["sbd", "gb", "gbk", "genbank", "fasta", "fa", "fas", "seq"]).pick_file()
+                {
+                    self.open(&p);
                 }
                 if ui.button(format!("Save  {}S", cmd_key())).clicked() { self.save(None); }
                 if ui.button("Save As…").clicked() { self.save_as(); }
@@ -1983,9 +1987,8 @@ impl App {
                 if ui.button("Open Enzyme Files…").clicked() {
                     let ezd = rfd::FileDialog::new().add_filter("Enzyme file", &["ezd"]).pick_file();
                     let sel = ezd.as_ref().and_then(|_| rfd::FileDialog::new().add_filter("Selector file", &["sel"]).pick_file());
-                    if let (Some(e), Some(s)) = (ezd, sel) {
-                        if let (Ok(b), Ok(t)) = (std::fs::read(e), std::fs::read_to_string(s)) { self.load_enzymes(&b, &t); }
-                    }
+                    if let (Some(e), Some(s)) = (ezd, sel)
+                        && let (Ok(b), Ok(t)) = (std::fs::read(e), std::fs::read_to_string(s)) { self.load_enzymes(&b, &t); }
                 }
             });
             ui.menu_button("Search", |ui| {
@@ -1997,12 +2000,10 @@ impl App {
                 if ui.add_enabled(!self.undo.is_empty(), egui::Button::new(format!("Undo  {}Z", cmd_key()))).clicked() { self.undo_redo(false); }
                 if ui.add_enabled(!self.redo.is_empty(), egui::Button::new(format!("Redo  {}Z", shift_cmd_key()))).clicked() { self.undo_redo(true); }
                 ui.separator();
-                if ui.button(format!("Copy  {}C", cmd_key())).clicked() {
-                    if let Some(s) = self.selected() { ui.ctx().copy_text(String::from_utf8_lossy(s).into_owned()); }
-                }
-                if ui.button(format!("Select All  {}A", cmd_key())).clicked() {
-                    if let Some(d) = &self.doc { self.sel = Some((0, d.seq.len())); }
-                }
+                if ui.button(format!("Copy  {}C", cmd_key())).clicked()
+                    && let Some(s) = self.selected() { ui.ctx().copy_text(String::from_utf8_lossy(s).into_owned()); }
+                if ui.button(format!("Select All  {}A", cmd_key())).clicked()
+                    && let Some(d) = &self.doc { self.sel = Some((0, d.seq.len())); }
                 if ui.button(format!("Go to Position…  {}J", cmd_key())).clicked() { self.goto_open = true; }
             });
             ui.menu_button("Features", |ui| {
@@ -2075,15 +2076,13 @@ impl App {
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::J),
         ));
-        if open {
-            if let Some(p) = rfd::FileDialog::new().pick_file() { self.open(&p); }
-        }
-        if all { if let Some(d) = &self.doc { self.sel = Some((0, d.seq.len())); } }
+        if open
+            && let Some(p) = rfd::FileDialog::new().pick_file() { self.open(&p); }
+        if all && let Some(d) = &self.doc { self.sel = Some((0, d.seq.len())); }
         if goto { self.goto_open = true; }
         // egui turns ⌘C into an event rather than a key press.
-        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
-            if let Some(s) = self.selected() { ctx.copy_text(String::from_utf8_lossy(s).into_owned()); }
-        }
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
+            && let Some(s) = self.selected() { ctx.copy_text(String::from_utf8_lossy(s).into_owned()); }
         if let Some(f) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) { self.open(&f); }
     }
 
@@ -2820,7 +2819,7 @@ impl App {
         let cw = ui.painter().layout_no_wrap("a".into(), font.clone(), Color32::WHITE).size().x;
         let lh = 16.0;
         let (gutter, right_w) = (cw * 5.0, cw * 8.0);
-        let gap = |i: usize, g: usize| if g == 0 { 0.0 } else { (i / g) as f32 * cw * 0.6 };
+        let gap = |i: usize, g: usize| i.checked_div(g).map_or(0.0, |n| n as f32 * cw * 0.6);
         let grouping = self.grouping;
         // bases per row: largest multiple of 10 that fits
         let avail = ui.available_width() - gutter - right_w - 16.0;
@@ -3178,18 +3177,18 @@ impl eframe::App for App {
                 ui.label("Fragments sharing terminal homology are joined in order; the last can close a circle with the first.");
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Add fragments…").clicked() {
-                        if let Some(files) = Self::pick_sequences() {
-                            let mut failed = vec![];
-                            for p in files {
-                                match load_all(&p) {
-                                    Ok(docs) => for d in docs { self.gib_frags.push((d.name, d.seq, d.feats)); },
-                                    Err(e) => failed.push(format!("{}: {e}", p.display())),
-                                }
+                    if ui.button("Add fragments…").clicked()
+                        && let Some(files) = Self::pick_sequences()
+                    {
+                        let mut failed = vec![];
+                        for p in files {
+                            match load_all(&p) {
+                                Ok(docs) => for d in docs { self.gib_frags.push((d.name, d.seq, d.feats)); },
+                                Err(e) => failed.push(format!("{}: {e}", p.display())),
                             }
-                            if !failed.is_empty() {
-                                self.error = Some(format!("Could not load {}", failed.join("; ")));
-                            }
+                        }
+                        if !failed.is_empty() {
+                            self.error = Some(format!("Could not load {}", failed.join("; ")));
                         }
                     }
                     if ui.button("Clear").clicked() { self.gib_frags.clear(); }
@@ -3249,24 +3248,22 @@ fn enzyme_ezd() -> Vec<u8> {
 }
 
 fn enzyme_sel() -> String {
-    if let Some(p) = user_selectorfile() {
-        if let Ok(s) = std::fs::read_to_string(p) { return s; }
-    }
-    if let Some(d) = enzyme_dir() {
-        if let Ok(s) = std::fs::read_to_string(d.join("EnzymeSelectors.sel")) { return s; }
-    }
+    if let Some(p) = user_selectorfile()
+        && let Ok(s) = std::fs::read_to_string(p) { return s; }
+    if let Some(d) = enzyme_dir()
+        && let Ok(s) = std::fs::read_to_string(d.join("EnzymeSelectors.sel")) { return s; }
     SEL_BUNDLED.to_string()
 }
 
 fn main() -> eframe::Result {
     // seqbuilder-rs --export-genbank in.sbd out.gb  (batch conversion, no window)
     let args: Vec<String> = std::env::args().collect();
-    if let [_, flag, input, output] = &args[..] {
-        if flag == "--export-genbank" {
-            let written = load(Path::new(input)).and_then(|(d, _)| write_atomic(Path::new(output), export_genbank(&d).as_bytes()).map_err(|e| e.to_string()));
-            if let Err(e) = written { eprintln!("{input}: {e}"); std::process::exit(1); }
-            return Ok(());
-        }
+    if let [_, flag, input, output] = &args[..]
+        && flag == "--export-genbank"
+    {
+        let written = load(Path::new(input)).and_then(|(d, _)| write_atomic(Path::new(output), export_genbank(&d).as_bytes()).map_err(|e| e.to_string()));
+        if let Err(e) = written { eprintln!("{input}: {e}"); std::process::exit(1); }
+        return Ok(());
     }
     let mut app = App { zoom: 1.0, map_title: Some(String::new()), primer_options: [true; 5], ..Default::default() };
     app.load_enzymes(&enzyme_ezd(), &enzyme_sel());
@@ -3481,7 +3478,8 @@ mod tests {
             assert_eq!(back.features.len(), ncbi.features.len());
             let key = |f: &gb_io::seq::Feature| (f.location.find_bounds().unwrap(), f.kind.to_string());
             let (mut a, mut b): (Vec<_>, Vec<_>) = (back.features.iter().map(key).collect(), ncbi.features.iter().map(key).collect());
-            (a.sort(), b.sort());
+            a.sort();
+            b.sort();
             assert_eq!(a, b, "{f}");
         }
         let out = export_genbank(&load(Path::new("testdata/ALDH2.sbd")).unwrap().0);
@@ -3585,9 +3583,11 @@ mod tests {
     fn dnastar_unique_six_cutters_on_pbr322() {
         let ezd = EZD_BUNDLED;
         let sel = SEL_BUNDLED;
-        let mut app = App::default();
-        app.enz = enzymes::parse_ezd(&ezd);
-        app.sels = enzymes::parse_sel(&sel).unwrap();
+        let mut app = App {
+            enz: enzymes::parse_ezd(ezd),
+            sels: enzymes::parse_sel(sel).unwrap(),
+            ..Default::default()
+        };
         assert_eq!((app.enz.len(), app.sels.len()), (264, 25));
         app.open(Path::new("testdata/pBR322.gb"));
         assert_eq!(app.shown.len(), app.sites.len(), "only cutting enzymes are checked");

@@ -128,7 +128,7 @@ mod tests {
         for c in NCBI_CODES {
             assert!(c.aas.iter().all(|&a| (a as char).is_ascii_uppercase() || a == b'*'));
             assert!(c.starts.iter().all(|&s| s == b'0' || s == b'1'));
-            assert!(c.starts.iter().any(|&s| s == b'1'), "table {} has no starts", c.id);
+            assert!(c.starts.contains(&b'1'), "table {} has no starts", c.id);
         }
     }
 

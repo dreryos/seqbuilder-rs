@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn region_beginning_with_start_is_not_a_without_orf() {
         let v = orfs("ATGTAA", StartFilter::Without, 1);
-        assert!(v.iter().filter(|o| o.frame == 1).next().is_none(), "the frame-1 region begins with ATG");
+        assert!(!v.iter().any(|o| o.frame == 1), "the frame-1 region begins with ATG");
     }
 
     #[test]

@@ -107,8 +107,7 @@ impl Pdf {
         let xref_pos = out.len();
         out.extend_from_slice(format!("xref\n0 {max_id}\n").as_bytes());
         out.extend_from_slice(b"0000000000 65535 f \n");
-        for id in 1..max_id {
-            let off = offsets[id];
+        for &off in &offsets[1..max_id] {
             if off > 0 {
                 out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
             } else {
