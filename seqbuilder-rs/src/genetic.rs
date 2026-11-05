@@ -60,12 +60,6 @@ impl GeneticCode {
         codon_index(codon).is_some_and(|i| self.starts[i])
     }
 
-    /// Codon indexes flagged as stops.
-    pub fn stop_indices(&self) -> Vec<usize> { (0..64).filter(|&i| self.aas[i] == b'*').collect() }
-
-    /// Codon indexes flagged as initiation codons.
-    pub fn start_indices(&self) -> Vec<usize> { (0..64).filter(|&i| self.starts[i]).collect() }
-
     /// The one-letter amino acid of a codon index.
     pub fn aa_at(&self, i: usize) -> char { self.aas[i] as char }
 
@@ -134,7 +128,7 @@ mod tests {
         for c in NCBI_CODES {
             assert!(c.aas.iter().all(|&a| (a as char).is_ascii_uppercase() || a == b'*'));
             assert!(c.starts.iter().all(|&s| s == b'0' || s == b'1'));
-            assert!(c.starts.iter().any(|&s| s == b'1'), "table {} has no starts", c.id);
+            assert!(c.starts.contains(&b'1'), "table {} has no starts", c.id);
         }
     }
 

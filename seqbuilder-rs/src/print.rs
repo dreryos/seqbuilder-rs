@@ -64,10 +64,11 @@ impl Pdf {
         self.ops.push(format!("0.75 w {x1} {y1} m {x2} {y2} l S"));
     }
 
-    /// Fill a rectangle with an RGB colour (0-255 per channel).
+    /// Fill a rectangle with an RGB colour (0-255 per channel), then restore
+    /// black as the fill colour so following text stays readable.
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, rgb: (u8, u8, u8)) {
         let (r, g, b) = (rgb.0 as f32 / 255.0, rgb.1 as f32 / 255.0, rgb.2 as f32 / 255.0);
-        self.ops.push(format!("{r} {g} {b} rg {x} {y} {w} {h} re f"));
+        self.ops.push(format!("{r} {g} {b} rg {x} {y} {w} {h} re f 0 0 0 rg"));
     }
 
     /// Assemble the PDF file (A4 portrait, 595×842pt).
@@ -83,7 +84,7 @@ impl Pdf {
 
         let mut out = b"%PDF-1.4\n".to_vec();
         let mut offsets = vec![0usize; max_id]; // offsets[id], objects are 1-based
-        let mut write = |out: &mut Vec<u8>, offsets: &mut [usize], id: usize, body: String| {
+        let write = |out: &mut Vec<u8>, offsets: &mut [usize], id: usize, body: String| {
             offsets[id] = out.len();
             out.extend_from_slice(format!("{id} 0 obj\n{body}\nendobj\n").as_bytes());
         };
@@ -106,8 +107,7 @@ impl Pdf {
         let xref_pos = out.len();
         out.extend_from_slice(format!("xref\n0 {max_id}\n").as_bytes());
         out.extend_from_slice(b"0000000000 65535 f \n");
-        for id in 1..max_id {
-            let off = offsets[id];
+        for &off in &offsets[1..max_id] {
             if off > 0 {
                 out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
             } else {
@@ -136,7 +136,6 @@ pub fn layout(pdf: &mut Pdf, doc: &PrintDoc) -> usize {
     const TOP: f32 = 800.0;
     const BOTTOM: f32 = 60.0;
     const ROW_H: f32 = 12.0;
-    const COL_W: f32 = 7.2; // Courier advance at 12pt is 7.2
     pdf.page();
     let mut y = TOP;
     let header = format!("{} — {} — {} bp", doc.name, doc.topology, doc.seq.len());
@@ -166,11 +165,12 @@ pub fn layout(pdf: &mut Pdf, doc: &PrintDoc) -> usize {
         }
     }
 
-    // feature table
+    // feature table, its header on a light band
     y -= ROW_H;
     if y < BOTTOM { pdf.page(); y = TOP; }
     pdf.text(40.0, y, 12.0, Font::HelveticaBold, "Features");
     y -= ROW_H;
+    pdf.rect(40.0, y - 3.0, W - 80.0, 12.0, (232, 236, 242));
     pdf.text(40.0, y, 9.0, Font::Helvetica, "Name                                   Range         Strand");
     y -= ROW_H;
     for (name, start, end, strand) in doc.features {
@@ -245,5 +245,32 @@ mod tests {
         let bytes = pdf.finish();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("    51  ACGTACGTAC"), "row starts at 51: {}", s.lines().take(8).collect::<Vec<_>>().join(" | "));
+        // the feature table's header band: light colour, full width (515pt
+        // tall 12pt), black restoration, and it sits between the Features
+        // title and the table's header row
+        let (title, colour, band, header) = (
+            s.find("(Features) Tj").expect("Features title"),
+            s.find("0.9098039 0.9254902 0.9490196 rg").expect("header fill colour"),
+            s.find("515 12 re f").expect("header band dimensions"),
+            s.find("(Name").expect("table header row"),
+        );
+        assert!(title < colour, "the band's colour is set after the Features title");
+        assert!(colour < band, "the fill colour must be set before the rectangle is filled");
+        assert!(band < header, "the band precedes the table header it shades");
+        assert!(s.contains("515 12 re f 0 0 0 rg"), "fill colour restored to black after the band");
+        // order and size alone would still pass with the band drawn elsewhere on
+        // the page, so check it really covers the row: same left edge, and the
+        // row's baseline between the rectangle's bottom and top
+        let numbers = |from: usize, upto: &str| -> Vec<f32> {
+            let tail = &s[from..];
+            tail[..tail.find(upto).expect("end of operator")]
+                .split_whitespace().filter_map(|t| t.parse::<f32>().ok()).collect()
+        };
+        let rect = numbers(colour, "re");                                  // r g b x y w h
+        let row = numbers(s[..header].rfind("BT ").expect("header text"), "Td"); // size x y
+        let (bx, by, bh) = (rect[3], rect[4], rect[6]);
+        let (rx, ry) = (row[1], row[2]);
+        assert_eq!(bx, rx, "the band starts at the header row's left edge");
+        assert!(by <= ry && ry <= by + bh, "the header baseline {ry} is inside the band {by}..{}", by + bh);
     }
 }

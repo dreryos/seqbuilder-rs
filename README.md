@@ -52,7 +52,7 @@ codes — so a single binary runs with no installation or setup.
   query/midline/subject alignment of the selected hit
 
 **Output**
-- File ▸ Print… (⌘P) writes the printed layout of the whole document —
+- File ▸ Print… (⌘P / Ctrl+P — ⌘ on macOS, Ctrl elsewhere) writes the printed layout of the whole document —
   numbered 60-base rows grouped in tens and the feature table — as a PDF;
   Print Selection… (menu only) prints the selected range instead
 

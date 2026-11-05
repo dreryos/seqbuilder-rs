@@ -320,6 +320,14 @@ fn comment_lines(comments: &[String]) -> String {
     out
 }
 
+/// The menu shortcut modifier as written on this platform: ⌘ on macOS,
+/// Ctrl+ on Windows and Linux (egui's KeyboardShortcut likewise binds
+/// Command, which is the platform's primary modifier).
+fn cmd_key() -> &'static str { if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" } }
+
+/// The shifted shortcut modifier as menus write it (Redo, Shift-select).
+fn shift_cmd_key() -> &'static str { if cfg!(target_os = "macos") { "⇧⌘" } else { "Shift+Ctrl+" } }
+
 /// Write a file through a sibling temporary, replacing the destination only
 /// after the write succeeds, so a failure cannot destroy previous content.
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
@@ -449,6 +457,16 @@ fn frame_residue(seq: &[u8], i: usize, k: usize, code: &GeneticCode) -> Option<c
     } else {
         let j = seq.len() - 2 - i; // codon start on the reverse strand
         (j % 3 == k - 3).then(|| code.translate(&codon.iter().rev().map(|&b| complement(b)).collect::<Vec<u8>>()))
+    }
+}
+
+/// The Range line of the ORF details: one span, or, for an ORF reading through
+/// the origin, the two spans it covers, as GenBank writes a wrapped location.
+fn orf_range_text(o: &Orf, n: usize) -> String {
+    if o.start <= o.end {
+        format!("{}..{}", o.start + 1, o.end)
+    } else {
+        format!("join({}..{},1..{})", o.start + 1, n, o.end)
     }
 }
 
@@ -589,14 +607,17 @@ struct App {
     blast_open: bool,                     // Search for Sequences… dialog
     blast_db: String,                     // target database
     blast_hits: Option<blast::BlastResult>,
+    blast_rid: Option<String>,                 // the running search's request id
+    seq_rev: u64,                             // bumped on every sequence edit; BLAST results carry theirs
     blast_pick: Option<usize>,            // hit selected for the HSP detail
     blast_rx: Option<std::sync::mpsc::Receiver<BlastMsg>>,
+    blast_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, // tells the worker to stop
 }
 
 /// Messages from the background BLAST thread.
 enum BlastMsg {
-    Running(String),                       // RID assigned, polling
-    Done(String, Box<blast::BlastResult>),  // document the result belongs to
+    Running(String),                       // RID assigned, polling (also the worker's liveness probe)
+    Done(String, u64, Box<blast::BlastResult>), // document name, sequence revision, result
     Failed(String),
 }
 
@@ -612,9 +633,8 @@ impl App {
                 // genetic code, as SeqBuilder Pro picks up (e.g. 11 for bacteria).
                 if let Some(t) = d.feats.iter().find_map(|f| {
                     f.quals.iter().find_map(|q| q.strip_prefix("transl_table=")).and_then(|v| v.trim().parse::<u8>().ok())
-                }) {
-                    if let Some(c) = GeneticCode::from_ncbi(t) { self.gen_code = c; }
-                }
+                })
+                    && let Some(c) = GeneticCode::from_ncbi(t) { self.gen_code = c; }
                 self.doc = Some(d);
                 self.error = None;
                 self.sel = None;
@@ -622,9 +642,8 @@ impl App {
                 self.orf_sel = None;
                 // a running BLAST search belongs to the previous document:
                 // dropping the receiver stops its worker, stale results go
-                self.blast_rx = None;
-                self.blast_hits = None;
-                self.blast_pick = None;
+                self.seq_rev += 1; // even a same-named document is a different one
+                self.blast_reset();
                 self.compute_hits();
                 // SeqBuilder opens a sequence showing its default selector's enzymes.
                 if let Some(id) = self.sels.iter().find(|s| s.name.contains("Unique Six+")).map(|s| s.id) { self.apply_selector(id); }
@@ -669,7 +688,7 @@ impl App {
             ui.heading(format!("ORF {}", oi + 1));
             ui.separator();
             let span = orf::span_len(o, d.seq.len());
-            let range = if o.start <= o.end { format!("{}..{}", o.start + 1, o.end) } else { format!("{}..{}", o.start + 1, o.end) };
+            let range = orf_range_text(o, d.seq.len());
             egui::Grid::new("orf_info").num_columns(2).show(ui, |ui| {
                 for (k, v) in [
                     ("Strand:", if o.strand < 0 { "Reverse" } else { "Forward" }.to_string()),
@@ -734,6 +753,7 @@ impl App {
         };
         self.undo.push((what, d.seq.clone(), d.feats.clone()));
         self.redo.clear();
+        self.seq_rev += 1;
         let (cut, add) = (b - a, ins.len());
         d.seq.splice(a..b, ins.iter().copied());
         let start = |s: usize| if s >= b { s - cut + add } else if s >= a { a } else { s };
@@ -751,6 +771,9 @@ impl App {
         d.lanes = assign_lanes(&mut d.feats, d.seq.len());
         (self.sel, self.caret, self.sel_feat) = (None, Some(a + add), None);
         self.compute_hits();
+        // a running search targeted the pre-edit sequence, and stored hits
+        // describe it; either way they no longer match what is shown
+        self.blast_reset();
     }
 
     fn undo_redo(&mut self, redo: bool) {
@@ -758,6 +781,7 @@ impl App {
         let (from, to) = if redo { (&mut self.redo, &mut self.undo) } else { (&mut self.undo, &mut self.redo) };
         let Some((what, seq, feats)) = from.pop() else { return };
         to.push((what, std::mem::replace(&mut d.seq, seq), std::mem::replace(&mut d.feats, feats)));
+        self.seq_rev += 1;
         // Rewrite everything on the next save; ids of features that came back must not be deleted.
         d.feats.iter_mut().for_each(|f| f.dirty = true);
         d.deleted.retain(|id| !d.feats.iter().any(|f| f.sbd_id == Some(*id)));
@@ -765,6 +789,7 @@ impl App {
         d.lanes = assign_lanes(&mut d.feats, d.seq.len());
         (self.sel, self.caret, self.sel_feat) = (None, None, None);
         self.compute_hits();
+        self.blast_reset(); // stored hits describe the pre-undo sequence
     }
 
     /// Typing, deleting, cut and paste in the Sequence view.
@@ -805,7 +830,24 @@ impl App {
         });
         (self.view, self.sel, self.sel_feat, self.caret, self.error) = (View::Sequence, None, None, Some(0), None);
         (self.undo, self.redo) = (vec![], vec![]);
+        // a new document is not the old one, even under the same "Untitled"
+        // name: results from any running search must not land on it
+        self.seq_rev += 1;
+        self.blast_reset();
         self.compute_hits();
+    }
+
+    /// Drop a running BLAST search and its results — when the open document
+    /// or its sequence changes, or the dialog closes, the search no longer
+    /// describes what is shown.
+    fn blast_reset(&mut self) {
+        // the worker waits and retries between messages, so a dropped receiver
+        // alone would not reach it; the flag does
+        if let Some(c) = self.blast_cancel.take() { c.store(true, std::sync::atomic::Ordering::Relaxed); }
+        self.blast_rx = None;
+        self.blast_rid = None;
+        self.blast_hits = None;
+        self.blast_pick = None;
     }
 
     /// Sequence ▸ Linear / Circular.
@@ -901,9 +943,8 @@ impl App {
     fn export(&mut self) {
         let Some(d) = &self.doc else { return };
         let name = d.path.file_stem().map(|n| n.to_string_lossy().into_owned() + ".gb").unwrap_or_default();
-        if let Some(p) = rfd::FileDialog::new().add_filter("GenBank", &["gb", "gbk"]).set_file_name(name).save_file() {
-            if let Err(e) = write_atomic(&p, export_genbank(d).as_bytes()) { self.error = Some(format!("{}: {e}", p.display())); }
-        }
+        if let Some(p) = rfd::FileDialog::new().add_filter("GenBank", &["gb", "gbk"]).set_file_name(name).save_file()
+            && let Err(e) = write_atomic(&p, export_genbank(d).as_bytes()) { self.error = Some(format!("{}: {e}", p.display())); }
     }
 
     fn save_as(&mut self) {
@@ -1017,7 +1058,7 @@ impl App {
         let Some(files) = Self::pick_sequences() else { return };
         let (mut docs, mut failed) = (vec![], vec![]);
         for p in &files {
-            match load_all(&p) {
+            match load_all(p) {
                 Ok(ds) => docs.extend(ds),
                 Err(e) => failed.push(format!("{}: {e}", p.display())),
             }
@@ -1059,7 +1100,7 @@ impl App {
         let Some(files) = Self::pick_sequences() else { return };
         let (mut docs, mut failed) = (vec![], vec![]);
         for p in &files {
-            match load_all(&p) {
+            match load_all(p) {
                 Ok(ds) => docs.extend(ds),
                 Err(e) => failed.push(format!("{}: {e}", p.display())),
             }
@@ -1109,7 +1150,8 @@ impl App {
         };
         let (le, re) = (&self.enz[le], &self.enz[re]);
         let name = format!("{} fragment", d.name);
-        let ins = match cloning::copy_insert(&d.seq, a, b, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut, &le.name, &re.name, &name, d.circular) {
+        let (lc, rc) = (cloning::Cut { d: le.bot_cut - le.top_cut, enzyme: &le.name }, cloning::Cut { d: re.bot_cut - re.top_cut, enzyme: &re.name });
+        let ins = match cloning::copy_insert(&d.seq, a, b, lc, rc, &name, d.circular) {
             Ok(i) => i,
             Err(e) => { self.error = Some(e); return; }
         };
@@ -1142,8 +1184,9 @@ impl App {
             _ => {}
         }
         let (n, from) = (ins.len(), (ins.left_enz.clone(), ins.right_enz.clone()));
+        let name = ins.name.clone();
         self.edit_seq(x, y, &ins.top);
-        self.info = Some(format!("Ligated the {} bp insert ({} × {} into {} × {})", n, from.0, from.1, names.0, names.1));
+        self.info = Some(format!("Ligated {name}, the {n} bp insert ({} × {} into {} × {})", from.0, from.1, names.0, names.1));
     }
 
     /// Cloning ▸ Clone Selected Fragment: a fresh document from the selection,
@@ -1186,6 +1229,10 @@ impl App {
         self.doc = Some(doc);
         (self.view, self.sel, self.sel_feat, self.caret, self.error) = (View::Sequence, None, None, Some(0), None);
         (self.undo, self.redo) = (vec![], vec![]);
+        // the cloned fragment is a different document: no stale search or
+        // hits may follow it
+        self.seq_rev += 1;
+        self.blast_reset();
         self.compute_hits();
         self.info = Some("Fragment cloned into a new document.".into());
     }
@@ -1195,7 +1242,7 @@ impl App {
     fn gibson_assemble_and_save(&mut self) {
         if self.gib_frags.len() < 2 { self.error = Some("Load at least two fragments.".into()); return; }
         let frags: Vec<Vec<u8>> = self.gib_frags.iter().map(|(_, s, _)| s.clone()).collect();
-        let (assembled, circular, spans) = match cloning::gibson_assemble(&frags, self.gib_min) {
+        let cloning::Assembly { seq: assembled, circular, spans } = match cloning::gibson_assemble(&frags, self.gib_min) {
             Ok(s) => s,
             Err(e) => { self.error = Some(e); return; }
         };
@@ -1346,27 +1393,49 @@ impl App {
                     let Some(d) = &self.doc else { return };
                     let (seq, db) = (d.seq.clone(), if self.blast_db.is_empty() { "core_nt".to_string() } else { self.blast_db.clone() });
                     let doc_name = d.name.clone();
+                    let seq_rev = self.seq_rev;
                     self.blast_hits = None;
                     self.blast_pick = None;
                     let (tx, rx) = std::sync::mpsc::channel();
                     self.blast_rx = Some(rx);
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    self.blast_cancel = Some(cancel.clone());
                     std::thread::spawn(move || {
-                        // hard deadline for the whole search, and stop as soon
-                        // as the dialog closes and drops the receiver
-                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-                        match blast::submit(&seq, &db, "blastn", 50) {
-                            Ok(rid) => {
-                                if tx.send(BlastMsg::Running(rid.clone())).is_err() { return; }
-                                while std::time::Instant::now() < deadline {
-                                    match blast::poll(&rid) {
-                                        Ok(Some(res)) => { let _ = tx.send(BlastMsg::Done(doc_name, Box::new(res))); return; }
-                                        Ok(None) => std::thread::sleep(std::time::Duration::from_secs(15)),
-                                        Err(e) => { let _ = tx.send(BlastMsg::Failed(e)); return; }
-                                    }
-                                }
-                                let _ = tx.send(BlastMsg::Failed("BLAST did not finish within 10 minutes".into()));
+                        // the search runs for ten minutes at most and stops the
+                        // moment the dialog drops it; every request, wait and
+                        // retry inside blast consults this
+                        let stop = blast::Stop::new(cancel, std::time::Duration::from_secs(600));
+                        // a halted search reports nothing to a gone dialog, and a
+                        // timeout once
+                        let give_up = |h: blast::Halt| if h == blast::Halt::TimedOut {
+                            let _ = tx.send(BlastMsg::Failed(h.message()));
+                        };
+                        let rid = match blast::submit(&seq, &db, "blastn", 50, &stop) {
+                            Ok(rid) => rid,
+                            Err(e) => {
+                                match stop.halted() { Some(h) => give_up(h), None => { let _ = tx.send(BlastMsg::Failed(e)); } }
+                                return;
                             }
-                            Err(e) => { let _ = tx.send(BlastMsg::Failed(e)); }
+                        };
+                        if tx.send(BlastMsg::Running(rid.clone())).is_err() { return; }
+                        loop {
+                            if let Some(h) = stop.halted() { give_up(h); return; }
+                            match blast::poll(&rid, &stop) {
+                                Ok(Some(res)) => {
+                                    // a request can never outlive the deadline, so
+                                    // a result in hand is one the dialog may still have
+                                    if stop.halted().is_none() {
+                                        let _ = tx.send(BlastMsg::Done(doc_name, seq_rev, Box::new(res)));
+                                    }
+                                    return;
+                                }
+                                // the loop head decides whether a woken wait goes on or gives up
+                                Ok(None) => { stop.wait(std::time::Duration::from_secs(15)); }
+                                Err(e) => {
+                                    match stop.halted() { Some(h) => give_up(h), None => { let _ = tx.send(BlastMsg::Failed(e)); } }
+                                    return;
+                                }
+                            }
                         }
                     });
                 }
@@ -1400,7 +1469,7 @@ impl App {
                         });
                     }
                 }
-                (None, Some(_)) => { ui.label("Searching NCBI BLAST…"); }
+                (None, Some(_)) => { ui.label(format!("Searching NCBI BLAST… ({})", self.blast_rid.as_deref().unwrap_or("submitting"))); }
                 (None, None) => { ui.weak("Submit the open sequence to run a blastn search."); }
             }
             ui.separator();
@@ -1410,9 +1479,14 @@ impl App {
         });
         if close {
             self.blast_open = false;
-            self.blast_rx = None;
-            self.blast_hits = None;
-            self.blast_pick = None;
+        }
+        // the title-bar X hides the window without the close flag; the
+        // search and any displayed results belong to the open dialog, so
+        // drop them there as well — including after a finished search,
+        // whose blast_rx is already gone but whose hits would otherwise
+        // reappear on reopen
+        if close || !self.blast_open {
+            self.blast_reset();
         }
     }
 
@@ -1422,22 +1496,28 @@ impl App {
         let Some(rx) = &self.blast_rx else { return };
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                BlastMsg::Running(_) => ctx.request_repaint(),
-                BlastMsg::Done(name, res) => {
+                BlastMsg::Running(rid) => { self.blast_rid = Some(rid); ctx.request_repaint(); }
+                BlastMsg::Done(name, rev, res) => {
                     let hits = res.hits.len();
-                    if self.doc.as_ref().map(|d| d.name.as_str()) == Some(name.as_str()) {
+                    // only a document with the same name and unedited sequence
+                    // is the one the search was submitted for
+                    if self.doc.as_ref().map(|d| d.name.as_str()) == Some(name.as_str()) && rev == self.seq_rev {
                         self.info = Some(format!("BLAST finished: {hits} hits"));
                         self.blast_hits = Some(*res);
                     } else {
                         self.info = Some("BLAST finished, but the document changed — results discarded.".into());
                     }
                     self.blast_rx = None;
+                    self.blast_cancel = None;
+                    self.blast_rid = None;
                     ctx.request_repaint();
                     return;
                 }
                 BlastMsg::Failed(e) => {
                     self.error = Some(format!("BLAST failed: {e}"));
                     self.blast_rx = None;
+                    self.blast_cancel = None;
+                    self.blast_rid = None;
                     ctx.request_repaint();
                     return;
                 }
@@ -1551,12 +1631,12 @@ impl App {
             p.text(egui::pos2(rect.left() + 8.0, center_top + CENTER_H + 4.0), egui::Align2::LEFT_TOP, format!("base {}", center_bp + 1), egui::FontId::monospace(10.0), egui::Color32::from_gray(140));
         }
 
-        if resp.clicked() {
-            if let Some(i) = hit {
-                self.sel_feat = Some(i);
-                self.side_top = SideTop::Style;
-                self.info = Some("Feature selected in the curtain view.".into());
-            }
+        if resp.clicked()
+            && let Some(i) = hit
+        {
+            self.sel_feat = Some(i);
+            self.side_top = SideTop::Style;
+            self.info = Some("Feature selected in the curtain view.".into());
         }
     }
 
@@ -1835,7 +1915,7 @@ impl App {
             sorted.sort_unstable();
             let mut grouped: Vec<(u32, u32)> = vec![]; // (bp, count)
             for f in sorted {
-                if let Some(last) = grouped.last_mut() { if last.0 == f { last.1 += 1; continue; } }
+                if let Some(last) = grouped.last_mut() && last.0 == f { last.1 += 1; continue; }
                 grouped.push((f, 1));
             }
             for (bp, count) in grouped {
@@ -1850,15 +1930,15 @@ impl App {
         p.rect_stroke(medium, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Middle);
 
         // hover: show the size of the band closest to the cursor
-        if let Some(mp) = resp.hover_pos() {
-            if medium.contains(mp) {
-                let best = bands.iter()
-                    .filter(|(x0, x1, y, _, _)| mp.x >= *x0 && mp.x <= *x1 && (mp.y - *y).abs() < 5.0)
-                    .min_by(|a, b| (mp.y - a.2).abs().partial_cmp(&(mp.y - b.2).abs()).unwrap_or(std::cmp::Ordering::Equal));
-                if let Some((_, _, _, label, _)) = best {
-                    let tpos = egui::pos2(mp.x + 12.0, mp.y - 18.0);
-                    p.text(tpos, egui::Align2::LEFT_TOP, label.clone(), egui::FontId::proportional(12.0), egui::Color32::WHITE);
-                }
+        if let Some(mp) = resp.hover_pos()
+            && medium.contains(mp)
+        {
+            let best = bands.iter()
+                .filter(|(x0, x1, y, _, _)| mp.x >= *x0 && mp.x <= *x1 && (mp.y - *y).abs() < 5.0)
+                .min_by(|a, b| (mp.y - a.2).abs().partial_cmp(&(mp.y - b.2).abs()).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some((_, _, _, label, _)) = best {
+                let tpos = egui::pos2(mp.x + 12.0, mp.y - 18.0);
+                p.text(tpos, egui::Align2::LEFT_TOP, label.clone(), egui::FontId::proportional(12.0), egui::Color32::WHITE);
             }
         }
     }
@@ -1893,28 +1973,27 @@ impl App {
     fn menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("New DNA  ⌘N").clicked() { self.new_dna(); }
+                if ui.button(format!("New DNA  {}N", cmd_key())).clicked() { self.new_dna(); }
                 if ui.button("New Agarose Gel").clicked() {
                     self.view = View::Gel;
                     self.gel_show_ladder = true;
                     self.gel_enzs.clear();
                 }
-                if ui.button("Open…  ⌘O").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("Sequence", &["sbd", "gb", "gbk", "genbank", "fasta", "fa", "fas", "seq"]).pick_file() {
-                        self.open(&p);
-                    }
+                if ui.button(format!("Open…  {}O", cmd_key())).clicked()
+                    && let Some(p) = rfd::FileDialog::new().add_filter("Sequence", &["sbd", "gb", "gbk", "genbank", "fasta", "fa", "fas", "seq"]).pick_file()
+                {
+                    self.open(&p);
                 }
-                if ui.button("Save  ⌘S").clicked() { self.save(None); }
+                if ui.button(format!("Save  {}S", cmd_key())).clicked() { self.save(None); }
                 if ui.button("Save As…").clicked() { self.save_as(); }
-                if ui.add_enabled(self.doc.is_some(), egui::Button::new("Print…  ⌘P")).clicked() { self.print_doc(false); }
+                if ui.add_enabled(self.doc.is_some(), egui::Button::new(format!("Print…  {}P", cmd_key()))).clicked() { self.print_doc(false); }
                 if ui.add_enabled(self.doc.is_some(), egui::Button::new("Print Selection…")).clicked() { self.print_doc(true); }
                 if ui.add_enabled(self.doc.is_some(), egui::Button::new("Export GenBank…")).clicked() { self.export(); }
                 if ui.button("Open Enzyme Files…").clicked() {
                     let ezd = rfd::FileDialog::new().add_filter("Enzyme file", &["ezd"]).pick_file();
                     let sel = ezd.as_ref().and_then(|_| rfd::FileDialog::new().add_filter("Selector file", &["sel"]).pick_file());
-                    if let (Some(e), Some(s)) = (ezd, sel) {
-                        if let (Ok(b), Ok(t)) = (std::fs::read(e), std::fs::read_to_string(s)) { self.load_enzymes(&b, &t); }
-                    }
+                    if let (Some(e), Some(s)) = (ezd, sel)
+                        && let (Ok(b), Ok(t)) = (std::fs::read(e), std::fs::read_to_string(s)) { self.load_enzymes(&b, &t); }
                 }
             });
             ui.menu_button("Search", |ui| {
@@ -1923,19 +2002,17 @@ impl App {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo  ⌘Z")).clicked() { self.undo_redo(false); }
-                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo  ⇧⌘Z")).clicked() { self.undo_redo(true); }
+                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new(format!("Undo  {}Z", cmd_key()))).clicked() { self.undo_redo(false); }
+                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new(format!("Redo  {}Z", shift_cmd_key()))).clicked() { self.undo_redo(true); }
                 ui.separator();
-                if ui.button("Copy  ⌘C").clicked() {
-                    if let Some(s) = self.selected() { ui.ctx().copy_text(String::from_utf8_lossy(s).into_owned()); }
-                }
-                if ui.button("Select All  ⌘A").clicked() {
-                    if let Some(d) = &self.doc { self.sel = Some((0, d.seq.len())); }
-                }
-                if ui.button("Go to Position…  ⌘J").clicked() { self.goto_open = true; }
+                if ui.button(format!("Copy  {}C", cmd_key())).clicked()
+                    && let Some(s) = self.selected() { ui.ctx().copy_text(String::from_utf8_lossy(s).into_owned()); }
+                if ui.button(format!("Select All  {}A", cmd_key())).clicked()
+                    && let Some(d) = &self.doc { self.sel = Some((0, d.seq.len())); }
+                if ui.button(format!("Go to Position…  {}J", cmd_key())).clicked() { self.goto_open = true; }
             });
             ui.menu_button("Features", |ui| {
-                if ui.add_enabled(self.sel.is_some(), egui::Button::new("New Feature  ⌘K")).clicked() { self.new_feature(); }
+                if ui.add_enabled(self.sel.is_some(), egui::Button::new(format!("New Feature  {}K", cmd_key()))).clicked() { self.new_feature(); }
                 if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Edit Feature…")).clicked() { self.edit_open = true; }
                 if ui.add_enabled(self.sel_feat.is_some(), egui::Button::new("Delete Feature")).clicked() { self.delete_feature(); }
             });
@@ -2004,15 +2081,13 @@ impl App {
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::A),
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::J),
         ));
-        if open {
-            if let Some(p) = rfd::FileDialog::new().pick_file() { self.open(&p); }
-        }
-        if all { if let Some(d) = &self.doc { self.sel = Some((0, d.seq.len())); } }
+        if open
+            && let Some(p) = rfd::FileDialog::new().pick_file() { self.open(&p); }
+        if all && let Some(d) = &self.doc { self.sel = Some((0, d.seq.len())); }
         if goto { self.goto_open = true; }
         // egui turns ⌘C into an event rather than a key press.
-        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
-            if let Some(s) = self.selected() { ctx.copy_text(String::from_utf8_lossy(s).into_owned()); }
-        }
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
+            && let Some(s) = self.selected() { ctx.copy_text(String::from_utf8_lossy(s).into_owned()); }
         if let Some(f) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) { self.open(&f); }
     }
 
@@ -2749,7 +2824,7 @@ impl App {
         let cw = ui.painter().layout_no_wrap("a".into(), font.clone(), Color32::WHITE).size().x;
         let lh = 16.0;
         let (gutter, right_w) = (cw * 5.0, cw * 8.0);
-        let gap = |i: usize, g: usize| if g == 0 { 0.0 } else { (i / g) as f32 * cw * 0.6 };
+        let gap = |i: usize, g: usize| i.checked_div(g).map_or(0.0, |n| n as f32 * cw * 0.6);
         let grouping = self.grouping;
         // bases per row: largest multiple of 10 that fits
         let avail = ui.available_width() - gutter - right_w - 16.0;
@@ -3107,18 +3182,18 @@ impl eframe::App for App {
                 ui.label("Fragments sharing terminal homology are joined in order; the last can close a circle with the first.");
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Add fragments…").clicked() {
-                        if let Some(files) = Self::pick_sequences() {
-                            let mut failed = vec![];
-                            for p in files {
-                                match load_all(&p) {
-                                    Ok(docs) => for d in docs { self.gib_frags.push((d.name, d.seq, d.feats)); },
-                                    Err(e) => failed.push(format!("{}: {e}", p.display())),
-                                }
+                    if ui.button("Add fragments…").clicked()
+                        && let Some(files) = Self::pick_sequences()
+                    {
+                        let mut failed = vec![];
+                        for p in files {
+                            match load_all(&p) {
+                                Ok(docs) => for d in docs { self.gib_frags.push((d.name, d.seq, d.feats)); },
+                                Err(e) => failed.push(format!("{}: {e}", p.display())),
                             }
-                            if !failed.is_empty() {
-                                self.error = Some(format!("Could not load {}", failed.join("; ")));
-                            }
+                        }
+                        if !failed.is_empty() {
+                            self.error = Some(format!("Could not load {}", failed.join("; ")));
                         }
                     }
                     if ui.button("Clear").clicked() { self.gib_frags.clear(); }
@@ -3178,24 +3253,22 @@ fn enzyme_ezd() -> Vec<u8> {
 }
 
 fn enzyme_sel() -> String {
-    if let Some(p) = user_selectorfile() {
-        if let Ok(s) = std::fs::read_to_string(p) { return s; }
-    }
-    if let Some(d) = enzyme_dir() {
-        if let Ok(s) = std::fs::read_to_string(d.join("EnzymeSelectors.sel")) { return s; }
-    }
+    if let Some(p) = user_selectorfile()
+        && let Ok(s) = std::fs::read_to_string(p) { return s; }
+    if let Some(d) = enzyme_dir()
+        && let Ok(s) = std::fs::read_to_string(d.join("EnzymeSelectors.sel")) { return s; }
     SEL_BUNDLED.to_string()
 }
 
 fn main() -> eframe::Result {
     // seqbuilder-rs --export-genbank in.sbd out.gb  (batch conversion, no window)
     let args: Vec<String> = std::env::args().collect();
-    if let [_, flag, input, output] = &args[..] {
-        if flag == "--export-genbank" {
-            let written = load(Path::new(input)).and_then(|(d, _)| write_atomic(Path::new(output), export_genbank(&d).as_bytes()).map_err(|e| e.to_string()));
-            if let Err(e) = written { eprintln!("{input}: {e}"); std::process::exit(1); }
-            return Ok(());
-        }
+    if let [_, flag, input, output] = &args[..]
+        && flag == "--export-genbank"
+    {
+        let written = load(Path::new(input)).and_then(|(d, _)| write_atomic(Path::new(output), export_genbank(&d).as_bytes()).map_err(|e| e.to_string()));
+        if let Err(e) = written { eprintln!("{input}: {e}"); std::process::exit(1); }
+        return Ok(());
     }
     let mut app = App { zoom: 1.0, map_title: Some(String::new()), primer_options: [true; 5], ..Default::default() };
     app.load_enzymes(&enzyme_ezd(), &enzyme_sel());
@@ -3410,7 +3483,8 @@ mod tests {
             assert_eq!(back.features.len(), ncbi.features.len());
             let key = |f: &gb_io::seq::Feature| (f.location.find_bounds().unwrap(), f.kind.to_string());
             let (mut a, mut b): (Vec<_>, Vec<_>) = (back.features.iter().map(key).collect(), ncbi.features.iter().map(key).collect());
-            (a.sort(), b.sort());
+            a.sort();
+            b.sort();
             assert_eq!(a, b, "{f}");
         }
         let out = export_genbank(&load(Path::new("testdata/ALDH2.sbd")).unwrap().0);
@@ -3508,15 +3582,33 @@ mod tests {
         assert_eq!(fragments(&[], 100, true), vec![100]);
     }
 
+    /// An ORF through the origin must not read as an ordinary span: both branches
+    /// of this once produced the same text, hiding the wrap.
+    #[test]
+    fn orf_range_shows_a_wrap_as_two_spans() {
+        let orf = |start, end| Orf { start, end, strand: 1, frame: 1, start_codon: true, len_aa: 2 };
+        assert_eq!(orf_range_text(&orf(99, 150), 4361), "100..150");
+        assert_eq!(orf_range_text(&orf(4300, 150), 4361), "join(4301..4361,1..150)");
+        // and a real wrapping ORF found on a circular sequence reaches that branch:
+        // ATG at 9..11, the next codon crossing the origin, the stop at 3..5
+        let seq = b"CCTAAGGGATGC";
+        let opts = orf::OrfOpts { min_aa: 1, starts: orf::StartFilter::With };
+        let found = orf::find_orfs(seq, true, &opts, &GeneticCode::standard());
+        let wrapped = found.iter().find(|o| o.start > o.end).expect("an ORF reading through the origin");
+        assert_eq!(orf_range_text(wrapped, seq.len()), format!("join({}..12,1..{})", wrapped.start + 1, wrapped.end));
+    }
+
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
     /// Runs against the bundled shipped files so it is deterministic on every machine/CI.
     #[test]
     fn dnastar_unique_six_cutters_on_pbr322() {
         let ezd = EZD_BUNDLED;
         let sel = SEL_BUNDLED;
-        let mut app = App::default();
-        app.enz = enzymes::parse_ezd(&ezd);
-        app.sels = enzymes::parse_sel(&sel).unwrap();
+        let mut app = App {
+            enz: enzymes::parse_ezd(ezd),
+            sels: enzymes::parse_sel(sel).unwrap(),
+            ..Default::default()
+        };
         assert_eq!((app.enz.len(), app.sels.len()), (264, 25));
         app.open(Path::new("testdata/pBR322.gb"));
         assert_eq!(app.shown.len(), app.sites.len(), "only cutting enzymes are checked");

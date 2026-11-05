@@ -484,10 +484,10 @@ impl Sbd {
 
     /// Sequence ▸ Linear / Circular: SeqBuilder records the topology in UVSI SeqShape and UVTL SBLinear.
     pub fn set_circular(&mut self, circular: bool) {
-        if let Some(si) = self.container.chunk_mut(b"UVSI") {
-            if let Some(at) = si.windows(8).position(|w| w == b"SeqShape") {
-                si[at + 12..at + 16].copy_from_slice(&(1 + circular as u32).to_le_bytes());
-            }
+        if let Some(si) = self.container.chunk_mut(b"UVSI")
+            && let Some(at) = si.windows(8).position(|w| w == b"SeqShape")
+        {
+            si[at + 12..at + 16].copy_from_slice(&(1 + circular as u32).to_le_bytes());
         }
         if let Some(tl) = self.container.chunk_mut(b"UVTL") { edit_all(tl, "SBLinear", |_| vec![!circular as u8]); }
         self.circular = circular;

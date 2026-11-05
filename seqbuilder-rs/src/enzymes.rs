@@ -152,7 +152,7 @@ fn eval(sels: &[Selector], id: u32, e: &Enzyme, hits: &[usize], depth: u8) -> bo
     let Some(s) = sels.iter().find(|s| s.id == id) else { return false };
     if depth > 16 { return false; } // selectors referencing each other in a loop
     match &s.rule {
-        Rule::Manual(ids) => ids.iter().any(|i| *i == e.id),
+        Rule::Manual(ids) => ids.contains(&e.id),
         &Rule::Overhang { use_len, min, use_max, max, five_prime, degeneracy } => {
             let (len, five) = e.overhang();
             let len_ok = !use_len || (len >= min && (!use_max || len <= max));
