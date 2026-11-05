@@ -246,12 +246,18 @@ mod tests {
         let bytes = pdf.finish();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("    51  ACGTACGTAC"), "row starts at 51: {}", s.lines().take(8).collect::<Vec<_>>().join(" | "));
-        // the feature table's header band: the light fill, its full width
-        // (515pt tall 12pt) and the black restoration that keeps the text
-        // over it readable
-        let (colour, band) = (s.find("0.9098039 0.9254902 0.9490196 rg"), s.find("515 12 re f"));
-        let (colour, band) = (colour.expect("header fill colour"), band.expect("header band dimensions"));
+        // the feature table's header band: light colour, full width (515pt
+        // tall 12pt), black restoration, and it sits between the Features
+        // title and the table's header row
+        let (title, colour, band, header) = (
+            s.find("(Features) Tj").expect("Features title"),
+            s.find("0.9098039 0.9254902 0.9490196 rg").expect("header fill colour"),
+            s.find("515 12 re f").expect("header band dimensions"),
+            s.find("(Name").expect("table header row"),
+        );
+        assert!(title < colour, "the band's colour is set after the Features title");
         assert!(colour < band, "the fill colour must be set before the rectangle is filled");
+        assert!(band < header, "the band precedes the table header it shades");
         assert!(s.contains("515 12 re f 0 0 0 rg"), "fill colour restored to black after the band");
     }
 }

@@ -90,7 +90,10 @@ pub fn poll(rid: &str) -> Result<Option<BlastResult>, String> {
 }
 
 fn http_get(url: &str) -> Result<String, String> {
-    let resp = ureq::get(url).timeout(std::time::Duration::from_secs(120)).call().map_err(|e| e.to_string())?;
+    // a short timeout: an NCBI poll answers within seconds, and a dropped
+    // dialog can only cancel the worker between requests, so requests must
+    // not stay in flight for the old two minutes
+    let resp = ureq::get(url).timeout(std::time::Duration::from_secs(30)).call().map_err(|e| e.to_string())?;
     resp.into_string().map_err(|e| e.to_string())
 }
 
