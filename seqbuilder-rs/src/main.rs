@@ -460,6 +460,16 @@ fn frame_residue(seq: &[u8], i: usize, k: usize, code: &GeneticCode) -> Option<c
     }
 }
 
+/// The Range line of the ORF details: one span, or, for an ORF reading through
+/// the origin, the two spans it covers, as GenBank writes a wrapped location.
+fn orf_range_text(o: &Orf, n: usize) -> String {
+    if o.start <= o.end {
+        format!("{}..{}", o.start + 1, o.end)
+    } else {
+        format!("join({}..{},1..{})", o.start + 1, n, o.end)
+    }
+}
+
 /// The protein of an ORF in one-letter code, reading through the origin when it wraps.
 /// The minus-strand span reads descending in plus coordinates, start codon at the high end.
 fn orf_protein(d: &Doc, o: &Orf, code: &GeneticCode) -> String {
@@ -678,12 +688,7 @@ impl App {
             ui.heading(format!("ORF {}", oi + 1));
             ui.separator();
             let span = orf::span_len(o, d.seq.len());
-            // an ORF reading through the origin is two spans, as GenBank writes it
-            let range = if o.start <= o.end {
-                format!("{}..{}", o.start + 1, o.end)
-            } else {
-                format!("join({}..{},1..{})", o.start + 1, d.seq.len(), o.end)
-            };
+            let range = orf_range_text(o, d.seq.len());
             egui::Grid::new("orf_info").num_columns(2).show(ui, |ui| {
                 for (k, v) in [
                     ("Strand:", if o.strand < 0 { "Reverse" } else { "Forward" }.to_string()),
@@ -3575,6 +3580,22 @@ mod tests {
         assert_eq!(fragments(&[10, 40], 100, true), vec![30, 70]);
         assert_eq!(fragments(&[40, 10], 100, false), vec![10, 30, 60]);
         assert_eq!(fragments(&[], 100, true), vec![100]);
+    }
+
+    /// An ORF through the origin must not read as an ordinary span: both branches
+    /// of this once produced the same text, hiding the wrap.
+    #[test]
+    fn orf_range_shows_a_wrap_as_two_spans() {
+        let orf = |start, end| Orf { start, end, strand: 1, frame: 1, start_codon: true, len_aa: 2 };
+        assert_eq!(orf_range_text(&orf(99, 150), 4361), "100..150");
+        assert_eq!(orf_range_text(&orf(4300, 150), 4361), "join(4301..4361,1..150)");
+        // and a real wrapping ORF found on a circular sequence reaches that branch:
+        // ATG at 9..11, the next codon crossing the origin, the stop at 3..5
+        let seq = b"CCTAAGGGATGC";
+        let opts = orf::OrfOpts { min_aa: 1, starts: orf::StartFilter::With };
+        let found = orf::find_orfs(seq, true, &opts, &GeneticCode::standard());
+        let wrapped = found.iter().find(|o| o.start > o.end).expect("an ORF reading through the origin");
+        assert_eq!(orf_range_text(wrapped, seq.len()), format!("join({}..12,1..{})", wrapped.start + 1, wrapped.end));
     }
 
     /// Matches SeqBuilder Pro 19 showing pBR322 with its default "Unique Six+ cutters" selector.
