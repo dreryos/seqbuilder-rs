@@ -54,7 +54,10 @@ pub fn submit(seq: &[u8], db: &str, program: &str, hitlist: usize) -> Result<Str
     let body = format!("CMD=Put&PROGRAM={}&DATABASE={}&HITLIST_SIZE={}&QUERY={}",
         urlencode(program), urlencode(db), hitlist, urlencode(&seq));
     let resp = ureq::post(BLAST_URL)
-        .timeout(std::time::Duration::from_secs(120))
+        // submissions carry at most a few kb and NCBI answers within
+        // seconds; a dropped dialog can only cancel this worker between
+        // requests, so the request must not stay in flight for two minutes
+        .timeout(std::time::Duration::from_secs(30))
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&body).map_err(|e| e.to_string())?;
     let body = resp.into_string().map_err(|e| e.to_string())?;

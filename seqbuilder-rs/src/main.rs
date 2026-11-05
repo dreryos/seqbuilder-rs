@@ -1452,8 +1452,11 @@ impl App {
             self.blast_open = false;
         }
         // the title-bar X hides the window without the close flag; the
-        // search belongs to the open dialog, so drop it there as well
-        if close || (!self.blast_open && self.blast_rx.is_some()) {
+        // search and any displayed results belong to the open dialog, so
+        // drop them there as well — including after a finished search,
+        // whose blast_rx is already gone but whose hits would otherwise
+        // reappear on reopen
+        if close || !self.blast_open {
             self.blast_reset();
         }
     }
