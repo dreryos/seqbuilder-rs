@@ -24,7 +24,11 @@ pub fn write(header: &str, name: &str, seq: &[u8], circular: bool, features: &[F
     for f in features {
         out += &format!("     {:<15} {}\n", f.kind, f.location);
         for q in f.quals {
-            for chunk in wrap(&format!("/{q}"), q.starts_with("translation=")) {
+            // line breaks inside a qualifier value would forge GenBank
+            // structure lines — flatten them to spaces before wrapping
+            let q = if q.contains('\n') || q.contains('\r') { q.replace(['\n', '\r'], " ") } else { q.to_string() };
+            let translation = q.starts_with("translation=");
+            for chunk in wrap(&format!("/{q}"), translation) {
                 out += &format!("{:21}{chunk}\n", "");
             }
         }

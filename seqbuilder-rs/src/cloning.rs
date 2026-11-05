@@ -39,8 +39,10 @@ fn take(seq: &[u8], start: usize, k: usize) -> Vec<u8> {
 }
 
 /// Cut an insert between top-strand cut positions [a, b) using the enzymes
-/// that made the cuts; `d` values are each enzyme's bot_cut - top_cut.
-pub fn copy_insert(seq: &[u8], a: usize, b: usize, left_d: i32, right_d: i32, left_enz: &str, right_enz: &str, name: &str) -> Result<Insert, String> {
+/// that made the cuts; `d` values are each enzyme's bot_cut - top_cut. On a
+/// circular source a left 3' overhang reaching before position zero wraps
+/// around the origin.
+pub fn copy_insert(seq: &[u8], a: usize, b: usize, left_d: i32, right_d: i32, left_enz: &str, right_enz: &str, name: &str, circular: bool) -> Result<Insert, String> {
     let (a, b) = if a <= b { (a, b) } else { (b, a) };
     if b > seq.len() { return Err("selection past the end of the sequence".into()); }
     // every overhang carried inside the cut range must fit in it: the 5'
@@ -48,11 +50,18 @@ pub fn copy_insert(seq: &[u8], a: usize, b: usize, left_d: i32, right_d: i32, le
     // |right_d| bases of top)
     if (b - a) < left_d.max(0) as usize { return Err(format!("the {} bp selection is shorter than its {} bp left overhang", b - a, left_d)); }
     if (b - a) < right_d.min(0).unsigned_abs() as usize { return Err(format!("the {} bp selection is shorter than its {} bp right overhang", b - a, right_d.min(0).abs())); }
+    // a 5' left overhang with a 3' right one can overlap each other: the
+    // bottom strand would start after it ends
+    if ((b - a) as i64 + right_d as i64 - left_d as i64) < 0 {
+        return Err("the overhangs overlap: the bottom strand would start after it ends".into());
+    }
     // a left 3' overhang reaches before a: the bottom strand starts that early
+    // (wrapping the origin on a circular source)
+    let n = seq.len().max(1);
     let left_under = if left_d < 0 {
         let k = left_d.unsigned_abs() as usize;
-        if k > a { return Err("the left 3' overhang runs past the start of the sequence".into()); }
-        seq[a - k..a].to_vec()
+        if k > a && !circular { return Err("the left 3' overhang runs past the start of the sequence".into()); }
+        (0..k).map(|i| seq[(a + n - k + i) % n]).collect()
     } else { vec![] };
     let top = seq[a..b].to_vec();
     let right_over = if right_d > 0 { revcomp(&take(seq, b, right_d as usize)) } else { vec![] };
@@ -80,7 +89,8 @@ fn eq_ci(a: &[u8], b: &[u8]) -> bool { a.len() == b.len() && a.iter().zip(b).all
 /// insert's left bottom overhang anneals to the target's top bases before
 /// the left cut, its right top tail to the target's top bases before the
 /// right cut — also direct pairings, compared case-insensitively.
-pub fn compatible(insert: &Insert, target: &[u8], x: usize, y: usize, dl: i32, dr: i32) -> Result<(), String> {
+pub fn compatible(insert: &Insert, target: &[u8], x: usize, y: usize, dl: i32, dr: i32, circular: bool) -> Result<(), String> {
+    let n = target.len().max(1);
     if insert.left_d != dl || insert.right_d != dr {
         return Err(format!("overhang lengths differ: insert {}+{}, target {}+{}",
             insert.left_d, insert.right_d, dl, dr));
@@ -93,10 +103,11 @@ pub fn compatible(insert: &Insert, target: &[u8], x: usize, y: usize, dl: i32, d
         }
     } else if dl < 0 {
         // the insert's bottom overhang pairs with the target's top bases
-        // immediately before the cut
+        // immediately before the cut (wrapping the origin on a circle)
         let k = dl.unsigned_abs() as usize;
-        if k > x { return Err("the target's left 3' overhang runs before its start".into()); }
-        if !eq_ci(&insert.left_under, &target[x - k..x]) {
+        if k > x && !circular { return Err("the target's left 3' overhang runs before its start".into()); }
+        let t: Vec<u8> = (0..k).map(|i| target[(x + n - k + i) % n]).collect();
+        if !eq_ci(&insert.left_under, &t) {
             return Err("the left overhang bases do not match the target bases before the left cut".into());
         }
     }
@@ -110,8 +121,9 @@ pub fn compatible(insert: &Insert, target: &[u8], x: usize, y: usize, dl: i32, d
         // the insert's top tail pairs with the target's bottom bases —
         // equivalently its top bases — immediately before the cut
         let k = dr.unsigned_abs() as usize;
-        if k > y { return Err("the target's right 3' overhang runs before its start".into()); }
-        if !eq_ci(&insert.top[insert.top.len() - k..], &target[y - k..y]) {
+        if k > y && !circular { return Err("the target's right 3' overhang runs before its start".into()); }
+        let t: Vec<u8> = (0..k).map(|i| target[(y + n - k + i) % n]).collect();
+        if !eq_ci(&insert.top[insert.top.len() - k..], &t) {
             return Err("the right overhang bases do not match the target bases before the right cut".into());
         }
     }
@@ -173,20 +185,38 @@ pub fn clone_fragment(seq: &[u8], a: usize, b: usize) -> Vec<u8> {
     if a <= b { seq[a..b].to_vec() } else { seq[a..].iter().chain(seq[..b].iter()).copied().collect() }
 }
 
-/// Shift every number in a GenBank location text ("join(101..110,201..210)",
-/// "complement(3..50)") by `delta`, preserving the location structure.
+/// Shift every coordinate in a GenBank location text ("join(101..110,201..210)",
+/// "complement(3..50)") by `delta`, preserving the location structure. Only
+/// pure coordinate numbers shift: range operands like 101..110 move both
+/// sides, while words carrying letters — remote accessions such as
+/// J12345.1 — are left untouched.
 pub fn offset_range(range: &str, delta: i64) -> String {
-    let (mut out, mut num) = (String::new(), String::new());
-    let flush = |out: &mut String, num: &mut String| {
-        if !num.is_empty() {
-            if let Ok(v) = num.parse::<i64>() { out.push_str(&(v + delta).to_string()); }
-            num.clear();
+    let shift = |word: &str| -> String {
+        if let Some(at) = word.find("..") {
+            let (l, r) = word.split_at(at);
+            match (l.parse::<i64>(), r[2..].parse::<i64>()) {
+                (Ok(a), Ok(b)) => format!("{}..{}", a.saturating_add(delta), b.saturating_add(delta)),
+                _ => word.to_string(),
+            }
+        } else if word.chars().all(|c| c.is_ascii_digit()) && !word.is_empty() {
+            word.parse::<i64>().map(|v| v.saturating_add(delta).to_string()).unwrap_or_else(|_| word.to_string())
+        } else {
+            word.to_string()
         }
     };
-    for c in range.chars() {
-        if c.is_ascii_digit() { num.push(c); } else { flush(&mut out, &mut num); out.push(c); }
+    let mut out = String::new();
+    let chars: Vec<char> = range.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_alphanumeric() || chars[i] == '.' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') { i += 1; }
+            out.push_str(&shift(&chars[start..i].iter().collect::<String>()));
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
     }
-    flush(&mut out, &mut num);
     out
 }
 
@@ -221,7 +251,7 @@ mod tests {
 
     #[test]
     fn ecori_geometry() {
-        let ins = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "fragment").unwrap();
+        let ins = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "fragment", false).unwrap();
         assert_eq!(ins.top, VECTOR[5..22]);
         let (l, r) = ins.overhangs();
         assert_eq!(l, b"AATT"); // top bases right after the left cut
@@ -230,11 +260,11 @@ mod tests {
 
     #[test]
     fn paste_into_same_enzyme_cuts() {
-        let ins = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "insert").unwrap();
+        let ins = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "insert", false).unwrap();
         // a target opened with EcoRI on both sides: TTGAATTC...GAATTCCT
         let target = b"TTTTGAATTCAAAAAAAAGAATTCCTTTT";
         // top cuts at 5 and 19
-        compatible(&ins, target, 5, 19, 4, 4).unwrap();
+        compatible(&ins, target, 5, 19, 4, 4, false).unwrap();
         let out = paste_insert(target, &ins, 5, 19);
         assert_eq!(&out[..5], &target[..5]);
         assert_eq!(&out[5..5 + ins.top.len()], &ins.top);
@@ -248,48 +278,48 @@ mod tests {
         // an EcoRI-left / BamHI-right insert (overhang AATT ... GATC on the
         // bottom strand) does not ligate into an EcoRI / EcoRI target
         let src = b"AAAAGAATTCCGGGGGGGGGGGGATCCTT";
-        let ins = copy_insert(src, 5, 22, 4, 4, "EcoRI", "BamHI", "mixed").unwrap();
+        let ins = copy_insert(src, 5, 22, 4, 4, "EcoRI", "BamHI", "mixed", false).unwrap();
         let (_, r) = ins.overhangs();
         assert_eq!(r, b"GATC"); // revcomp of GGATCC's tail past the cut
         let target = b"TTTTGAATTCAAAAAAAAGAATTCCTTTT";
-        assert!(compatible(&ins, target, 5, 19, 4, 4).is_err());
+        assert!(compatible(&ins, target, 5, 19, 4, 4, false).is_err());
         // and into a matching EcoRI / BamHI target it does
         let t2 = b"TTTTGAATTCAAAAAAAAGGATCCCTTTT";
-        compatible(&ins, t2, 5, 19, 4, 4).unwrap();
+        compatible(&ins, t2, 5, 19, 4, 4, false).unwrap();
     }
 
     #[test]
     fn overhang_comparison_is_case_insensitive() {
         let ins = Insert { name: "s".into(), top: b"aattCGCGCG".to_vec(), left_d: 4, right_d: 0, left_enz: "EcoRI".into(), right_enz: "SmaI".into(), left_under: vec![], right_over: vec![] };
         let target = b"TTTTGAATTCAAAAAAAAAAAAAACTTTT";
-        compatible(&ins, target, 5, 9, 4, 0).unwrap();
+        compatible(&ins, target, 5, 9, 4, 0, false).unwrap();
     }
 
     #[test]
     fn selection_shorter_than_overhang_rejected() {
         // MspI C^CGG (d=2) and SmaI CCC^GGG (d=0) bound a 1-base top strand
-        assert!(copy_insert(b"CCCGGG", 2, 3, 2, 0, "MspI", "SmaI", "t").is_err());
+        assert!(copy_insert(b"CCCGGG", 2, 3, 2, 0, "MspI", "SmaI", "t", false).is_err());
     }
 
     #[test]
     fn blunt_and_incompatible() {
         let blunt = Insert { name: "b".into(), top: b"ACGTACGTAC".to_vec(), left_d: 0, right_d: 0, left_enz: "SmaI".into(), right_enz: "SmaI".into(), left_under: vec![], right_over: vec![] };
-        compatible(&blunt, b"AAAAAAAAAA", 3, 7, 0, 0).unwrap();
+        compatible(&blunt, b"AAAAAAAAAA", 3, 7, 0, 0, false).unwrap();
         // an AATT insert does not ligate into a blunt target
-        let sticky = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "s").unwrap();
-        assert!(compatible(&sticky, b"AAAAAAAAAAA", 3, 7, 0, 0).is_err());
+        let sticky = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "s", false).unwrap();
+        assert!(compatible(&sticky, b"AAAAAAAAAAA", 3, 7, 0, 0, false).is_err());
         // and not into a target whose overhang bases differ
         let t = b"TTTTGACTAGAAAAAAAAGACTAGCTTTT";
-        assert!(compatible(&sticky, t, 5, 17, 4, 4).is_err());
+        assert!(compatible(&sticky, t, 5, 17, 4, 4, false).is_err());
     }
 
     #[test]
     fn circular_target_wraps() {
         // cut at the origin: target[y..] then [x..y) spans the wrap
-        let ins = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "i").unwrap();
+        let ins = copy_insert(VECTOR, 5, 22, 4, 4, "EcoRI", "EcoRI", "i", false).unwrap();
         let target = b"GAATTCAAAAAAAGAATTCGG";
         // left cut EcoRI at 1, right cut EcoRI at 14: target[..1] ++ ins ++ target[14..]
-        compatible(&ins, target, 1, 14, 4, 4).unwrap();
+        compatible(&ins, target, 1, 14, 4, 4, false).unwrap();
         let out = paste_insert(target, &ins, 1, 14);
         assert_eq!(out.len(), 1 + ins.top.len() + (target.len() - 14));
     }
@@ -341,6 +371,31 @@ mod tests {
         assert_eq!(offset_range("101..110", -100), "1..10");
         assert_eq!(offset_range("complement(3..50)", -2), "complement(1..48)");
         assert_eq!(offset_range("join(101..110,201..210)", -100), "join(1..10,101..110)");
+    }
+
+    #[test]
+    fn offset_range_keeps_remote_accessions() {
+        // remote references carry their own accession numbers, which must not shift
+        assert_eq!(offset_range("J12345.1:20..30", 10), "J12345.1:30..40");
+        assert_eq!(offset_range("join(5..9,U00004.5:12..19)", 100), "join(105..109,U00004.5:112..119)");
+        assert_eq!(offset_range("U00004.5", 1000), "U00004.5");
+    }
+
+    #[test]
+    fn gibson_spans_report_fragment_positions() {
+        let (out, circular, spans) = gibson_assemble(&[b"AAAACCCC".to_vec(), b"CCCCGGGG".to_vec()], 4).unwrap();
+        assert_eq!(out, b"AAAACCCCGGGG");
+        assert!(!circular);
+        // fragment 0 contributes all of itself from product position 0;
+        // fragment 1 contributes from its own base 4 (the overlap) at
+        // product position 8
+        assert_eq!(spans, vec![(0, 0), (8, 4)]);
+
+        // a closed circle: the second fragment's tail is the product's start
+        let (out, circular, spans) = gibson_assemble(&[b"TTTTAAAA".to_vec(), b"AAAATTTT".to_vec()], 4).unwrap();
+        assert_eq!(out, b"TTTTAAAA");
+        assert!(circular);
+        assert_eq!(spans, vec![(0, 0), (8, 4)]);
     }
 
     #[test]
@@ -396,25 +451,25 @@ mod tests {
     fn three_prime_overhangs_clone() {
         // KpnI-like left end (d = -4): the fragment's bottom strand starts
         // four bases before the top cut, so it carries a left 3' overhang
-        let ins = copy_insert(VECTOR, 7, 20, -4, 0, "KpnI", "SmaI", "x").unwrap();
+        let ins = copy_insert(VECTOR, 7, 20, -4, 0, "KpnI", "SmaI", "x", false).unwrap();
         assert_eq!(ins.top, VECTOR[7..20]);
         assert_eq!(ins.left_under, VECTOR[3..7]);
         // matching target: same bases before its left cut
-        assert!(compatible(&ins, VECTOR, 7, 20, -4, 0).is_ok());
+        assert!(compatible(&ins, VECTOR, 7, 20, -4, 0, false).is_ok());
         // a target whose bases before the cut differ does not ligate
         let other = b"TTTTGAATTCCGGGGGGGGGGGAATTCGGTT";
-        assert!(compatible(&ins, other, 7, 20, -4, 0).is_err());
+        assert!(compatible(&ins, other, 7, 20, -4, 0, false).is_err());
         // the pasted product keeps the target's flanks and the insert
         assert_eq!(paste_insert(VECTOR, &ins, 7, 20), [VECTOR[..7].to_vec(), ins.top.clone(), VECTOR[20..].to_vec()].concat());
 
         // PstI-like right end (d = -4): the fragment's top tail pairs with
         // the target's bases before its right cut
-        let ins = copy_insert(VECTOR, 5, 20, 0, -4, "SmaI", "PstI", "y").unwrap();
-        assert!(compatible(&ins, VECTOR, 5, 20, 0, -4).is_ok());
+        let ins = copy_insert(VECTOR, 5, 20, 0, -4, "SmaI", "PstI", "y", false).unwrap();
+        assert!(compatible(&ins, VECTOR, 5, 20, 0, -4, false).is_ok());
         let mismatched = [VECTOR[..16].to_vec(), b"TTTT".to_vec(), VECTOR[20..].to_vec()].concat();
-        assert!(compatible(&ins, &mismatched, 5, 20, 0, -4).is_err());
+        assert!(compatible(&ins, &mismatched, 5, 20, 0, -4, false).is_err());
 
         // a left 3' overhang reaching before the sequence start is refused
-        assert!(copy_insert(VECTOR, 2, 10, -4, 0, "KpnI", "SmaI", "z").is_err());
+        assert!(copy_insert(VECTOR, 2, 10, -4, 0, "KpnI", "SmaI", "z", false).is_err());
     }
 }

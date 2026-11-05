@@ -201,20 +201,30 @@ fn short(label: &str) -> String {
     if label.chars().count() > 28 { label.chars().take(27).collect::<String>() + "…" } else { label.to_string() }
 }
 
-/// Read a sequence document; the count says how many records the file held
-/// (multi-record files open their first record).
-fn load(path: &Path) -> Result<(Doc, usize), String> {
-    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+/// Read every record a sequence file holds: one document per FASTA or
+/// GenBank record (.sbd files are single documents). FASTA records are named
+/// from their header line.
+fn load_all(path: &Path) -> Result<Vec<Doc>, String> {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let text = std::fs::read(path).map_err(|e| e.to_string())?;
-    let (mut doc, records) = if text.first() == Some(&b'>') {
-        // FASTA: only the first record opens; later ones are counted, not merged
+    let mut docs: Vec<Doc> = vec![];
+    if text.first() == Some(&b'>') {
+        let mut recs: Vec<(Option<String>, Vec<u8>)> = vec![];
+        let mut header: Option<String> = None;
         let mut seq: Vec<u8> = vec![];
-        let mut records = 0usize;
         for line in text.split(|&b| b == b'\n') {
-            if line.starts_with(b">") { records += 1; }
-            else if records <= 1 { seq.extend(line.iter().copied().filter(u8::is_ascii_alphabetic)); }
+            if line.starts_with(b">") {
+                recs.push((header.replace(String::from_utf8_lossy(&line[1..]).trim().to_string()), std::mem::take(&mut seq)));
+            } else {
+                seq.extend(line.iter().copied().filter(u8::is_ascii_alphabetic));
+            }
         }
-        (Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false }, records.max(1))
+        if header.is_some() || !seq.is_empty() { recs.push((header, seq)); }
+        for (h, s) in recs {
+            if s.is_empty() { continue; }
+            let name = h.as_deref().and_then(|h| h.split_whitespace().next()).unwrap_or(&stem).to_string();
+            docs.push(Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq: s, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false });
+        }
     } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sbd")) {
         let s = sbd::read(&text)?;
         let feats = s.feats.iter().map(|f| {
@@ -231,59 +241,60 @@ fn load(path: &Path) -> Result<(Doc, usize), String> {
             }
         }).collect();
         let locus = s.header_field("LOCUS", " ");
-        (
-            Doc {
-                name: locus.split_whitespace().next().map_or(name, str::to_owned),
-                definition: s.header_field("DEFINITION", " "), accession: s.header_field("ACCESSION", " "),
-                comment: s.header_field("COMMENT", "\n"),
-                seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), header: s.header.clone(), sbd: Some(s), deleted: vec![], seq_dirty: false, topology_dirty: false,
-            },
-            1,
-        )
+        docs.push(Doc {
+            name: locus.split_whitespace().next().map_or(stem, str::to_owned),
+            definition: s.header_field("DEFINITION", " "), accession: s.header_field("ACCESSION", " "),
+            comment: s.header_field("COMMENT", "\n"),
+            seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), header: s.header.clone(), sbd: Some(s), deleted: vec![], seq_dirty: false, topology_dirty: false,
+        });
     } else {
-        let recs: Vec<_> = gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())?
-            .into_iter().collect();
-        let count = recs.len();
-        let rec = recs.into_iter().next().ok_or("no sequence in file")?;
-        let len = rec.seq.len();
-        let feats = rec.features.iter().filter_map(|f| {
-            let (s, e) = f.location.find_bounds().ok()?;
-            let q = |k: &str| f.qualifier_values(k).next().map(str::to_owned);
-            // INSDC qualifiers whose values are written without quotes
-            const BARE: [&str; 13] = ["anticodon", "citation", "codon_start", "compare", "direction", "estimated_length",
-                "mod_base", "number", "rpt_type", "rpt_unit_range", "tag_peptide", "transl_except", "transl_table"];
-            let quals: Vec<String> = f.qualifiers.iter().map(|(k, v)| match v {
-                Some(v) if BARE.contains(&k.as_ref()) => format!("{k}={v}"),
-                // continuation lines join with a space, except inside a protein translation
-                Some(v) => format!("{k}=\"{}\"", v.replace('\n', if k == "translation" { "" } else { " " })),
-                None => k.to_string(),
+        for rec in gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())? {
+            let len = rec.seq.len();
+            let feats = rec.features.iter().filter_map(|f| {
+                let (s, e) = f.location.find_bounds().ok()?;
+                let q = |k: &str| f.qualifier_values(k).next().map(str::to_owned);
+                // INSDC qualifiers whose values are written without quotes
+                const BARE: [&str; 13] = ["anticodon", "citation", "codon_start", "compare", "direction", "estimated_length",
+                    "mod_base", "number", "rpt_type", "rpt_unit_range", "tag_peptide", "transl_except", "transl_table"];
+                let quals: Vec<String> = f.qualifiers.iter().map(|(k, v)| match v {
+                    Some(v) if BARE.contains(&k.as_ref()) => format!("{k}={v}"),
+                    // continuation lines join with a space, except inside a protein translation
+                    Some(v) => format!("{k}=\"{}\"", v.replace('\n', if k == "translation" { "" } else { " " })),
+                    None => k.to_string(),
+                }).collect();
+                let name = sbd::feature_name(&quals);
+                // find_bounds unwraps origin-spanning joins past len; fold them back.
+                let (start, end) = (s.rem_euclid(len as i64) as usize, e as usize);
+                let end = if end > len { end - len } else { end };
+                Some(Feat {
+                    kind: f.kind.to_string(), label: short(&name), name, desc: q("note").or_else(|| q("product")).unwrap_or_default(),
+                    range: f.location.to_gb_format(), start, end, strand: location_strand(&f.location), lane: 0,
+                    show: f.kind != "source", // SeqBuilder lists source but leaves it hidden
+                    style: None, base: TYPE_LOOKS.0.get(f.kind.as_ref()).copied(), sbd_id: None, edited: false, quals, dirty: false,
+                    shape: None, base_shape: TYPE_LOOKS.1.get(f.kind.as_ref()).copied(), shape_edited: false,
+                })
             }).collect();
-            let name = sbd::feature_name(&quals);
-            // find_bounds unwraps origin-spanning joins past len; fold them back.
-            let (start, end) = (s.rem_euclid(len as i64) as usize, e as usize);
-            let end = if end > len { end - len } else { end };
-            Some(Feat {
-                kind: f.kind.to_string(), label: short(&name), name, desc: q("note").or_else(|| q("product")).unwrap_or_default(),
-                range: f.location.to_gb_format(), start, end, strand: location_strand(&f.location), lane: 0,
-                show: f.kind != "source", // SeqBuilder lists source but leaves it hidden
-                style: None, base: TYPE_LOOKS.0.get(f.kind.as_ref()).copied(), sbd_id: None, edited: false, quals, dirty: false,
-                shape: None, base_shape: TYPE_LOOKS.1.get(f.kind.as_ref()).copied(), shape_edited: false,
-            })
-        }).collect();
-        let circular = rec.is_circular();
-        (
-            Doc {
-                name: rec.name.clone().unwrap_or(name), definition: rec.definition.clone().unwrap_or_default(),
+            let circular = rec.is_circular();
+            docs.push(Doc {
+                name: rec.name.clone().unwrap_or_else(|| stem.clone()), definition: rec.definition.clone().unwrap_or_default(),
                 accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
                 seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false,
                 header: text.iter().map(|&b| b as char).collect::<String>().split("\nFEATURES").next().unwrap_or_default().to_string() + "\n",
                 topology_dirty: false,
-            },
-            count,
-        )
-    };
-    doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
-    Ok((doc, records))
+            });
+        }
+    }
+    for doc in &mut docs { doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len()); }
+    Ok(docs)
+}
+
+/// Read a sequence document; the count says how many records the file held
+/// (multi-record files open their first record).
+fn load(path: &Path) -> Result<(Doc, usize), String> {
+    let mut docs = load_all(path)?;
+    if docs.is_empty() { return Err("no sequence in file".into()); }
+    let records = docs.len();
+    Ok((docs.remove(0), records))
 }
 
 /// Style for documents that carry none (GenBank, FASTA).
@@ -539,9 +550,9 @@ impl App {
     fn open(&mut self, path: &Path) {
         match load(path) {
             Ok((d, records)) => {
-                if records > 1 {
-                    self.info = Some(format!("{} holds {} sequences — the first one ({} bp) is open", path.display(), records, d.seq.len()));
-                }
+                self.info = if records > 1 {
+                    Some(format!("{} holds {} sequences — the first one ({} bp) is open", path.display(), records, d.seq.len()))
+                } else { None };
                 self.view = if d.circular { View::Circular } else { View::Sequence };
                 // GenBank CDS /transl_table qualifiers select the document's
                 // genetic code, as SeqBuilder Pro picks up (e.g. 11 for bacteria).
@@ -883,11 +894,13 @@ impl App {
         let Some(files) = Self::pick_sequences() else { return };
         let mut saved = 0;
         for p in files {
-            let Ok((d, _)) = load(&p) else { continue };
+            let Ok(docs) = load_all(&p) else { continue };
             let out = p.with_extension("rc.gb");
-            if std::fs::write(&out, export_genbank(&tools::reverse_complement(&d))).is_ok() { saved += 1; }
+            let mut text = String::new();
+            for d in docs { text += &export_genbank(&tools::reverse_complement(&d)); }
+            if !text.is_empty() && std::fs::write(&out, text).is_ok() { saved += 1; }
         }
-        self.info = Some(format!("{saved} sequence(s) reverse-complemented"));
+        self.info = Some(format!("{saved} sequence file(s) reverse-complemented"));
     }
 
     /// Tools ▸ Batch Translate: the frame-1 protein of every picked sequence,
@@ -897,23 +910,26 @@ impl App {
         let code = self.gen_code.clone();
         let mut saved = 0;
         for p in files {
-            let Ok((d, _)) = load(&p) else { continue };
-            let prot = tools::translate_protein(&d, &code);
-            let mut out = format!(">{}_protein\n", d.name);
-            for chunk in prot.as_bytes().chunks(60) {
-                out.push_str(&String::from_utf8_lossy(chunk));
-                out.push('\n');
+            let Ok(docs) = load_all(&p) else { continue };
+            let mut out = String::new();
+            for d in docs {
+                let prot = tools::translate_protein(&d, &code);
+                out += &format!(">{}_protein\n", d.name);
+                for chunk in prot.as_bytes().chunks(60) {
+                    out.push_str(&String::from_utf8_lossy(chunk));
+                    out.push('\n');
+                }
             }
-            if std::fs::write(p.with_extension("prot.fas"), out).is_ok() { saved += 1; }
+            if !out.is_empty() && std::fs::write(p.with_extension("prot.fas"), out).is_ok() { saved += 1; }
         }
-        self.info = Some(format!("{saved} sequence(s) translated"));
+        self.info = Some(format!("{saved} sequence file(s) translated"));
     }
 
     /// Tools ▸ Concatenate: the picked sequences joined end to end, features
     /// offset to their new positions, saved as one GenBank file.
     fn tool_concatenate(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
-        let docs: Vec<Doc> = files.iter().filter_map(|p| load(p).ok().map(|(d, _)| d)).collect();
+        let docs: Vec<Doc> = files.iter().filter_map(|p| load_all(p).ok()).flatten().collect();
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
         let cat = tools::concatenate(&docs);
         let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name(format!("{}_concatenated.gb", cat.name)).save_file() else { return };
@@ -949,7 +965,7 @@ impl App {
     /// multi-FASTA file.
     fn tool_export_single(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
-        let docs: Vec<Doc> = files.iter().filter_map(|p| load(p).ok().map(|(d, _)| d)).collect();
+        let docs: Vec<Doc> = files.iter().filter_map(|p| load_all(p).ok()).flatten().collect();
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
         let n = docs.len();
         let Some(out) = rfd::FileDialog::new().add_filter("FASTA", &["fas"]).set_file_name("sequences.fas").save_file() else { return };
@@ -996,7 +1012,7 @@ impl App {
         };
         let (le, re) = (&self.enz[le], &self.enz[re]);
         let name = format!("{} fragment", d.name);
-        let ins = match cloning::copy_insert(&d.seq, a, b, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut, &le.name, &re.name, &name) {
+        let ins = match cloning::copy_insert(&d.seq, a, b, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut, &le.name, &re.name, &name, d.circular) {
             Ok(i) => i,
             Err(e) => { self.error = Some(e); return; }
         };
@@ -1021,7 +1037,7 @@ impl App {
             return;
         };
         let (le, re) = (&self.enz[le], &self.enz[re]);
-        let check = self.doc.as_ref().map(|d| cloning::compatible(&ins, &d.seq, x, y, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut));
+        let check = self.doc.as_ref().map(|d| cloning::compatible(&ins, &d.seq, x, y, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut, d.circular));
         let names = (le.name.clone(), re.name.clone());
         match check {
             Some(Err(e)) => { self.error = Some(e); return; }
@@ -1086,21 +1102,52 @@ impl App {
             Ok(s) => s,
             Err(e) => { self.error = Some(e); return; }
         };
-        // carry the fragments' features into the product: a feature at
-        // [s..e) of fragment i lands at [out_start + s - in_start ..) of the
-        // assembly; wrap features and spans past the product are clamped
+        // carry the fragments' features into the product: every feature is
+        // split into source segments (an origin-spanning feature yields the
+        // two sides of its fragment), each segment lands at out_start +
+        // in_pos - in_start of the assembly, and on a circular product
+        // positions past the end are the closing overlap — the same bases as
+        // the product's start — so they wrap around. Feature bounds outside
+        // the fragment's own sequence are dropped; offsets use saturating
+        // arithmetic so malformed sources cannot overflow.
+        let alen = assembled.len();
         let mut feats: Vec<Feat> = vec![];
-        for ((_, _, ffeats), (out_start, in_start)) in self.gib_frags.iter().zip(spans.iter()) {
-            let delta = *out_start as i64 - *in_start as i64;
+        for ((_, fseq, ffeats), (out_start, in_start)) in self.gib_frags.iter().zip(spans.iter()) {
+            let (flen, delta) = (fseq.len(), *out_start as isize - *in_start as isize);
             for f in ffeats {
-                if f.end <= f.start { continue; } // a wrap feature cannot shift into a linear product
+                if f.start >= flen || f.end > flen { continue; }
+                let segs: Vec<(usize, usize)> = if f.end > f.start {
+                    vec![(f.start, f.end)]
+                } else {
+                    vec![(f.start, flen), (0, f.end)] // a wrap feature's two sides
+                };
+                let mut outsegs: Vec<(usize, usize)> = vec![];
+                for (s, e) in segs {
+                    if e <= s { continue; }
+                    let (ns, ne) = (s.saturating_add_signed(delta), e.saturating_add_signed(delta));
+                    if circular {
+                        let (ns, ne) = if ns >= alen { (ns - alen, ne - alen) } else { (ns, ne) };
+                        if ne <= alen {
+                            if ne > ns { outsegs.push((ns, ne)); }
+                        } else {
+                            // crosses the product's origin
+                            outsegs.push((ns, alen));
+                            outsegs.push((0, (ne - alen).min(alen)));
+                        }
+                    } else {
+                        let (ns, ne) = (ns.min(alen), ne.min(alen));
+                        if ne > ns { outsegs.push((ns, ne)); }
+                    }
+                }
+                if outsegs.is_empty() { continue; }
                 let mut g = f.clone();
-                let (ns, ne) = (f.start as i64 + delta, f.end as i64 + delta);
-                if ns >= assembled.len() as i64 { continue; }
-                g.start = ns.max(0) as usize;
-                g.end = (ne.min(assembled.len() as i64)).max(g.start as i64 + 1) as usize;
-                if g.start >= assembled.len() { continue; }
-                g.range = cloning::offset_range(&f.range, delta);
+                g.start = outsegs[0].0;
+                g.end = outsegs[outsegs.len() - 1].1;
+                // the location text is rebuilt from the mapped segments, so
+                // every coordinate lies inside the product
+                let parts: Vec<String> = outsegs.iter().map(|(a, b)| format!("{}..{}", a + 1, b)).collect();
+                let loc = if parts.len() == 1 { parts[0].clone() } else { format!("join({})", parts.join(",")) };
+                g.range = if f.strand < 0 { format!("complement({loc})") } else { loc };
                 g.lane = 0;
                 feats.push(g);
             }
@@ -2947,8 +2994,8 @@ impl eframe::App for App {
                         if let Some(files) = Self::pick_sequences() {
                             let mut failed = vec![];
                             for p in files {
-                                match load(&p) {
-                                    Ok((d, _)) => self.gib_frags.push((d.name, d.seq, d.feats)),
+                                match load_all(&p) {
+                                    Ok(docs) => for d in docs { self.gib_frags.push((d.name, d.seq, d.feats)); },
                                     Err(e) => failed.push(format!("{}: {e}", p.display())),
                                 }
                             }
@@ -3048,6 +3095,20 @@ mod tests {
     fn complement_and_gc() {
         assert_eq!(b"ACGTN".map(complement), *b"TGCAN");
         assert_eq!(gc_percent(b"GGAT"), 50.0);
+    }
+
+    #[test]
+    fn multi_record_fasta_loads_each_record() {
+        let p = std::env::temp_dir().join("sb_multi_test.fas");
+        std::fs::write(&p, ">first one\nACGT\n>second\nTTTT\nGGGG\n").unwrap();
+        let docs = load_all(&p).unwrap();
+        // opening keeps the first record and reports the count
+        let (d, records) = load(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!((docs[0].name.as_str(), docs[0].seq.as_slice()), ("first", b"ACGT".as_slice()));
+        assert_eq!((docs[1].name.as_str(), docs[1].seq.as_slice()), ("second", b"TTTTGGGG".as_slice()));
+        assert_eq!((records, d.name.as_str(), d.seq.as_slice()), (2, "first", b"ACGT".as_slice()));
     }
 
     #[test]
