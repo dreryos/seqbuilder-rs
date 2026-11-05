@@ -259,5 +259,19 @@ mod tests {
         assert!(colour < band, "the fill colour must be set before the rectangle is filled");
         assert!(band < header, "the band precedes the table header it shades");
         assert!(s.contains("515 12 re f 0 0 0 rg"), "fill colour restored to black after the band");
+        // order and size alone would still pass with the band drawn elsewhere on
+        // the page, so check it really covers the row: same left edge, and the
+        // row's baseline between the rectangle's bottom and top
+        let numbers = |from: usize, upto: &str| -> Vec<f32> {
+            let tail = &s[from..];
+            tail[..tail.find(upto).expect("end of operator")]
+                .split_whitespace().filter_map(|t| t.parse::<f32>().ok()).collect()
+        };
+        let rect = numbers(colour, "re");                                  // r g b x y w h
+        let row = numbers(s[..header].rfind("BT ").expect("header text"), "Td"); // size x y
+        let (bx, by, bh) = (rect[3], rect[4], rect[6]);
+        let (rx, ry) = (row[1], row[2]);
+        assert_eq!(bx, rx, "the band starts at the header row's left edge");
+        assert!(by <= ry && ry <= by + bh, "the header baseline {ry} is inside the band {by}..{}", by + bh);
     }
 }

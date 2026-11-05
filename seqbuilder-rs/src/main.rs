@@ -601,6 +601,7 @@ struct App {
     seq_rev: u64,                             // bumped on every sequence edit; BLAST results carry theirs
     blast_pick: Option<usize>,            // hit selected for the HSP detail
     blast_rx: Option<std::sync::mpsc::Receiver<BlastMsg>>,
+    blast_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, // tells the worker to stop
 }
 
 /// Messages from the background BLAST thread.
@@ -831,6 +832,9 @@ impl App {
     /// or its sequence changes, or the dialog closes, the search no longer
     /// describes what is shown.
     fn blast_reset(&mut self) {
+        // the worker waits and retries between messages, so a dropped receiver
+        // alone would not reach it; the flag does
+        if let Some(c) = self.blast_cancel.take() { c.store(true, std::sync::atomic::Ordering::Relaxed); }
         self.blast_rx = None;
         self.blast_rid = None;
         self.blast_hits = None;
@@ -1385,28 +1389,44 @@ impl App {
                     self.blast_pick = None;
                     let (tx, rx) = std::sync::mpsc::channel();
                     self.blast_rx = Some(rx);
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    self.blast_cancel = Some(cancel.clone());
                     std::thread::spawn(move || {
-                        // hard deadline for the whole search, and stop as soon
-                        // as the dialog closes and drops the receiver
-                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-                        match blast::submit(&seq, &db, "blastn", 50) {
-                            Ok(rid) => {
-                                if tx.send(BlastMsg::Running(rid.clone())).is_err() { return; }
-                                while std::time::Instant::now() < deadline {
-                                    match blast::poll(&rid) {
-                                        Ok(Some(res)) => { let _ = tx.send(BlastMsg::Done(doc_name, seq_rev, Box::new(res))); return; }
-                                        Ok(None) => {
-                                            // a failed send means the receiver is gone — the dialog
-                                            // closed or the document changed — so stop polling NCBI
-                                            if tx.send(BlastMsg::Running(rid.clone())).is_err() { return; }
-                                            std::thread::sleep(std::time::Duration::from_secs(15));
-                                        }
-                                        Err(e) => { let _ = tx.send(BlastMsg::Failed(e)); return; }
-                                    }
-                                }
-                                let _ = tx.send(BlastMsg::Failed("BLAST did not finish within 10 minutes".into()));
+                        // the search runs for ten minutes at most and stops the
+                        // moment the dialog drops it; every request, wait and
+                        // retry inside blast consults this
+                        let stop = blast::Stop::new(cancel, std::time::Duration::from_secs(600));
+                        // a halted search reports nothing to a gone dialog, and a
+                        // timeout once
+                        let give_up = |h: blast::Halt| if h == blast::Halt::TimedOut {
+                            let _ = tx.send(BlastMsg::Failed(h.message()));
+                        };
+                        let rid = match blast::submit(&seq, &db, "blastn", 50, &stop) {
+                            Ok(rid) => rid,
+                            Err(e) => {
+                                match stop.halted() { Some(h) => give_up(h), None => { let _ = tx.send(BlastMsg::Failed(e)); } }
+                                return;
                             }
-                            Err(e) => { let _ = tx.send(BlastMsg::Failed(e)); }
+                        };
+                        if tx.send(BlastMsg::Running(rid.clone())).is_err() { return; }
+                        loop {
+                            if let Some(h) = stop.halted() { give_up(h); return; }
+                            match blast::poll(&rid, &stop) {
+                                Ok(Some(res)) => {
+                                    // a request can never outlive the deadline, so
+                                    // a result in hand is one the dialog may still have
+                                    if stop.halted().is_none() {
+                                        let _ = tx.send(BlastMsg::Done(doc_name, seq_rev, Box::new(res)));
+                                    }
+                                    return;
+                                }
+                                // the loop head decides whether a woken wait goes on or gives up
+                                Ok(None) => { stop.wait(std::time::Duration::from_secs(15)); }
+                                Err(e) => {
+                                    match stop.halted() { Some(h) => give_up(h), None => { let _ = tx.send(BlastMsg::Failed(e)); } }
+                                    return;
+                                }
+                            }
                         }
                     });
                 }
@@ -1479,6 +1499,7 @@ impl App {
                         self.info = Some("BLAST finished, but the document changed — results discarded.".into());
                     }
                     self.blast_rx = None;
+                    self.blast_cancel = None;
                     self.blast_rid = None;
                     ctx.request_repaint();
                     return;
@@ -1486,6 +1507,7 @@ impl App {
                 BlastMsg::Failed(e) => {
                     self.error = Some(format!("BLAST failed: {e}"));
                     self.blast_rx = None;
+                    self.blast_cancel = None;
                     self.blast_rid = None;
                     ctx.request_repaint();
                     return;

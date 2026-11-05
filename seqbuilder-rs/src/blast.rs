@@ -4,7 +4,75 @@
 //! in BlastParse.xml; the URL API's XML output carries the same hits
 //! without scraping.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 const BLAST_URL: &str = "https://blast.ncbi.nlm.nih.gov/Blast.cgi";
+/// A submission carries the whole sequence, so it needs room on a slow line.
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// A poll answers within seconds.
+const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+const RETRY_WAIT: Duration = Duration::from_secs(5);
+const ATTEMPTS: u32 = 3;
+
+/// Why a search stopped before it had an answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Halt {
+    /// The dialog closed or the document changed.
+    Cancelled,
+    /// The search ran past its deadline.
+    TimedOut,
+}
+
+impl Halt {
+    pub fn message(self) -> String {
+        match self {
+            Halt::Cancelled => "the search was cancelled".into(),
+            Halt::TimedOut => "BLAST did not finish within the time allowed".into(),
+        }
+    }
+}
+
+/// The limits one search runs under. Every wait, retry and request consults it,
+/// so a dropped dialog stops the NCBI traffic instead of leaving a worker that
+/// keeps polling, and no request outlives the deadline.
+pub struct Stop {
+    cancelled: Arc<AtomicBool>,
+    until: Instant,
+}
+
+impl Stop {
+    pub fn new(cancelled: Arc<AtomicBool>, run_for: Duration) -> Self {
+        Stop { cancelled, until: Instant::now() + run_for }
+    }
+
+    pub fn halted(&self) -> Option<Halt> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            Some(Halt::Cancelled)
+        } else if Instant::now() >= self.until {
+            Some(Halt::TimedOut)
+        } else {
+            None
+        }
+    }
+
+    /// How long a request may still take without overrunning the deadline.
+    pub fn remaining(&self) -> Duration {
+        self.until.saturating_duration_since(Instant::now())
+    }
+
+    /// Sleep up to `d`, giving up early once the search must stop; false then.
+    pub fn wait(&self, d: Duration) -> bool {
+        let end = Instant::now() + d;
+        loop {
+            if self.halted().is_some() { return false; }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() { return true; }
+            std::thread::sleep(left.min(Duration::from_millis(200)));
+        }
+    }
+}
 
 /// One database hit with its best HSP.
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -47,17 +115,17 @@ fn urlencode(s: &str) -> String {
 
 /// Submit a BLAST job; returns the RID used to poll for results. The query
 /// goes in a POST body — long sequences would exceed any GET URL limit.
-pub fn submit(seq: &[u8], db: &str, program: &str, hitlist: usize) -> Result<String, String> {
+pub fn submit(seq: &[u8], db: &str, program: &str, hitlist: usize, stop: &Stop) -> Result<String, String> {
     let seq = std::str::from_utf8(seq).map_err(|_| "the sequence is not ASCII text".to_string())?
         .bytes().filter(|b| !b" \r\n\t".contains(b)).map(|b| b as char).collect::<String>();
     if seq.is_empty() { return Err("the sequence is empty".into()); }
     let body = format!("CMD=Put&PROGRAM={}&DATABASE={}&HITLIST_SIZE={}&QUERY={}",
         urlencode(program), urlencode(db), hitlist, urlencode(&seq));
+    if let Some(h) = stop.halted() { return Err(h.message()); }
     let resp = ureq::post(BLAST_URL)
-        // submissions carry at most a few kb and NCBI answers within
-        // seconds; a dropped dialog can only cancel this worker between
-        // requests, so the request must not stay in flight for two minutes
-        .timeout(std::time::Duration::from_secs(30))
+        // long enough for a large sequence on a slow line, but never past the
+        // search's own deadline
+        .timeout(SUBMIT_TIMEOUT.min(stop.remaining()))
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&body).map_err(|e| e.to_string())?;
     let body = resp.into_string().map_err(|e| e.to_string())?;
@@ -74,9 +142,9 @@ pub fn submit(seq: &[u8], db: &str, program: &str, hitlist: usize) -> Result<Str
 /// Poll a submitted job: Ok(None) while it is still running, Ok(Some) with
 /// the parsed result once it finishes. UNKNOWN (expired RID) and FAILED are
 /// terminal errors.
-pub fn poll(rid: &str) -> Result<Option<BlastResult>, String> {
+pub fn poll(rid: &str, stop: &Stop) -> Result<Option<BlastResult>, String> {
     let url = format!("{BLAST_URL}?CMD=Get&FORMAT_TYPE=XML&RID={}", urlencode(rid));
-    let body = http_get(&url)?;
+    let body = http_get(&url, stop)?;
     if body.contains("<BlastOutput") {
         return Ok(Some(parse_xml(&body, rid)?));
     }
@@ -92,24 +160,27 @@ pub fn poll(rid: &str) -> Result<Option<BlastResult>, String> {
     Err(format!("unexpected BLAST response for RID {rid}"))
 }
 
-fn http_get(url: &str) -> Result<String, String> {
-    // a short timeout: an NCBI poll answers within seconds, and a dropped
-    // dialog can only cancel the worker between requests, so requests must
-    // not stay in flight for the old two minutes
-    // transient transport failures (a slow answer, a reset connection) are
-    // retried — the NCBI job keeps running through them, and the worker's
-    // overall deadline bounds the wait; HTTP status errors are terminal
+fn http_get(url: &str, stop: &Stop) -> Result<String, String> {
+    // A poll that fails on the way (a reset connection, a body cut short, one
+    // of NCBI's 5xx) says nothing about the job, which keeps running, so it is
+    // retried. A 4xx is the answer itself and ends the search. Cancellation and
+    // the deadline are checked before every request and during every wait, and
+    // each request is capped by whatever is left of the deadline.
     let mut last = String::new();
-    for attempt in 0..3 {
-        match ureq::get(url).timeout(std::time::Duration::from_secs(30)).call() {
-            Ok(resp) => return resp.into_string().map_err(|e| e.to_string()),
-            // transport errors (timeout, reset, DNS) are transient: retry
-            Err(e) if attempt < 2 && matches!(e, ureq::Error::Transport(_)) => {
-                last = e.to_string();
-                std::thread::sleep(std::time::Duration::from_secs(5));
-            }
-            // HTTP status errors are terminal
+    for attempt in 0..ATTEMPTS {
+        if let Some(h) = stop.halted() { return Err(h.message()); }
+        last = match ureq::get(url).timeout(POLL_TIMEOUT.min(stop.remaining())).call() {
+            Ok(resp) => match resp.into_string() {
+                Ok(text) => return Ok(text),
+                Err(e) => e.to_string(),
+            },
+            Err(ureq::Error::Transport(t)) => t.to_string(),
+            Err(ureq::Error::Status(code, _)) if (500..600).contains(&code) => format!("NCBI returned HTTP {code}"),
             Err(e) => return Err(e.to_string()),
+        };
+        if attempt + 1 == ATTEMPTS { break; }
+        if !stop.wait(RETRY_WAIT) {
+            return Err(stop.halted().unwrap_or(Halt::Cancelled).message());
         }
     }
     Err(last)
@@ -241,6 +312,31 @@ mod tests {
         assert_eq!(h2.evalue, "1e-180");
         assert_eq!(h2.length, 861);
         assert_eq!(h2.hseq, "ACGGGT");
+    }
+
+    fn stop_for(secs: u64) -> (Arc<AtomicBool>, Stop) {
+        let flag = Arc::new(AtomicBool::new(false));
+        (flag.clone(), Stop::new(flag, Duration::from_secs(secs)))
+    }
+
+    #[test]
+    fn cancelling_wakes_a_waiting_search() {
+        let (flag, stop) = stop_for(600);
+        assert!(stop.halted().is_none());
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(stop.halted(), Some(Halt::Cancelled));
+        // a cancelled search must not sit out the wait
+        let begun = Instant::now();
+        assert!(!stop.wait(Duration::from_secs(15)));
+        assert!(begun.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_deadline_bounds_waits_and_requests() {
+        let (_flag, stop) = stop_for(0);
+        assert_eq!(stop.halted(), Some(Halt::TimedOut));
+        assert!(stop.remaining().is_zero(), "an expired search leaves no time for another request");
+        assert!(!stop.wait(Duration::from_secs(15)));
     }
 
     #[test]
