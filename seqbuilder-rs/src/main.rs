@@ -201,13 +201,30 @@ fn short(label: &str) -> String {
     if label.chars().count() > 28 { label.chars().take(27).collect::<String>() + "…" } else { label.to_string() }
 }
 
-fn load(path: &Path) -> Result<Doc, String> {
-    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+/// Read every record a sequence file holds: one document per FASTA or
+/// GenBank record (.sbd files are single documents). FASTA records are named
+/// from their header line.
+fn load_all(path: &Path) -> Result<Vec<Doc>, String> {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let text = std::fs::read(path).map_err(|e| e.to_string())?;
-    let mut doc = if text.first() == Some(&b'>') {
-        let seq: Vec<u8> = text.split(|&b| b == b'\n').filter(|l| !l.starts_with(b">"))
-            .flatten().copied().filter(u8::is_ascii_alphabetic).collect();
-        Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false }
+    let mut docs: Vec<Doc> = vec![];
+    if text.first() == Some(&b'>') {
+        let mut recs: Vec<(Option<String>, Vec<u8>)> = vec![];
+        let mut header: Option<String> = None;
+        let mut seq: Vec<u8> = vec![];
+        for line in text.split(|&b| b == b'\n') {
+            if line.starts_with(b">") {
+                recs.push((header.replace(String::from_utf8_lossy(&line[1..]).trim().to_string()), std::mem::take(&mut seq)));
+            } else {
+                seq.extend(line.iter().copied().filter(u8::is_ascii_alphabetic));
+            }
+        }
+        if header.is_some() || !seq.is_empty() { recs.push((header, seq)); }
+        for (h, s) in recs {
+            if s.is_empty() { continue; }
+            let name = h.as_deref().and_then(|h| h.split_whitespace().next()).unwrap_or(&stem).to_string();
+            docs.push(Doc { name, definition: String::new(), accession: String::new(), comment: String::new(), seq: s, circular: false, feats: vec![], lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false });
+        }
     } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sbd")) {
         let s = sbd::read(&text)?;
         let feats = s.feats.iter().map(|f| {
@@ -224,51 +241,114 @@ fn load(path: &Path) -> Result<Doc, String> {
             }
         }).collect();
         let locus = s.header_field("LOCUS", " ");
-        Doc {
-            name: locus.split_whitespace().next().map_or(name, str::to_owned),
+        docs.push(Doc {
+            name: locus.split_whitespace().next().map_or(stem, str::to_owned),
             definition: s.header_field("DEFINITION", " "), accession: s.header_field("ACCESSION", " "),
             comment: s.header_field("COMMENT", "\n"),
             seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), header: s.header.clone(), sbd: Some(s), deleted: vec![], seq_dirty: false, topology_dirty: false,
-        }
+        });
     } else {
-        let rec = gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())?
-            .into_iter().next().ok_or("no sequence in file")?;
-        let len = rec.seq.len();
-        let feats = rec.features.iter().filter_map(|f| {
-            let (s, e) = f.location.find_bounds().ok()?;
-            let q = |k: &str| f.qualifier_values(k).next().map(str::to_owned);
-            // INSDC qualifiers whose values are written without quotes
-            const BARE: [&str; 13] = ["anticodon", "citation", "codon_start", "compare", "direction", "estimated_length",
-                "mod_base", "number", "rpt_type", "rpt_unit_range", "tag_peptide", "transl_except", "transl_table"];
-            let quals: Vec<String> = f.qualifiers.iter().map(|(k, v)| match v {
-                Some(v) if BARE.contains(&k.as_ref()) => format!("{k}={v}"),
-                // continuation lines join with a space, except inside a protein translation
-                Some(v) => format!("{k}=\"{}\"", v.replace('\n', if k == "translation" { "" } else { " " })),
-                None => k.to_string(),
+        let mut first = true;
+        for rec in gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())? {
+            let len = rec.seq.len();
+            // a zero-length record cannot carry feature coordinates; skip it
+            // rather than dividing by zero when folding wrapped joins
+            if len == 0 { continue; }
+            let feats = rec.features.iter().filter_map(|f| {
+                let (s, e) = f.location.find_bounds().ok()?;
+                let q = |k: &str| f.qualifier_values(k).next().map(str::to_owned);
+                // INSDC qualifiers whose values are written without quotes
+                const BARE: [&str; 13] = ["anticodon", "citation", "codon_start", "compare", "direction", "estimated_length",
+                    "mod_base", "number", "rpt_type", "rpt_unit_range", "tag_peptide", "transl_except", "transl_table"];
+                let quals: Vec<String> = f.qualifiers.iter().map(|(k, v)| match v {
+                    Some(v) if BARE.contains(&k.as_ref()) => format!("{k}={v}"),
+                    // continuation lines join with a space, except inside a protein translation
+                    Some(v) => format!("{k}=\"{}\"", v.replace('\n', if k == "translation" { "" } else { " " })),
+                    None => k.to_string(),
+                }).collect();
+                let name = sbd::feature_name(&quals);
+                // find_bounds unwraps origin-spanning joins past len; fold them back.
+                let (start, end) = (s.rem_euclid(len as i64) as usize, e as usize);
+                let end = if end > len { end - len } else { end };
+                Some(Feat {
+                    kind: f.kind.to_string(), label: short(&name), name, desc: q("note").or_else(|| q("product")).unwrap_or_default(),
+                    range: f.location.to_gb_format(), start, end, strand: location_strand(&f.location), lane: 0,
+                    show: f.kind != "source", // SeqBuilder lists source but leaves it hidden
+                    style: None, base: TYPE_LOOKS.0.get(f.kind.as_ref()).copied(), sbd_id: None, edited: false, quals, dirty: false,
+                    shape: None, base_shape: TYPE_LOOKS.1.get(f.kind.as_ref()).copied(), shape_edited: false,
+                })
             }).collect();
-            let name = sbd::feature_name(&quals);
-            // find_bounds unwraps origin-spanning joins past len; fold them back.
-            let (start, end) = (s.rem_euclid(len as i64) as usize, e as usize);
-            let end = if end > len { end - len } else { end };
-            Some(Feat {
-                kind: f.kind.to_string(), label: short(&name), name, desc: q("note").or_else(|| q("product")).unwrap_or_default(),
-                range: f.location.to_gb_format(), start, end, strand: location_strand(&f.location), lane: 0,
-                show: f.kind != "source", // SeqBuilder lists source but leaves it hidden
-                style: None, base: TYPE_LOOKS.0.get(f.kind.as_ref()).copied(), sbd_id: None, edited: false, quals, dirty: false,
-                shape: None, base_shape: TYPE_LOOKS.1.get(f.kind.as_ref()).copied(), shape_edited: false,
-            })
-        }).collect();
-        let circular = rec.is_circular();
-        Doc {
-            name: rec.name.clone().unwrap_or(name), definition: rec.definition.clone().unwrap_or_default(),
-            accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
-            seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false,
-            header: text.iter().map(|&b| b as char).collect::<String>().split("\nFEATURES").next().unwrap_or_default().to_string() + "\n",
-            topology_dirty: false,
+            let circular = rec.is_circular();
+            // the file's header text belongs to its first record; later
+            // records get a header built from their own metadata so their
+            // exports do not carry the first record's definition and
+            // accession
+            let header = if first {
+                text.iter().map(|&b| b as char).collect::<String>().split("\nFEATURES").next().unwrap_or_default().to_string() + "\n"
+            } else {
+                format!("LOCUS       {}\nDEFINITION  {}\nACCESSION   {}\n{}",
+                    rec.name.clone().unwrap_or_else(|| stem.clone()),
+                    rec.definition.clone().unwrap_or_default(),
+                    rec.accession.clone().unwrap_or_default(),
+                    comment_lines(&rec.comments))
+            };
+            first = false;
+            docs.push(Doc {
+                name: rec.name.clone().unwrap_or_else(|| stem.clone()), definition: rec.definition.clone().unwrap_or_default(),
+                accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
+                seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false,
+                header,
+                topology_dirty: false,
+            });
         }
-    };
-    doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
-    Ok(doc)
+    }
+    for doc in &mut docs { doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len()); }
+    Ok(docs)
+}
+
+/// A GenBank COMMENT block for a record's comments, or nothing.
+fn comment_lines(comments: &[String]) -> String {
+    if comments.is_empty() { return String::new(); }
+    let mut out = String::from("COMMENT     ");
+    let mut first = true;
+    for c in comments {
+        if !first { out.push_str("\n            "); }
+        first = false;
+        out.push_str(c);
+    }
+    out.push('\n');
+    out
+}
+
+/// Write a file through a sibling temporary, replacing the destination only
+/// after the write succeeds, so a failure cannot destroy previous content.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    let tmp = path.with_extension("part");
+    std::fs::write(&tmp, contents).and_then(|_| std::fs::rename(&tmp, path))
+}
+
+/// A derived output path that does not collide with one already handed out:
+/// same stem and extension, numbered -2, -3 … for repeats, so sample.fa and
+/// sample.gb both keep their results.
+fn unique_path(path: std::path::PathBuf, used: &mut std::collections::HashSet<String>) -> std::path::PathBuf {
+    let key = path.to_string_lossy().into_owned();
+    if used.insert(key) { return path; }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    for k in 2.. {
+        let candidate = path.with_file_name(if ext.is_empty() { format!("{stem}-{k}") } else { format!("{stem}-{k}.{ext}") });
+        if used.insert(candidate.to_string_lossy().into_owned()) { return candidate; }
+    }
+    unreachable!()
+}
+
+/// Read a sequence document; the count says how many records the file held
+/// (multi-record files open their first record).
+fn load(path: &Path) -> Result<(Doc, usize), String> {
+    let mut docs = load_all(path)?;
+    if docs.is_empty() { return Err("no sequence in file".into()); }
+    let records = docs.len();
+    Ok((docs.remove(0), records))
 }
 
 /// Style for documents that carry none (GenBank, FASTA).
@@ -499,7 +579,7 @@ struct App {
     clip_insert: Option<cloning::Insert>, // Copy/Paste Restriction Insert
     gib_open: bool,                       // Gibson / In-Fusion dialog
     gib_min: usize,                       // minimum overlap in bp
-    gib_frags: Vec<(String, Vec<u8>)>,    // fragments loaded in the dialog
+    gib_frags: Vec<(String, Vec<u8>, Vec<Feat>)>,  // fragments loaded in the dialog, with their features
     gel_ladder: usize,                    // index into the bundled Markers.tdl ladders
     gel_box: usize,                       // index into the bundled Gelbox.tdl boxes
     gel_lanes: usize,                     // chosen well count of the gel box
@@ -523,7 +603,10 @@ enum BlastMsg {
 impl App {
     fn open(&mut self, path: &Path) {
         match load(path) {
-            Ok(d) => {
+            Ok((d, records)) => {
+                self.info = if records > 1 {
+                    Some(format!("{} holds {} sequences — the first one ({} bp) is open", path.display(), records, d.seq.len()))
+                } else { None };
                 self.view = if d.circular { View::Circular } else { View::Sequence };
                 // GenBank CDS /transl_table qualifiers select the document's
                 // genetic code, as SeqBuilder Pro picks up (e.g. 11 for bacteria).
@@ -808,7 +891,7 @@ impl App {
             f.edited = false;
         }
         let path = to.unwrap_or_else(|| d.path.clone());
-        match std::fs::write(&path, s.to_bytes()) {
+        match write_atomic(&path, &s.to_bytes()) {
             Ok(()) => { d.path = path; self.error = None; }
             Err(e) => self.error = Some(format!("{}: {e}", path.display())),
         }
@@ -819,7 +902,7 @@ impl App {
         let Some(d) = &self.doc else { return };
         let name = d.path.file_stem().map(|n| n.to_string_lossy().into_owned() + ".gb").unwrap_or_default();
         if let Some(p) = rfd::FileDialog::new().add_filter("GenBank", &["gb", "gbk"]).set_file_name(name).save_file() {
-            if let Err(e) = std::fs::write(&p, export_genbank(d)) { self.error = Some(format!("{}: {e}", p.display())); }
+            if let Err(e) = write_atomic(&p, export_genbank(d).as_bytes()) { self.error = Some(format!("{}: {e}", p.display())); }
         }
     }
 
@@ -863,13 +946,24 @@ impl App {
     /// remapped features.
     fn tool_batch_rc(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
-        let mut saved = 0;
+        let (mut saved, mut failed) = (0, vec![]);
+        let mut used: std::collections::HashSet<String> = Default::default();
         for p in files {
-            let Ok(d) = load(&p) else { continue };
-            let out = p.with_extension("rc.gb");
-            if std::fs::write(&out, export_genbank(&tools::reverse_complement(&d))).is_ok() { saved += 1; }
+            match load_all(&p) {
+                Ok(docs) if docs.is_empty() => failed.push(format!("{}: no sequence in file", p.display())),
+                Ok(docs) => {
+                    let out = unique_path(p.with_extension("rc.gb"), &mut used);
+                    let mut text = String::new();
+                    for d in docs { text += &export_genbank(&tools::reverse_complement(&d)); }
+                    match write_atomic(&out, text.as_bytes()) {
+                        Ok(_) => saved += 1,
+                        Err(e) => failed.push(format!("{}: {e}", out.display())),
+                    }
+                }
+                Err(e) => failed.push(format!("{}: {e}", p.display())),
+            }
         }
-        self.info = Some(format!("{saved} sequence(s) reverse-complemented"));
+        self.report_batch(saved, failed, "reverse-complemented");
     }
 
     /// Tools ▸ Batch Translate: the frame-1 protein of every picked sequence,
@@ -877,30 +971,62 @@ impl App {
     fn tool_batch_translate(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
         let code = self.gen_code.clone();
-        let mut saved = 0;
+        let (mut saved, mut failed) = (0, vec![]);
+        let mut used: std::collections::HashSet<String> = Default::default();
         for p in files {
-            let Ok(d) = load(&p) else { continue };
-            let prot = tools::translate_protein(&d, &code);
-            let mut out = format!(">{}_protein\n", d.name);
-            for chunk in prot.as_bytes().chunks(60) {
-                out.push_str(&String::from_utf8_lossy(chunk));
-                out.push('\n');
+            match load_all(&p) {
+                Ok(docs) if docs.is_empty() => failed.push(format!("{}: no sequence in file", p.display())),
+                Ok(docs) => {
+                    let mut out = String::new();
+                    for d in docs {
+                        let prot = tools::translate_protein(&d, &code);
+                        out += &format!(">{}_protein\n", d.name);
+                        for chunk in prot.as_bytes().chunks(60) {
+                            out.push_str(&String::from_utf8_lossy(chunk));
+                            out.push('\n');
+                        }
+                    }
+                    let out_path = unique_path(p.with_extension("prot.fas"), &mut used);
+                    match write_atomic(&out_path, out.as_bytes()) {
+                        Ok(_) => saved += 1,
+                        Err(e) => failed.push(format!("{}: {e}", out_path.display())),
+                    }
+                }
+                Err(e) => failed.push(format!("{}: {e}", p.display())),
             }
-            if std::fs::write(p.with_extension("prot.fas"), out).is_ok() { saved += 1; }
         }
-        self.info = Some(format!("{saved} sequence(s) translated"));
+        self.report_batch(saved, failed, "translated");
+    }
+
+    /// Report a batch tool's outcome: the saved count and, if any files were
+    /// skipped, exactly which ones and why. The opposite status field is
+    /// cleared so a recovered run does not sit beside its earlier error.
+    fn report_batch(&mut self, saved: usize, failed: Vec<String>, what: &str) {
+        if failed.is_empty() {
+            self.error = None;
+            self.info = Some(format!("{saved} sequence file(s) {what}"));
+        } else {
+            self.info = None;
+            self.error = Some(format!("{saved} sequence file(s) {what}; {} not processed: {}", failed.len(), failed.join("; ")));
+        }
     }
 
     /// Tools ▸ Concatenate: the picked sequences joined end to end, features
     /// offset to their new positions, saved as one GenBank file.
     fn tool_concatenate(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
-        let docs: Vec<Doc> = files.iter().filter_map(|p| load(p).ok()).collect();
+        let (mut docs, mut failed) = (vec![], vec![]);
+        for p in &files {
+            match load_all(&p) {
+                Ok(ds) => docs.extend(ds),
+                Err(e) => failed.push(format!("{}: {e}", p.display())),
+            }
+        }
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
         let cat = tools::concatenate(&docs);
         let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name(format!("{}_concatenated.gb", cat.name)).save_file() else { return };
-        match std::fs::write(&out, export_genbank(&cat)) {
-            Ok(_) => self.info = Some(format!("Concatenated {} sequences to {}", docs.len(), out.display())),
+        match write_atomic(&out, export_genbank(&cat).as_bytes()) {
+            Ok(_) => self.report_batch(files.len(), failed, &format!("concatenated (to {})", out.display())),
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -921,7 +1047,7 @@ impl App {
                 text.push('\n');
             }
         }
-        match std::fs::write(&out, text) {
+        match write_atomic(&out, text.as_bytes()) {
             Ok(_) => self.info = Some(format!("Features written to {}", out.display())),
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -931,12 +1057,17 @@ impl App {
     /// multi-FASTA file.
     fn tool_export_single(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
-        let docs: Vec<Doc> = files.iter().filter_map(|p| load(p).ok()).collect();
+        let (mut docs, mut failed) = (vec![], vec![]);
+        for p in &files {
+            match load_all(&p) {
+                Ok(ds) => docs.extend(ds),
+                Err(e) => failed.push(format!("{}: {e}", p.display())),
+            }
+        }
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
-        let n = docs.len();
         let Some(out) = rfd::FileDialog::new().add_filter("FASTA", &["fas"]).set_file_name("sequences.fas").save_file() else { return };
-        match std::fs::write(&out, tools::to_fasta(&docs)) {
-            Ok(_) => self.info = Some(format!("{n} sequences exported to {}", out.display())),
+        match write_atomic(&out, tools::to_fasta(&docs).as_bytes()) {
+            Ok(_) => self.report_batch(files.len(), failed, &format!("exported (to {})", out.display())),
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -978,7 +1109,7 @@ impl App {
         };
         let (le, re) = (&self.enz[le], &self.enz[re]);
         let name = format!("{} fragment", d.name);
-        let ins = match cloning::copy_insert(&d.seq, a, b, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut, &le.name, &re.name, &name) {
+        let ins = match cloning::copy_insert(&d.seq, a, b, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut, &le.name, &re.name, &name, d.circular) {
             Ok(i) => i,
             Err(e) => { self.error = Some(e); return; }
         };
@@ -1003,7 +1134,7 @@ impl App {
             return;
         };
         let (le, re) = (&self.enz[le], &self.enz[re]);
-        let check = self.doc.as_ref().map(|d| cloning::compatible(&ins, &d.seq, x, y, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut));
+        let check = self.doc.as_ref().map(|d| cloning::compatible(&ins, &d.seq, x, y, le.bot_cut - le.top_cut, re.bot_cut - re.top_cut, d.circular));
         let names = (le.name.clone(), re.name.clone());
         match check {
             Some(Err(e)) => { self.error = Some(e); return; }
@@ -1063,19 +1194,92 @@ impl App {
     /// product as a GenBank file (circular only when the fragments close a circle).
     fn gibson_assemble_and_save(&mut self) {
         if self.gib_frags.len() < 2 { self.error = Some("Load at least two fragments.".into()); return; }
-        let frags: Vec<Vec<u8>> = self.gib_frags.iter().map(|(_, s)| s.clone()).collect();
-        let (assembled, circular) = match cloning::gibson_assemble(&frags, self.gib_min) {
+        let frags: Vec<Vec<u8>> = self.gib_frags.iter().map(|(_, s, _)| s.clone()).collect();
+        let (assembled, circular, spans) = match cloning::gibson_assemble(&frags, self.gib_min) {
             Ok(s) => s,
             Err(e) => { self.error = Some(e); return; }
         };
+        if assembled.is_empty() { self.error = Some("the assembly is empty".into()); return; }
+        // carry the fragments' features into the product: the feature's own
+        // location supplies its segments (join() gaps, fuzzy < > markers and
+        // origin-spanning joins all survive), each segment lands at
+        // out_start + in_pos - in_start of the assembly, and on a circular
+        // product positions past the end are the closing overlap — the same
+        // bases as the product's start — so they wrap around. Coordinates
+        // outside the fragment's own sequence are clipped; offsets use
+        // saturating i64 arithmetic so malformed sources cannot overflow.
+        let alen = assembled.len();
+        let mut feats: Vec<Feat> = vec![];
+        for ((_, fseq, ffeats), (out_start, in_start)) in self.gib_frags.iter().zip(spans.iter()) {
+            let (flen, delta) = (fseq.len(), *out_start as i64 - *in_start as i64);
+            for f in ffeats {
+                // segments straight from the written location, falling back
+                // to the numeric bounds for plain or unparsable ranges
+                let mut segs: Vec<(usize, usize, Option<char>, Option<char>)> = cloning::parse_location(&f.range).into_iter()
+                    .map(|(a, b, fs, fe)| (((a - 1).max(0)) as usize, (b.max(a)) as usize, fs, fe))
+                    .collect();
+                if segs.is_empty() { segs = vec![(f.start, f.end, None, None)]; }
+                let mut outsegs: Vec<(usize, usize, Option<char>, Option<char>)> = vec![];
+                for (s, e, fs, fe) in segs {
+                    let (s, e) = (s.min(flen), e.min(flen)); // clip to the fragment
+                    if e <= s { continue; }
+                    // signed mapping into the product, clipped only at the product boundary
+                    let ns = ((s as i64).saturating_add(delta)).max(0) as usize;
+                    let ne = ((e as i64).saturating_add(delta)).max(0) as usize;
+                    let span = ne.saturating_sub(ns);
+                    if circular {
+                        // normalize into the circle: positions past the end are
+                        // the closing overlap, the same bases as the product's
+                        // start, so every position is taken modulo the length
+                        let base = ns % alen;
+                        let ne = base + span.min(alen);
+                        if ne <= alen {
+                            outsegs.push((base, ne, fs, fe));
+                        } else {
+                            // crosses the product's origin: the feature's own
+                            // fuzzy end belongs to the segment that carries
+                            // its end, the split boundary itself is exact
+                            outsegs.push((base, alen, fs, None));
+                            outsegs.push((0, ne - alen, None, fe));
+                        }
+                    } else {
+                        let (ns, ne) = (ns.min(alen), ne.min(alen));
+                        if ne > ns { outsegs.push((ns, ne, fs, fe)); }
+                    }
+                }
+                if outsegs.is_empty() { continue; }
+                let mut g = f.clone();
+                g.start = outsegs[0].0;
+                g.end = outsegs[outsegs.len() - 1].1;
+                // the location text is rebuilt from the mapped segments with
+                // their fuzzy markers, so every coordinate lies inside the
+                // product
+                let parts: Vec<String> = outsegs.iter()
+                    .map(|(a, b, fs, fe)| {
+                        let mut s = String::new();
+                        if let Some(m) = fs { s.push(*m); }
+                        s.push_str(&(a + 1).to_string());
+                        s.push_str("..");
+                        s.push_str(&b.to_string());
+                        if let Some(m) = fe { s.push(*m); }
+                        s
+                    })
+                    .collect();
+                let loc = if parts.len() == 1 { parts[0].clone() } else { format!("join({})", parts.join(",")) };
+                g.range = if f.strand < 0 { format!("complement({loc})") } else { loc };
+                g.lane = 0;
+                feats.push(g);
+            }
+        }
         let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name("assembly.gb").save_file() else { return };
-        let doc = Doc {
+        let mut doc = Doc {
             name: "assembly".into(), definition: String::new(), accession: String::new(), comment: String::new(),
-            seq: assembled, circular, feats: vec![], lanes: 0, hits: vec![], path: "Untitled".into(),
+            seq: assembled, circular, feats, lanes: 0, hits: vec![], path: "Untitled".into(),
             sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false,
         };
-        match std::fs::write(&out, export_genbank(&doc)) {
-            Ok(_) => self.info = Some(format!("Assembly written to {} ({})", out.display(), if circular { "circular" } else { "linear" })),
+        doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
+        match write_atomic(&out, export_genbank(&doc).as_bytes()) {
+            Ok(_) => self.info = Some(format!("Assembly written to {} ({} features, {})", out.display(), doc.feats.len(), if circular { "circular" } else { "linear" })),
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -1117,10 +1321,8 @@ impl App {
         let pages = print::layout(&mut pdf, &pd);
         let bytes = pdf.finish();
         let Some(out) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{}.pdf", name)).save_file() else { return };
-        // write to a sibling temp file and rename, so a failed write cannot
-        // destroy an existing printout
-        let tmp = out.with_extension("part");
-        match std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &out)) {
+        // a failed write cannot destroy an existing printout
+        match write_atomic(&out, &bytes) {
             Ok(_) => self.info = Some(format!("Printout written to {} ({} page{})", out.display(), pages, if pages == 1 { "" } else { "s" })),
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -2909,8 +3111,8 @@ impl eframe::App for App {
                         if let Some(files) = Self::pick_sequences() {
                             let mut failed = vec![];
                             for p in files {
-                                match load(&p) {
-                                    Ok(d) => self.gib_frags.push((d.name, d.seq)),
+                                match load_all(&p) {
+                                    Ok(docs) => for d in docs { self.gib_frags.push((d.name, d.seq, d.feats)); },
                                     Err(e) => failed.push(format!("{}: {e}", p.display())),
                                 }
                             }
@@ -2924,7 +3126,7 @@ impl eframe::App for App {
                 ui.add_space(4.0);
                 egui::Grid::new("gib_frags").num_columns(2).striped(true).show(ui, |ui| {
                     ui.strong("Fragment"); ui.strong("Length"); ui.end_row();
-                    for (name, seq) in &self.gib_frags {
+                    for (name, seq, _) in &self.gib_frags {
                         ui.label(name); ui.label(format!("{} bp", seq.len())); ui.end_row();
                     }
                 });
@@ -2936,7 +3138,7 @@ impl eframe::App for App {
                 });
                 // live preview of the pairwise overlaps
                 if self.gib_frags.len() >= 2 {
-                    let frags: Vec<&Vec<u8>> = self.gib_frags.iter().map(|(_, s)| s).collect();
+                    let frags: Vec<&Vec<u8>> = self.gib_frags.iter().map(|(_, s, _)| s).collect();
                     for w in frags.windows(2) {
                         let ov = cloning::overlap(w[0], w[1]).unwrap_or(0);
                         let mark = if ov >= self.gib_min { "✓" } else { "✗" };
@@ -2990,7 +3192,7 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     if let [_, flag, input, output] = &args[..] {
         if flag == "--export-genbank" {
-            let written = load(Path::new(input)).and_then(|d| std::fs::write(output, export_genbank(&d)).map_err(|e| e.to_string()));
+            let written = load(Path::new(input)).and_then(|(d, _)| write_atomic(Path::new(output), export_genbank(&d).as_bytes()).map_err(|e| e.to_string()));
             if let Err(e) = written { eprintln!("{input}: {e}"); std::process::exit(1); }
             return Ok(());
         }
@@ -3013,8 +3215,22 @@ mod tests {
     }
 
     #[test]
+    fn multi_record_fasta_loads_each_record() {
+        let p = std::env::temp_dir().join("sb_multi_test.fas");
+        std::fs::write(&p, ">first one\nACGT\n>second\nTTTT\nGGGG\n").unwrap();
+        let docs = load_all(&p).unwrap();
+        // opening keeps the first record and reports the count
+        let (d, records) = load(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!((docs[0].name.as_str(), docs[0].seq.as_slice()), ("first", b"ACGT".as_slice()));
+        assert_eq!((docs[1].name.as_str(), docs[1].seq.as_slice()), ("second", b"TTTTGGGG".as_slice()));
+        assert_eq!((records, d.name.as_str(), d.seq.as_slice()), (2, "first", b"ACGT".as_slice()));
+    }
+
+    #[test]
     fn loads_genbank_features() {
-        let d = load(Path::new("testdata/pBR322.gb")).unwrap();
+        let d = load(Path::new("testdata/pBR322.gb")).unwrap().0;
         assert_eq!(d.seq.len(), 4361);
         assert!(d.circular);
         let bla = d.feats.iter().find(|f| f.label == "bla").expect("bla gene");
@@ -3042,13 +3258,13 @@ mod tests {
 
     #[test]
     fn sbd_matches_genbank() {
-        let (s, g) = (load(Path::new("testdata/pBR322.sbd")).unwrap(), load(Path::new("testdata/pBR322.gb")).unwrap());
+        let (s, g) = (load(Path::new("testdata/pBR322.sbd")).unwrap().0, load(Path::new("testdata/pBR322.gb")).unwrap().0);
         assert_eq!(s.seq.to_ascii_uppercase(), g.seq.to_ascii_uppercase());
         assert_eq!((s.name.as_str(), s.circular, s.feats.len()), ("SYNPBR322", true, g.feats.len()));
         for (a, b) in s.feats.iter().zip(&g.feats) {
             assert_eq!((&a.kind, a.start, a.end, a.strand), (&b.kind, b.start, b.end, b.strand), "{}", b.range);
         }
-        let red = load(Path::new("testdata/pBR322_blaRED.sbd")).unwrap();
+        let red = load(Path::new("testdata/pBR322_blaRED.sbd")).unwrap().0;
         assert_eq!(red.feats[38].style.unwrap().fill, Some([255, 0, 0]));
     }
 
@@ -3177,7 +3393,7 @@ mod tests {
     #[test]
     fn genbank_export_matches_seqbuilder() {
         let want = std::fs::read_to_string("testdata/pBR322_add.gbk").unwrap();
-        let out = export_genbank(&load(Path::new("testdata/pBR322_add.sbd")).unwrap());
+        let out = export_genbank(&load(Path::new("testdata/pBR322_add.sbd")).unwrap().0);
         if out != want {
             let line = out.lines().zip(want.lines()).position(|(a, b)| a != b);
             panic!("differs at line {line:?}: {:?}", line.map(|i| (out.lines().nth(i), want.lines().nth(i))));
@@ -3189,7 +3405,7 @@ mod tests {
     fn genbank_export_keeps_ncbi_content() {
         let ncbi = gb_io::reader::parse_file("testdata/pBR322.gb").unwrap().remove(0);
         for f in ["testdata/pBR322.gb", "testdata/pBR322.sbd"] {
-            let back = gb_io::reader::parse_slice(export_genbank(&load(Path::new(f)).unwrap()).as_bytes()).unwrap().remove(0);
+            let back = gb_io::reader::parse_slice(export_genbank(&load(Path::new(f)).unwrap().0).as_bytes()).unwrap().remove(0);
             assert!(back.seq == ncbi.seq && back.is_circular() && back.definition == ncbi.definition, "{f}");
             assert_eq!(back.features.len(), ncbi.features.len());
             let key = |f: &gb_io::seq::Feature| (f.location.find_bounds().unwrap(), f.kind.to_string());
@@ -3197,7 +3413,7 @@ mod tests {
             (a.sort(), b.sort());
             assert_eq!(a, b, "{f}");
         }
-        let out = export_genbank(&load(Path::new("testdata/ALDH2.sbd")).unwrap());
+        let out = export_genbank(&load(Path::new("testdata/ALDH2.sbd")).unwrap().0);
         let back = gb_io::reader::parse_slice(out.as_bytes()).unwrap().remove(0);
         assert_eq!((back.seq.len(), back.features.len(), back.is_circular()), (114842, 2, false));
         assert_eq!(back.features[1].location.to_gb_format(), "complement(5087..5124)");
@@ -3257,7 +3473,7 @@ mod tests {
     /// (its 1240..1276 is 1253..1289 of the saved ALDH2.sbd).
     #[test]
     fn base_statistics_match_seqbuilder() {
-        let d = load(Path::new("testdata/ALDH2.sbd")).unwrap();
+        let d = load(Path::new("testdata/ALDH2.sbd")).unwrap().0;
         let rows: std::collections::HashMap<String, String> = base_stats(&d.seq[1252..1289]).into_iter().collect();
         for (k, v) in [("% A", "21.62 [8]"), ("% A+T", "56.76 [21]"), ("% Ambiguous", "0.00 [0]"), ("% C", "32.43 [12]"),
             ("% G", "10.81 [4]"), ("% G+C", "43.24 [16]"), ("% T", "35.14 [13]"), ("% diCG", "0.00 [0]"),
@@ -3269,14 +3485,14 @@ mod tests {
 
     #[test]
     fn primers_tab_values() {
-        let d = load(Path::new("testdata/ALDH2.sbd")).unwrap();
+        let d = load(Path::new("testdata/ALDH2.sbd")).unwrap().0;
         let p = primer_sequence(&d.feats[0], &d.seq);
         assert_eq!(String::from_utf8_lossy(&p).to_uppercase(), "AGGCTGAGGCAGGAGAATGGCATGAACCCGGGAGGCGG");
         assert_eq!(format!("{:.1}", primers::tm(&p)), "77.7"); // SeqBuilder's Primers tab
         let r = primer_sequence(&d.feats[1], &d.seq);
         assert_eq!((r.len(), format!("{:.1}", primers::tm(&r))), (38, "77.7".to_string()));
         // Tm and dG SeqBuilder showed for the primers in pBR322_primers.sbd
-        let d = load(Path::new("testdata/pBR322_primers.sbd")).unwrap();
+        let d = load(Path::new("testdata/pBR322_primers.sbd")).unwrap().0;
         let shown: Vec<(String, String)> = d.feats.iter().filter(|f| f.kind == "PCR_primer").map(|f| {
             let p = primer_sequence(f, &d.seq);
             (format!("{:.1}", primers::tm(&p)), format!("{:.1}", primers::dg(&p)))
