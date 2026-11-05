@@ -64,10 +64,11 @@ impl Pdf {
         self.ops.push(format!("0.75 w {x1} {y1} m {x2} {y2} l S"));
     }
 
-    /// Fill a rectangle with an RGB colour (0-255 per channel).
+    /// Fill a rectangle with an RGB colour (0-255 per channel), then restore
+    /// black as the fill colour so following text stays readable.
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, rgb: (u8, u8, u8)) {
         let (r, g, b) = (rgb.0 as f32 / 255.0, rgb.1 as f32 / 255.0, rgb.2 as f32 / 255.0);
-        self.ops.push(format!("{r} {g} {b} rg {x} {y} {w} {h} re f"));
+        self.ops.push(format!("{r} {g} {b} rg {x} {y} {w} {h} re f 0 0 0 rg"));
     }
 
     /// Assemble the PDF file (A4 portrait, 595×842pt).
@@ -245,7 +246,10 @@ mod tests {
         let bytes = pdf.finish();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("    51  ACGTACGTAC"), "row starts at 51: {}", s.lines().take(8).collect::<Vec<_>>().join(" | "));
-        // the feature table's header band is filled
-        assert!(s.contains("rg 40"), "header fill drawn before the table: {}", &s[s.find("Features").map(|i| i.saturating_sub(80)).unwrap_or(0)..s.find("Features").map(|i| i + 40).unwrap_or(120)].replace('\n', " | "));
+        // the feature table's header band: the light fill, its full width
+        // (515pt tall 12pt) and the black restoration that keeps the text
+        // over it readable
+        assert!(s.contains("0.9098039 0.9254902 0.9490196 rg"), "header fill colour: {}", &s[s.find("Features").map(|i| i.saturating_sub(120)).unwrap_or(0)..s.find("Features").map(|i| i + 60).unwrap_or(160)].replace('\n', " | "));
+        assert!(s.contains("515 12 re f 0 0 0 rg"), "header band sized and fill colour restored");
     }
 }

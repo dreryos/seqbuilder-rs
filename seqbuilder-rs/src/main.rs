@@ -598,14 +598,15 @@ struct App {
     blast_db: String,                     // target database
     blast_hits: Option<blast::BlastResult>,
     blast_rid: Option<String>,                 // the running search's request id
+    seq_rev: u64,                             // bumped on every sequence edit; BLAST results carry theirs
     blast_pick: Option<usize>,            // hit selected for the HSP detail
     blast_rx: Option<std::sync::mpsc::Receiver<BlastMsg>>,
 }
 
 /// Messages from the background BLAST thread.
 enum BlastMsg {
-    Running(String),                       // RID assigned, polling
-    Done(String, Box<blast::BlastResult>),  // document the result belongs to
+    Running(String),                       // RID assigned, polling (also the worker's liveness probe)
+    Done(String, u64, Box<blast::BlastResult>), // document name, sequence revision, result
     Failed(String),
 }
 
@@ -744,6 +745,7 @@ impl App {
         };
         self.undo.push((what, d.seq.clone(), d.feats.clone()));
         self.redo.clear();
+        self.seq_rev += 1;
         let (cut, add) = (b - a, ins.len());
         d.seq.splice(a..b, ins.iter().copied());
         let start = |s: usize| if s >= b { s - cut + add } else if s >= a { a } else { s };
@@ -768,6 +770,7 @@ impl App {
         let (from, to) = if redo { (&mut self.redo, &mut self.undo) } else { (&mut self.undo, &mut self.redo) };
         let Some((what, seq, feats)) = from.pop() else { return };
         to.push((what, std::mem::replace(&mut d.seq, seq), std::mem::replace(&mut d.feats, feats)));
+        self.seq_rev += 1;
         // Rewrite everything on the next save; ids of features that came back must not be deleted.
         d.feats.iter_mut().for_each(|f| f.dirty = true);
         d.deleted.retain(|id| !d.feats.iter().any(|f| f.sbd_id == Some(*id)));
@@ -1357,6 +1360,7 @@ impl App {
                     let Some(d) = &self.doc else { return };
                     let (seq, db) = (d.seq.clone(), if self.blast_db.is_empty() { "core_nt".to_string() } else { self.blast_db.clone() });
                     let doc_name = d.name.clone();
+                    let seq_rev = self.seq_rev;
                     self.blast_hits = None;
                     self.blast_pick = None;
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -1370,8 +1374,13 @@ impl App {
                                 if tx.send(BlastMsg::Running(rid.clone())).is_err() { return; }
                                 while std::time::Instant::now() < deadline {
                                     match blast::poll(&rid) {
-                                        Ok(Some(res)) => { let _ = tx.send(BlastMsg::Done(doc_name, Box::new(res))); return; }
-                                        Ok(None) => std::thread::sleep(std::time::Duration::from_secs(15)),
+                                        Ok(Some(res)) => { let _ = tx.send(BlastMsg::Done(doc_name, seq_rev, Box::new(res))); return; }
+                                        Ok(None) => {
+                                            // a failed send means the receiver is gone — the dialog
+                                            // closed or the document changed — so stop polling NCBI
+                                            if tx.send(BlastMsg::Running(rid.clone())).is_err() { return; }
+                                            std::thread::sleep(std::time::Duration::from_secs(15));
+                                        }
                                         Err(e) => { let _ = tx.send(BlastMsg::Failed(e)); return; }
                                     }
                                 }
@@ -1435,9 +1444,11 @@ impl App {
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 BlastMsg::Running(rid) => { self.blast_rid = Some(rid); ctx.request_repaint(); }
-                BlastMsg::Done(name, res) => {
+                BlastMsg::Done(name, rev, res) => {
                     let hits = res.hits.len();
-                    if self.doc.as_ref().map(|d| d.name.as_str()) == Some(name.as_str()) {
+                    // only a document with the same name and unedited sequence
+                    // is the one the search was submitted for
+                    if self.doc.as_ref().map(|d| d.name.as_str()) == Some(name.as_str()) && rev == self.seq_rev {
                         self.info = Some(format!("BLAST finished: {hits} hits"));
                         self.blast_hits = Some(*res);
                     } else {
