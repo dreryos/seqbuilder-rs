@@ -60,6 +60,7 @@ pub fn copy_insert(seq: &[u8], a: usize, b: usize, left_d: i32, right_d: i32, le
     let n = seq.len().max(1);
     let left_under = if left_d < 0 {
         let k = left_d.unsigned_abs() as usize;
+        if k > n { return Err("the 3' overhang is longer than the whole sequence".into()); }
         if k > a && !circular { return Err("the left 3' overhang runs past the start of the sequence".into()); }
         (0..k).map(|i| seq[(a + n - k + i) % n]).collect()
     } else { vec![] };
@@ -95,6 +96,13 @@ pub fn compatible(insert: &Insert, target: &[u8], x: usize, y: usize, dl: i32, d
         return Err(format!("overhang lengths differ: insert {}+{}, target {}+{}",
             insert.left_d, insert.right_d, dl, dr));
     }
+    // the target's bottom strand runs [x+dl, y+dr): its span must not invert
+    if (y as i64 + dr as i64) - (x as i64 + dl as i64) < 0 {
+        return Err("the target's overhangs overlap: its bottom strand would start after it ends".into());
+    }
+    // 3' overhangs must fit inside the target before wrapping
+    if dl < 0 && dl.unsigned_abs() as usize > n { return Err("the 3' overhang is longer than the whole target".into()); }
+    if dr < 0 && dr.unsigned_abs() as usize > n { return Err("the 3' overhang is longer than the whole target".into()); }
     // left junction
     if dl > 0 {
         let t = take(target, x, dl as usize);
@@ -186,36 +194,78 @@ pub fn clone_fragment(seq: &[u8], a: usize, b: usize) -> Vec<u8> {
 }
 
 /// Shift every coordinate in a GenBank location text ("join(101..110,201..210)",
-/// "complement(3..50)") by `delta`, preserving the location structure. Only
-/// pure coordinate numbers shift: range operands like 101..110 move both
+/// "complement(3..50)", "<101..>110") by `delta`, preserving the location
+/// structure. Only pure coordinate numbers shift: range operands move both
 /// sides, while words carrying letters — remote accessions such as
-/// J12345.1 — are left untouched.
+/// J12345.1 — are left untouched, as are fuzzy markers (<, >).
 pub fn offset_range(range: &str, delta: i64) -> String {
-    let shift = |word: &str| -> String {
-        if let Some(at) = word.find("..") {
-            let (l, r) = word.split_at(at);
-            match (l.parse::<i64>(), r[2..].parse::<i64>()) {
-                (Ok(a), Ok(b)) => format!("{}..{}", a.saturating_add(delta), b.saturating_add(delta)),
-                _ => word.to_string(),
-            }
-        } else if word.chars().all(|c| c.is_ascii_digit()) && !word.is_empty() {
-            word.parse::<i64>().map(|v| v.saturating_add(delta).to_string()).unwrap_or_else(|_| word.to_string())
-        } else {
-            word.to_string()
-        }
-    };
     let mut out = String::new();
     let chars: Vec<char> = range.chars().collect();
     let mut i = 0;
     while i < chars.len() {
         if chars[i].is_ascii_alphanumeric() || chars[i] == '.' {
+            // a word runs over alphanumerics and single dots, but the ".."
+            // range operator always ends it, so fuzzy bounds like <101..>110
+            // parse as two numbers around the operator
             let start = i;
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') { i += 1; }
-            out.push_str(&shift(&chars[start..i].iter().collect::<String>()));
+            while i < chars.len() {
+                let c = chars[i];
+                // a dot never starts a word, and the ".." operator ends one
+                if c == '.' && (i == start || (i + 1 < chars.len() && chars[i + 1] == '.')) { break; }
+                if !(c.is_ascii_alphanumeric() || c == '.') { break; }
+                i += 1;
+            }
+            if i == start {
+                // a lone dot or the first dot of the ".." operator
+                out.push(chars[start]);
+                i += 1;
+                continue;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if let Ok(v) = word.parse::<i64>() {
+                out.push_str(&v.saturating_add(delta).to_string());
+            } else {
+                out.push_str(&word);
+            }
         } else {
             out.push(chars[i]);
             i += 1;
         }
+    }
+    out
+}
+
+/// The segments of a GenBank location as (start, end, fuzzy_start, fuzzy_end)
+/// tuples, 1-based inclusive as written. Understands "a..b", fuzzy bounds
+/// like "<a" and ">b", join(...) and complement(...) wrappers. Returns
+/// nothing when the location holds no "a..b" pair (callers fall back to the
+/// feature's numeric bounds).
+pub fn parse_location(loc: &str) -> Vec<(i64, i64, bool, bool)> {
+    let c: Vec<char> = loc.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < c.len() {
+        let fuzzy_s = c[i] == '<' || c[i] == '>';
+        let ds = i + usize::from(fuzzy_s);
+        if ds < c.len() && c[ds].is_ascii_digit() {
+            let mut j = ds;
+            while j < c.len() && c[j].is_ascii_digit() { j += 1; }
+            let a: i64 = c[ds..j].iter().collect::<String>().parse().unwrap_or(0);
+            if j + 1 < c.len() && c[j] == '.' && c[j + 1] == '.' {
+                let mut k = j + 2;
+                let fuzzy_e = k < c.len() && (c[k] == '<' || c[k] == '>');
+                let de = k + usize::from(fuzzy_e);
+                if de < c.len() && c[de].is_ascii_digit() {
+                    let mut m = de;
+                    while m < c.len() && c[m].is_ascii_digit() { m += 1; }
+                    let b: i64 = c[de..m].iter().collect::<String>().parse().unwrap_or(0);
+                    out.push((a, b, fuzzy_s, fuzzy_e));
+                    i = m;
+                    continue;
+                }
+            }
+        }
+        i += 1;
     }
     out
 }
@@ -379,6 +429,21 @@ mod tests {
         assert_eq!(offset_range("J12345.1:20..30", 10), "J12345.1:30..40");
         assert_eq!(offset_range("join(5..9,U00004.5:12..19)", 100), "join(105..109,U00004.5:112..119)");
         assert_eq!(offset_range("U00004.5", 1000), "U00004.5");
+    }
+
+    #[test]
+    fn offset_range_shifts_fuzzy_bounds() {
+        assert_eq!(offset_range("<101..>110", 10), "<111..>120");
+        assert_eq!(offset_range("join(<1..5,>900..950)", -1), "join(<0..4,>899..949)");
+    }
+
+    #[test]
+    fn parse_location_reads_segments_and_markers() {
+        assert_eq!(parse_location("101..110"), vec![(101, 110, false, false)]);
+        assert_eq!(parse_location("<101..>110"), vec![(101, 110, true, true)]);
+        assert_eq!(parse_location("complement(join(5..9,201..210))"), vec![(5, 9, false, false), (201, 210, false, false)]);
+        assert_eq!(parse_location("J12345.1:20..30"), vec![(20, 30, false, false)]);
+        assert!(parse_location("complement(56)").is_empty());
     }
 
     #[test]

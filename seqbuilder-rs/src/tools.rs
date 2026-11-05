@@ -17,9 +17,14 @@ fn fresh_doc(name: String, seq: Vec<u8>, circular: bool, header: String) -> Doc 
 }
 
 /// A feature's range text, recomputed after a strand/coordinate change.
-fn range_text(f: &Feat) -> String {
-    let (lo, hi) = (f.start + 1, f.end);
-    if f.strand < 0 { format!("complement({lo}..{hi})") } else { format!("{lo}..{hi}") }
+fn range_text(f: &Feat, n: usize) -> String {
+    let loc = if f.end > f.start {
+        format!("{}..{}", f.start + 1, f.end)
+    } else {
+        // an origin-spanning feature: its two sides of the circle
+        format!("join({}..{},1..{})", f.start + 1, n, f.end)
+    };
+    if f.strand < 0 { format!("complement({loc})") } else { loc }
 }
 
 /// The reverse complement of a document: the sequence flips, and every feature
@@ -37,7 +42,7 @@ pub fn reverse_complement(d: &Doc) -> Doc {
         f.start = n - e;
         f.end = n - s;
         f.strand = -f.strand;
-        f.range = range_text(&f);
+        f.range = range_text(&f, n);
         f
     }).collect();
     out
@@ -67,15 +72,16 @@ pub fn concatenate(docs: &[Doc]) -> Doc {
     let mut out = fresh_doc(name, Vec::new(), false, String::new());
     let mut offset = 0usize;
     for d in docs {
+        let n = d.seq.len();
         out.seq.extend_from_slice(&d.seq);
         for f in &d.feats {
             let mut f = f.clone();
             f.start += offset;
             f.end += offset;
-            f.range = range_text(&f);
+            f.range = range_text(&f, offset + n);
             out.feats.push(f);
         }
-        offset += d.seq.len();
+        offset += n;
     }
     out
 }

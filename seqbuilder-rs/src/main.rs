@@ -248,6 +248,7 @@ fn load_all(path: &Path) -> Result<Vec<Doc>, String> {
             seq: s.seq.clone(), circular: s.circular, feats, lanes: 0, hits: vec![], path: path.into(), header: s.header.clone(), sbd: Some(s), deleted: vec![], seq_dirty: false, topology_dirty: false,
         });
     } else {
+        let mut first = true;
         for rec in gb_io::reader::parse_slice(&text).map_err(|e| e.to_string())? {
             let len = rec.seq.len();
             let feats = rec.features.iter().filter_map(|f| {
@@ -275,11 +276,24 @@ fn load_all(path: &Path) -> Result<Vec<Doc>, String> {
                 })
             }).collect();
             let circular = rec.is_circular();
+            // the file's header text belongs to its first record; later
+            // records get a header built from their own metadata so their
+            // exports do not carry the first record's definition and
+            // accession
+            let header = if first {
+                text.iter().map(|&b| b as char).collect::<String>().split("\nFEATURES").next().unwrap_or_default().to_string() + "\n"
+            } else {
+                format!("LOCUS       {}\nDEFINITION  {}\nACCESSION   {}\n",
+                    rec.name.clone().unwrap_or_else(|| stem.clone()),
+                    rec.definition.clone().unwrap_or_default(),
+                    rec.accession.clone().unwrap_or_default())
+            };
+            first = false;
             docs.push(Doc {
                 name: rec.name.clone().unwrap_or_else(|| stem.clone()), definition: rec.definition.clone().unwrap_or_default(),
                 accession: rec.accession.clone().unwrap_or_default(), comment: rec.comments.join("\n"),
                 seq: rec.seq, circular, feats, lanes: 0, hits: vec![], path: path.into(), sbd: None, deleted: vec![], seq_dirty: false,
-                header: text.iter().map(|&b| b as char).collect::<String>().split("\nFEATURES").next().unwrap_or_default().to_string() + "\n",
+                header,
                 topology_dirty: false,
             });
         }
@@ -892,15 +906,23 @@ impl App {
     /// remapped features.
     fn tool_batch_rc(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
-        let mut saved = 0;
+        let (mut saved, mut failed) = (0, vec![]);
         for p in files {
-            let Ok(docs) = load_all(&p) else { continue };
-            let out = p.with_extension("rc.gb");
-            let mut text = String::new();
-            for d in docs { text += &export_genbank(&tools::reverse_complement(&d)); }
-            if !text.is_empty() && std::fs::write(&out, text).is_ok() { saved += 1; }
+            match load_all(&p) {
+                Ok(docs) if docs.is_empty() => failed.push(format!("{}: no sequence in file", p.display())),
+                Ok(docs) => {
+                    let out = p.with_extension("rc.gb");
+                    let mut text = String::new();
+                    for d in docs { text += &export_genbank(&tools::reverse_complement(&d)); }
+                    match std::fs::write(&out, text) {
+                        Ok(_) => saved += 1,
+                        Err(e) => failed.push(format!("{}: {e}", out.display())),
+                    }
+                }
+                Err(e) => failed.push(format!("{}: {e}", p.display())),
+            }
         }
-        self.info = Some(format!("{saved} sequence file(s) reverse-complemented"));
+        self.report_batch(saved, failed, "reverse-complemented");
     }
 
     /// Tools ▸ Batch Translate: the frame-1 protein of every picked sequence,
@@ -908,21 +930,40 @@ impl App {
     fn tool_batch_translate(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
         let code = self.gen_code.clone();
-        let mut saved = 0;
+        let (mut saved, mut failed) = (0, vec![]);
         for p in files {
-            let Ok(docs) = load_all(&p) else { continue };
-            let mut out = String::new();
-            for d in docs {
-                let prot = tools::translate_protein(&d, &code);
-                out += &format!(">{}_protein\n", d.name);
-                for chunk in prot.as_bytes().chunks(60) {
-                    out.push_str(&String::from_utf8_lossy(chunk));
-                    out.push('\n');
+            match load_all(&p) {
+                Ok(docs) if docs.is_empty() => failed.push(format!("{}: no sequence in file", p.display())),
+                Ok(docs) => {
+                    let mut out = String::new();
+                    for d in docs {
+                        let prot = tools::translate_protein(&d, &code);
+                        out += &format!(">{}_protein\n", d.name);
+                        for chunk in prot.as_bytes().chunks(60) {
+                            out.push_str(&String::from_utf8_lossy(chunk));
+                            out.push('\n');
+                        }
+                    }
+                    let out_path = p.with_extension("prot.fas");
+                    match std::fs::write(&out_path, out) {
+                        Ok(_) => saved += 1,
+                        Err(e) => failed.push(format!("{}: {e}", out_path.display())),
+                    }
                 }
+                Err(e) => failed.push(format!("{}: {e}", p.display())),
             }
-            if !out.is_empty() && std::fs::write(p.with_extension("prot.fas"), out).is_ok() { saved += 1; }
         }
-        self.info = Some(format!("{saved} sequence file(s) translated"));
+        self.report_batch(saved, failed, "translated");
+    }
+
+    /// Report a batch tool's outcome: the saved count and, if any files were
+    /// skipped, exactly which ones and why.
+    fn report_batch(&mut self, saved: usize, failed: Vec<String>, what: &str) {
+        if failed.is_empty() {
+            self.info = Some(format!("{saved} sequence file(s) {what}"));
+        } else {
+            self.error = Some(format!("{saved} sequence file(s) {what}; {} not processed: {}", failed.len(), failed.join("; ")));
+        }
     }
 
     /// Tools ▸ Concatenate: the picked sequences joined end to end, features
@@ -1102,50 +1143,62 @@ impl App {
             Ok(s) => s,
             Err(e) => { self.error = Some(e); return; }
         };
-        // carry the fragments' features into the product: every feature is
-        // split into source segments (an origin-spanning feature yields the
-        // two sides of its fragment), each segment lands at out_start +
-        // in_pos - in_start of the assembly, and on a circular product
-        // positions past the end are the closing overlap — the same bases as
-        // the product's start — so they wrap around. Feature bounds outside
-        // the fragment's own sequence are dropped; offsets use saturating
-        // arithmetic so malformed sources cannot overflow.
+        if assembled.is_empty() { self.error = Some("the assembly is empty".into()); return; }
+        // carry the fragments' features into the product: the feature's own
+        // location supplies its segments (join() gaps, fuzzy < > markers and
+        // origin-spanning joins all survive), each segment lands at
+        // out_start + in_pos - in_start of the assembly, and on a circular
+        // product positions past the end are the closing overlap — the same
+        // bases as the product's start — so they wrap around. Coordinates
+        // outside the fragment's own sequence are clipped; offsets use
+        // saturating i64 arithmetic so malformed sources cannot overflow.
         let alen = assembled.len();
         let mut feats: Vec<Feat> = vec![];
         for ((_, fseq, ffeats), (out_start, in_start)) in self.gib_frags.iter().zip(spans.iter()) {
-            let (flen, delta) = (fseq.len(), *out_start as isize - *in_start as isize);
+            let (flen, delta) = (fseq.len(), *out_start as i64 - *in_start as i64);
             for f in ffeats {
-                if f.start >= flen || f.end > flen { continue; }
-                let segs: Vec<(usize, usize)> = if f.end > f.start {
-                    vec![(f.start, f.end)]
-                } else {
-                    vec![(f.start, flen), (0, f.end)] // a wrap feature's two sides
-                };
-                let mut outsegs: Vec<(usize, usize)> = vec![];
-                for (s, e) in segs {
+                // segments straight from the written location, falling back
+                // to the numeric bounds for plain or unparsable ranges
+                let mut segs: Vec<(usize, usize, bool, bool)> = cloning::parse_location(&f.range).into_iter()
+                    .map(|(a, b, fs, fe)| (((a - 1).max(0)) as usize, (b.max(a)) as usize, fs, fe))
+                    .collect();
+                if segs.is_empty() { segs = vec![(f.start, f.end, false, false)]; }
+                let mut outsegs: Vec<(usize, usize, bool, bool)> = vec![];
+                for (s, e, fs, fe) in segs {
+                    let (s, e) = (s.min(flen), e.min(flen)); // clip to the fragment
                     if e <= s { continue; }
-                    let (ns, ne) = (s.saturating_add_signed(delta), e.saturating_add_signed(delta));
+                    // signed mapping into the product, clipped only at the product boundary
+                    let ns = ((s as i64).saturating_add(delta)).max(0) as usize;
+                    let ne = ((e as i64).saturating_add(delta)).max(0) as usize;
+                    let span = ne.saturating_sub(ns);
                     if circular {
-                        let (ns, ne) = if ns >= alen { (ns - alen, ne - alen) } else { (ns, ne) };
+                        // normalize into the circle: positions past the end are
+                        // the closing overlap, the same bases as the product's
+                        // start, so every position is taken modulo the length
+                        let base = ns % alen;
+                        let ne = base + span.min(alen);
                         if ne <= alen {
-                            if ne > ns { outsegs.push((ns, ne)); }
+                            outsegs.push((base, ne, fs, fe));
                         } else {
                             // crosses the product's origin
-                            outsegs.push((ns, alen));
-                            outsegs.push((0, (ne - alen).min(alen)));
+                            outsegs.push((base, alen, fs, fe));
+                            outsegs.push((0, ne - alen, false, false));
                         }
                     } else {
                         let (ns, ne) = (ns.min(alen), ne.min(alen));
-                        if ne > ns { outsegs.push((ns, ne)); }
+                        if ne > ns { outsegs.push((ns, ne, fs, fe)); }
                     }
                 }
                 if outsegs.is_empty() { continue; }
                 let mut g = f.clone();
                 g.start = outsegs[0].0;
                 g.end = outsegs[outsegs.len() - 1].1;
-                // the location text is rebuilt from the mapped segments, so
-                // every coordinate lies inside the product
-                let parts: Vec<String> = outsegs.iter().map(|(a, b)| format!("{}..{}", a + 1, b)).collect();
+                // the location text is rebuilt from the mapped segments with
+                // their fuzzy markers, so every coordinate lies inside the
+                // product
+                let parts: Vec<String> = outsegs.iter()
+                    .map(|(a, b, fs, fe)| format!("{}{}..{}{}", if *fs { "<" } else { "" }, a + 1, b, if *fe { ">" } else { "" }))
+                    .collect();
                 let loc = if parts.len() == 1 { parts[0].clone() } else { format!("join({})", parts.join(",")) };
                 g.range = if f.strand < 0 { format!("complement({loc})") } else { loc };
                 g.lane = 0;
