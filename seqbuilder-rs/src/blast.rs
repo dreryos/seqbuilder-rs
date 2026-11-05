@@ -103,10 +103,12 @@ fn http_get(url: &str) -> Result<String, String> {
     for attempt in 0..3 {
         match ureq::get(url).timeout(std::time::Duration::from_secs(30)).call() {
             Ok(resp) => return resp.into_string().map_err(|e| e.to_string()),
-            Err(e) if attempt < 2 && matches!(e.kind(), ureq::ErrorKind::Transport) => {
+            // transport errors (timeout, reset, DNS) are transient: retry
+            Err(e) if attempt < 2 && matches!(e, ureq::Error::Transport(_)) => {
                 last = e.to_string();
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
+            // HTTP status errors are terminal
             Err(e) => return Err(e.to_string()),
         }
     }
