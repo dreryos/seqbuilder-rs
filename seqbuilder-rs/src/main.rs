@@ -891,7 +891,7 @@ impl App {
             f.edited = false;
         }
         let path = to.unwrap_or_else(|| d.path.clone());
-        match std::fs::write(&path, s.to_bytes()) {
+        match write_atomic(&path, &s.to_bytes()) {
             Ok(()) => { d.path = path; self.error = None; }
             Err(e) => self.error = Some(format!("{}: {e}", path.display())),
         }
@@ -902,7 +902,7 @@ impl App {
         let Some(d) = &self.doc else { return };
         let name = d.path.file_stem().map(|n| n.to_string_lossy().into_owned() + ".gb").unwrap_or_default();
         if let Some(p) = rfd::FileDialog::new().add_filter("GenBank", &["gb", "gbk"]).set_file_name(name).save_file() {
-            if let Err(e) = std::fs::write(&p, export_genbank(d)) { self.error = Some(format!("{}: {e}", p.display())); }
+            if let Err(e) = write_atomic(&p, export_genbank(d).as_bytes()) { self.error = Some(format!("{}: {e}", p.display())); }
         }
     }
 
@@ -1025,7 +1025,7 @@ impl App {
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
         let cat = tools::concatenate(&docs);
         let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name(format!("{}_concatenated.gb", cat.name)).save_file() else { return };
-        match std::fs::write(&out, export_genbank(&cat)) {
+        match write_atomic(&out, export_genbank(&cat).as_bytes()) {
             Ok(_) => self.report_batch(files.len(), failed, &format!("concatenated (to {})", out.display())),
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -1047,7 +1047,7 @@ impl App {
                 text.push('\n');
             }
         }
-        match std::fs::write(&out, text) {
+        match write_atomic(&out, text.as_bytes()) {
             Ok(_) => self.info = Some(format!("Features written to {}", out.display())),
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -1066,7 +1066,7 @@ impl App {
         }
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
         let Some(out) = rfd::FileDialog::new().add_filter("FASTA", &["fas"]).set_file_name("sequences.fas").save_file() else { return };
-        match std::fs::write(&out, tools::to_fasta(&docs)) {
+        match write_atomic(&out, tools::to_fasta(&docs).as_bytes()) {
             Ok(_) => self.report_batch(files.len(), failed, &format!("exported (to {})", out.display())),
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -1278,7 +1278,7 @@ impl App {
             sbd: None, deleted: vec![], seq_dirty: false, header: String::new(), topology_dirty: false,
         };
         doc.lanes = assign_lanes(&mut doc.feats, doc.seq.len());
-        match std::fs::write(&out, export_genbank(&doc)) {
+        match write_atomic(&out, export_genbank(&doc).as_bytes()) {
             Ok(_) => self.info = Some(format!("Assembly written to {} ({} features, {})", out.display(), doc.feats.len(), if circular { "circular" } else { "linear" })),
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -3192,7 +3192,7 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     if let [_, flag, input, output] = &args[..] {
         if flag == "--export-genbank" {
-            let written = load(Path::new(input)).and_then(|(d, _)| std::fs::write(output, export_genbank(&d)).map_err(|e| e.to_string()));
+            let written = load(Path::new(input)).and_then(|(d, _)| write_atomic(Path::new(output), export_genbank(&d).as_bytes()).map_err(|e| e.to_string()));
             if let Err(e) = written { eprintln!("{input}: {e}"); std::process::exit(1); }
             return Ok(());
         }
