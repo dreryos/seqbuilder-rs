@@ -249,7 +249,9 @@ mod tests {
         // the feature table's header band: the light fill, its full width
         // (515pt tall 12pt) and the black restoration that keeps the text
         // over it readable
-        assert!(s.contains("0.9098039 0.9254902 0.9490196 rg"), "header fill colour: {}", &s[s.find("Features").map(|i| i.saturating_sub(120)).unwrap_or(0)..s.find("Features").map(|i| i + 60).unwrap_or(160)].replace('\n', " | "));
-        assert!(s.contains("515 12 re f 0 0 0 rg"), "header band sized and fill colour restored");
+        let (colour, band) = (s.find("0.9098039 0.9254902 0.9490196 rg"), s.find("515 12 re f"));
+        let (colour, band) = (colour.expect("header fill colour"), band.expect("header band dimensions"));
+        assert!(colour < band, "the fill colour must be set before the rectangle is filled");
+        assert!(s.contains("515 12 re f 0 0 0 rg"), "fill colour restored to black after the band");
     }
 }

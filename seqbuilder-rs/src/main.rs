@@ -632,10 +632,8 @@ impl App {
                 self.orf_sel = None;
                 // a running BLAST search belongs to the previous document:
                 // dropping the receiver stops its worker, stale results go
-                self.blast_rx = None;
-                self.blast_rid = None;
-                self.blast_hits = None;
-                self.blast_pick = None;
+                self.seq_rev += 1; // even a same-named document is a different one
+                self.blast_reset();
                 self.compute_hits();
                 // SeqBuilder opens a sequence showing its default selector's enzymes.
                 if let Some(id) = self.sels.iter().find(|s| s.name.contains("Unique Six+")).map(|s| s.id) { self.apply_selector(id); }
@@ -763,6 +761,9 @@ impl App {
         d.lanes = assign_lanes(&mut d.feats, d.seq.len());
         (self.sel, self.caret, self.sel_feat) = (None, Some(a + add), None);
         self.compute_hits();
+        // a running search targeted the pre-edit sequence, and stored hits
+        // describe it; either way they no longer match what is shown
+        self.blast_reset();
     }
 
     fn undo_redo(&mut self, redo: bool) {
@@ -778,6 +779,7 @@ impl App {
         d.lanes = assign_lanes(&mut d.feats, d.seq.len());
         (self.sel, self.caret, self.sel_feat) = (None, None, None);
         self.compute_hits();
+        self.blast_reset(); // stored hits describe the pre-undo sequence
     }
 
     /// Typing, deleting, cut and paste in the Sequence view.
@@ -818,7 +820,21 @@ impl App {
         });
         (self.view, self.sel, self.sel_feat, self.caret, self.error) = (View::Sequence, None, None, Some(0), None);
         (self.undo, self.redo) = (vec![], vec![]);
+        // a new document is not the old one, even under the same "Untitled"
+        // name: results from any running search must not land on it
+        self.seq_rev += 1;
+        self.blast_reset();
         self.compute_hits();
+    }
+
+    /// Drop a running BLAST search and its results — when the open document
+    /// or its sequence changes, or the dialog closes, the search no longer
+    /// describes what is shown.
+    fn blast_reset(&mut self) {
+        self.blast_rx = None;
+        self.blast_rid = None;
+        self.blast_hits = None;
+        self.blast_pick = None;
     }
 
     /// Sequence ▸ Linear / Circular.
@@ -1200,6 +1216,10 @@ impl App {
         self.doc = Some(doc);
         (self.view, self.sel, self.sel_feat, self.caret, self.error) = (View::Sequence, None, None, Some(0), None);
         (self.undo, self.redo) = (vec![], vec![]);
+        // the cloned fragment is a different document: no stale search or
+        // hits may follow it
+        self.seq_rev += 1;
+        self.blast_reset();
         self.compute_hits();
         self.info = Some("Fragment cloned into a new document.".into());
     }
@@ -1430,10 +1450,11 @@ impl App {
         });
         if close {
             self.blast_open = false;
-            self.blast_rx = None;
-            self.blast_rid = None;
-            self.blast_hits = None;
-            self.blast_pick = None;
+        }
+        // the title-bar X hides the window without the close flag; the
+        // search belongs to the open dialog, so drop it there as well
+        if close || (!self.blast_open && self.blast_rx.is_some()) {
+            self.blast_reset();
         }
     }
 
