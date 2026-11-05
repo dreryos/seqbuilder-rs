@@ -96,8 +96,21 @@ fn http_get(url: &str) -> Result<String, String> {
     // a short timeout: an NCBI poll answers within seconds, and a dropped
     // dialog can only cancel the worker between requests, so requests must
     // not stay in flight for the old two minutes
-    let resp = ureq::get(url).timeout(std::time::Duration::from_secs(30)).call().map_err(|e| e.to_string())?;
-    resp.into_string().map_err(|e| e.to_string())
+    // transient transport failures (a slow answer, a reset connection) are
+    // retried — the NCBI job keeps running through them, and the worker's
+    // overall deadline bounds the wait; HTTP status errors are terminal
+    let mut last = String::new();
+    for attempt in 0..3 {
+        match ureq::get(url).timeout(std::time::Duration::from_secs(30)).call() {
+            Ok(resp) => return resp.into_string().map_err(|e| e.to_string()),
+            Err(e) if attempt < 2 && matches!(e.kind(), ureq::ErrorKind::Transport) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err(last)
 }
 
 /// Parse a BLAST XML report (CMD=Get&FORMAT_TYPE=XML) into hits.
