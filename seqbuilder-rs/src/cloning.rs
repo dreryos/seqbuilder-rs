@@ -236,25 +236,26 @@ pub fn offset_range(range: &str, delta: i64) -> String {
 }
 
 /// The segments of a GenBank location as (start, end, fuzzy_start, fuzzy_end)
-/// tuples, 1-based inclusive as written. Understands "a..b", fuzzy bounds
-/// like "<a" and ">b", join(...) and complement(...) wrappers. Returns
-/// nothing when the location holds no "a..b" pair (callers fall back to the
-/// feature's numeric bounds).
-pub fn parse_location(loc: &str) -> Vec<(i64, i64, bool, bool)> {
+/// tuples, 1-based inclusive as written; the fuzzy fields carry the exact
+/// marker written ("<" or ">", or none for an exact bound). Understands
+/// "a..b", fuzzy bounds like "<a" and ">b", join(...) and complement(...)
+/// wrappers. Returns nothing when the location holds no "a..b" pair
+/// (callers fall back to the feature's numeric bounds).
+pub fn parse_location(loc: &str) -> Vec<(i64, i64, Option<char>, Option<char>)> {
     let c: Vec<char> = loc.chars().collect();
     let mut out = vec![];
     let mut i = 0;
     while i < c.len() {
-        let fuzzy_s = c[i] == '<' || c[i] == '>';
-        let ds = i + usize::from(fuzzy_s);
+        let fuzzy_s = (c[i] == '<' || c[i] == '>').then_some(c[i]);
+        let ds = i + usize::from(fuzzy_s.is_some());
         if ds < c.len() && c[ds].is_ascii_digit() {
             let mut j = ds;
             while j < c.len() && c[j].is_ascii_digit() { j += 1; }
             let a: i64 = c[ds..j].iter().collect::<String>().parse().unwrap_or(0);
             if j + 1 < c.len() && c[j] == '.' && c[j + 1] == '.' {
                 let mut k = j + 2;
-                let fuzzy_e = k < c.len() && (c[k] == '<' || c[k] == '>');
-                let de = k + usize::from(fuzzy_e);
+                let fuzzy_e = if k < c.len() && (c[k] == '<' || c[k] == '>') { Some(c[k]) } else { None };
+                let de = k + usize::from(fuzzy_e.is_some());
                 if de < c.len() && c[de].is_ascii_digit() {
                     let mut m = de;
                     while m < c.len() && c[m].is_ascii_digit() { m += 1; }
@@ -439,10 +440,11 @@ mod tests {
 
     #[test]
     fn parse_location_reads_segments_and_markers() {
-        assert_eq!(parse_location("101..110"), vec![(101, 110, false, false)]);
-        assert_eq!(parse_location("<101..>110"), vec![(101, 110, true, true)]);
-        assert_eq!(parse_location("complement(join(5..9,201..210))"), vec![(5, 9, false, false), (201, 210, false, false)]);
-        assert_eq!(parse_location("J12345.1:20..30"), vec![(20, 30, false, false)]);
+        assert_eq!(parse_location("101..110"), vec![(101, 110, None, None)]);
+        assert_eq!(parse_location("<101..>110"), vec![(101, 110, Some('<'), Some('>'))]);
+        assert_eq!(parse_location(">101..<110"), vec![(101, 110, Some('>'), Some('<'))]);
+        assert_eq!(parse_location("complement(join(5..9,201..210))"), vec![(5, 9, None, None), (201, 210, None, None)]);
+        assert_eq!(parse_location("J12345.1:20..30"), vec![(20, 30, None, None)]);
         assert!(parse_location("complement(56)").is_empty());
     }
 

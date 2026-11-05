@@ -1016,7 +1016,7 @@ impl App {
     fn tool_concatenate(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
         let (mut docs, mut failed) = (vec![], vec![]);
-        for p in files {
+        for p in &files {
             match load_all(&p) {
                 Ok(ds) => docs.extend(ds),
                 Err(e) => failed.push(format!("{}: {e}", p.display())),
@@ -1026,7 +1026,7 @@ impl App {
         let cat = tools::concatenate(&docs);
         let Some(out) = rfd::FileDialog::new().add_filter("GenBank", &["gb"]).set_file_name(format!("{}_concatenated.gb", cat.name)).save_file() else { return };
         match std::fs::write(&out, export_genbank(&cat)) {
-            Ok(_) => self.report_batch(docs.len(), failed, &format!("concatenated (to {})", out.display())),
+            Ok(_) => self.report_batch(files.len(), failed, &format!("concatenated (to {})", out.display())),
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -1058,17 +1058,16 @@ impl App {
     fn tool_export_single(&mut self) {
         let Some(files) = Self::pick_sequences() else { return };
         let (mut docs, mut failed) = (vec![], vec![]);
-        for p in files {
+        for p in &files {
             match load_all(&p) {
                 Ok(ds) => docs.extend(ds),
                 Err(e) => failed.push(format!("{}: {e}", p.display())),
             }
         }
         if docs.is_empty() { self.error = Some("No readable sequences picked.".into()); return; }
-        let n = docs.len();
         let Some(out) = rfd::FileDialog::new().add_filter("FASTA", &["fas"]).set_file_name("sequences.fas").save_file() else { return };
         match std::fs::write(&out, tools::to_fasta(&docs)) {
-            Ok(_) => self.report_batch(n, failed, &format!("exported (to {})", out.display())),
+            Ok(_) => self.report_batch(files.len(), failed, &format!("exported (to {})", out.display())),
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -1216,11 +1215,11 @@ impl App {
             for f in ffeats {
                 // segments straight from the written location, falling back
                 // to the numeric bounds for plain or unparsable ranges
-                let mut segs: Vec<(usize, usize, bool, bool)> = cloning::parse_location(&f.range).into_iter()
+                let mut segs: Vec<(usize, usize, Option<char>, Option<char>)> = cloning::parse_location(&f.range).into_iter()
                     .map(|(a, b, fs, fe)| (((a - 1).max(0)) as usize, (b.max(a)) as usize, fs, fe))
                     .collect();
-                if segs.is_empty() { segs = vec![(f.start, f.end, false, false)]; }
-                let mut outsegs: Vec<(usize, usize, bool, bool)> = vec![];
+                if segs.is_empty() { segs = vec![(f.start, f.end, None, None)]; }
+                let mut outsegs: Vec<(usize, usize, Option<char>, Option<char>)> = vec![];
                 for (s, e, fs, fe) in segs {
                     let (s, e) = (s.min(flen), e.min(flen)); // clip to the fragment
                     if e <= s { continue; }
@@ -1240,8 +1239,8 @@ impl App {
                             // crosses the product's origin: the feature's own
                             // fuzzy end belongs to the segment that carries
                             // its end, the split boundary itself is exact
-                            outsegs.push((base, alen, fs, false));
-                            outsegs.push((0, ne - alen, false, fe));
+                            outsegs.push((base, alen, fs, None));
+                            outsegs.push((0, ne - alen, None, fe));
                         }
                     } else {
                         let (ns, ne) = (ns.min(alen), ne.min(alen));
@@ -1256,7 +1255,15 @@ impl App {
                 // their fuzzy markers, so every coordinate lies inside the
                 // product
                 let parts: Vec<String> = outsegs.iter()
-                    .map(|(a, b, fs, fe)| format!("{}{}..{}{}", if *fs { "<" } else { "" }, a + 1, b, if *fe { ">" } else { "" }))
+                    .map(|(a, b, fs, fe)| {
+                        let mut s = String::new();
+                        if let Some(m) = fs { s.push(*m); }
+                        s.push_str(&(a + 1).to_string());
+                        s.push_str("..");
+                        s.push_str(&b.to_string());
+                        if let Some(m) = fe { s.push(*m); }
+                        s
+                    })
                     .collect();
                 let loc = if parts.len() == 1 { parts[0].clone() } else { format!("join({})", parts.join(",")) };
                 g.range = if f.strand < 0 { format!("complement({loc})") } else { loc };
